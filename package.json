@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
-	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"name": "vault-crdt-sync",
+	"version": "0.1.0",
+	"description": "Real-time collaborative vault sync across devices using Yjs CRDTs and PartyKit.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
