@@ -8,7 +8,9 @@ import {
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
-import { isExcluded, parseExcludePatterns } from "./sync/exclude";
+import { BlobSyncManager, type BlobQueueSnapshot } from "./sync/blobSync";
+import { parseExcludePatterns } from "./sync/exclude";
+import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { applyDiffToYText } from "./sync/diff";
 import {
 	type DiskIndex,
@@ -17,6 +19,20 @@ import {
 	moveIndexEntries,
 	waitForStable,
 } from "./sync/diskIndex";
+import {
+	type BlobHashCache,
+	moveCachedHashes,
+} from "./sync/blobHashCache";
+import {
+	requestDailySnapshot,
+	requestSnapshotNow,
+	listSnapshots as fetchSnapshotList,
+	downloadSnapshot,
+	diffSnapshot,
+	restoreFromSnapshot,
+	type SnapshotIndex,
+	type SnapshotDiff,
+} from "./sync/snapshotClient";
 
 type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
@@ -29,6 +45,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private vaultSync: VaultSync | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
+	private blobSync: BlobSyncManager | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -71,6 +88,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Persisted disk index: {path -> {mtime, size}}. */
 	private diskIndex: DiskIndex = {};
 
+	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
+	private blobHashCache: BlobHashCache = {};
+
+	/** Persisted blob queue snapshot for crash resilience. */
+	private savedBlobQueue: BlobQueueSnapshot | null = null;
+
 	/** Pending stability checks for newly created/dropped files. */
 	private pendingStabilityChecks = new Set<string>();
 
@@ -110,6 +133,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Parse exclude patterns and file size limit from settings
 		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
 		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
+
+		this.applyCursorVisibility();
 
 		// Warn about insecure connections to non-localhost hosts
 		if (this.settings.host) {
@@ -154,9 +179,44 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			);
 			this.diskMirror.startMapObservers();
 
+			// 4b. BlobSyncManager (if attachment sync is enabled)
+			if (this.settings.enableAttachmentSync) {
+				this.blobSync = new BlobSyncManager(
+					this.app,
+					this.vaultSync,
+					{
+						host: this.settings.host,
+						token: this.settings.token,
+						vaultId: this.settings.vaultId,
+						maxAttachmentSizeKB: this.settings.maxAttachmentSizeKB,
+						attachmentConcurrency: this.settings.attachmentConcurrency,
+						debug: this.settings.debug,
+					},
+					this.blobHashCache,
+				);
+				this.blobSync.startObservers();
+
+				// Restore persisted queue from previous session
+				if (this.savedBlobQueue) {
+					this.blobSync.importQueue(this.savedBlobQueue);
+					this.savedBlobQueue = null;
+				}
+			}
+
 			// 5. Status tracking
 			this.vaultSync.provider.on("status", () => this.refreshStatusBar());
-			this.statusInterval = setInterval(() => this.refreshStatusBar(), 3000);
+			this.statusInterval = setInterval(() => {
+				this.refreshStatusBar();
+				// Periodically persist blob queue if transfers are active,
+				// or clear persisted queue if transfers completed
+				if (this.blobSync) {
+					if (this.blobSync.pendingUploads > 0 || this.blobSync.pendingDownloads > 0) {
+						void this.saveBlobQueue();
+					} else {
+						void this.clearSavedBlobQueue();
+					}
+				}
+			}, 3000);
 			this.register(() => {
 				if (this.statusInterval) clearInterval(this.statusInterval);
 			});
@@ -167,12 +227,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// 7. Commands
 			this.registerCommands();
 
-			// 8. Rename batch callback → update editor bindings + disk mirror observers + disk index
+			// 8. Rename batch callback → update editor bindings + disk mirror observers + disk index + blob hash cache
 			this.vaultSync.onRenameBatchFlushed((renames) => {
 				this.editorBindings?.updatePathsAfterRename(renames);
 
 				// Move disk index entries
 				moveIndexEntries(this.diskIndex, renames);
+
+				// Move blob hash cache entries
+				moveCachedHashes(this.blobHashCache, renames);
 
 				// Move disk mirror observers and openFilePaths tracking
 				// for any paths that were open before the rename.
@@ -244,6 +307,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			this.refreshStatusBar();
 			this.log("Startup complete");
+
+			// Trigger daily snapshot (noop if already taken today).
+			// Fire-and-forget — don't block startup on snapshot creation.
+			if (providerSynced) {
+				void this.triggerDailySnapshot();
+			}
 		} catch (err) {
 			console.error("[vault-crdt-sync] Failed to initialize sync:", err);
 			new Notice(`Vault CRDT sync: failed to initialize — ${err}`);
@@ -378,7 +447,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Filter by exclude patterns first
 			const eligibleFiles: TFile[] = [];
 			for (const file of allMdFiles) {
-				if (isExcluded(file.path, this.excludePatterns)) {
+				if (!isMarkdownSyncable(file.path, this.excludePatterns)) {
 					excludedCount++;
 					continue;
 				}
@@ -492,6 +561,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				`${result.untracked.length} untracked, ` +
 				`${result.skipped} tombstoned`,
 			);
+
+			// Blob reconciliation (if enabled)
+			if (this.blobSync) {
+				const blobResult = await this.blobSync.reconcile(
+					mode,
+					this.excludePatterns,
+				);
+				this.log(
+					`Blob reconciliation [${mode}]: ` +
+					`${blobResult.uploadQueued} uploads, ` +
+					`${blobResult.downloadQueued} downloads, ` +
+					`${blobResult.skipped} skipped`,
+				);
+			}
 		} finally {
 			this.reconcileInFlight = false;
 			this.lastReconcileTime = Date.now();
@@ -628,6 +711,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.editorBindings?.bind(view, this.settings.deviceName);
 					this.trackOpenFile(file.path);
 				}
+
+				// Prefetch embedded attachments for the opened note
+				if (file.path.endsWith(".md") && this.blobSync) {
+					this.prefetchEmbeddedAttachments(file);
+				}
 			}),
 		);
 
@@ -635,23 +723,32 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.vault.on("modify", (file) => {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
-				if (!file.path.endsWith(".md")) return;
-				if (isExcluded(file.path, this.excludePatterns)) return;
-				if (this.diskMirror?.isSuppressed(file.path)) {
-					this.log(`Suppressed modify event for "${file.path}"`);
-					return;
+
+				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+					if (this.diskMirror?.isSuppressed(file.path)) {
+						this.log(`Suppressed modify event for "${file.path}"`);
+						return;
+					}
+					void this.syncFileFromDisk(file);
+				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+					this.blobSync.handleFileChange(file);
 				}
-				void this.syncFileFromDisk(file);
 			}),
 		);
 
-		// Rename: use batched queueRename for atomic folder renames
+		// Rename: use batched queueRename for atomic folder renames.
+		// Both markdown and blob files go through the same rename batch
+		// since folder renames affect both types atomically.
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
-				if (!oldPath.endsWith(".md") && !file.path.endsWith(".md")) return;
-				if (isExcluded(file.path, this.excludePatterns)) return;
+				// Rename is relevant if either the old or new path is syncable
+				const newSyncable = isMarkdownSyncable(file.path, this.excludePatterns)
+					|| isBlobSyncable(file.path, this.excludePatterns);
+				const oldSyncable = isMarkdownSyncable(oldPath, this.excludePatterns)
+					|| isBlobSyncable(oldPath, this.excludePatterns);
+				if (!newSyncable && !oldSyncable) return;
 				this.vaultSync?.queueRename(oldPath, file.path);
 				this.log(`Rename queued: "${oldPath}" -> "${file.path}"`);
 			}),
@@ -661,22 +758,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.vault.on("delete", (file) => {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
-				if (!file.path.endsWith(".md")) return;
-				if (isExcluded(file.path, this.excludePatterns)) return;
-				if (this.diskMirror?.isSuppressed(file.path)) {
-					this.log(`Suppressed delete event for "${file.path}"`);
-					return;
-				}
-				// Bug 3: unbind editor if the deleted file was open
-				this.editorBindings?.unbindByPath(file.path);
-				this.diskMirror?.notifyFileClosed(file.path);
-				this.openFilePaths.delete(file.path);
 
-				this.vaultSync?.handleDelete(
-					file.path,
-					this.settings.deviceName,
-				);
-				this.log(`Delete: "${file.path}"`);
+				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+					if (this.diskMirror?.isSuppressed(file.path)) {
+						this.log(`Suppressed delete event for "${file.path}"`);
+						return;
+					}
+					this.editorBindings?.unbindByPath(file.path);
+					this.diskMirror?.notifyFileClosed(file.path);
+					this.openFilePaths.delete(file.path);
+
+					this.vaultSync?.handleDelete(
+						file.path,
+						this.settings.deviceName,
+					);
+					this.log(`Delete: "${file.path}"`);
+				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+					this.blobSync.handleFileDelete(file.path, this.settings.deviceName);
+					this.log(`Delete (blob): "${file.path}"`);
+				}
 			}),
 		);
 
@@ -684,23 +784,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.vault.on("create", (file) => {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
-				if (!file.path.endsWith(".md")) return;
-				if (isExcluded(file.path, this.excludePatterns)) return;
-				if (this.diskMirror?.isSuppressed(file.path)) return;
 
-				// Debounce rapid creates (like unzip or folder paste)
-				if (this.pendingStabilityChecks.has(file.path)) return;
-				this.pendingStabilityChecks.add(file.path);
+				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+					if (this.diskMirror?.isSuppressed(file.path)) return;
 
-				// Wait for file stability (OS writes to finish) before importing
-				void waitForStable(this.app, file.path).then((stable) => {
-					this.pendingStabilityChecks.delete(file.path);
-					if (stable) {
-						void this.syncFileFromDisk(file);
-					} else {
-						this.log(`Create: "${file.path}" unstable after timeout, skipping import`);
-					}
-				});
+					// Debounce rapid creates (like unzip or folder paste)
+					if (this.pendingStabilityChecks.has(file.path)) return;
+					this.pendingStabilityChecks.add(file.path);
+
+					// Wait for file stability (OS writes to finish) before importing
+					void waitForStable(this.app, file.path).then((stable) => {
+						this.pendingStabilityChecks.delete(file.path);
+						if (stable) {
+							void this.syncFileFromDisk(file);
+						} else {
+							this.log(`Create: "${file.path}" unstable after timeout, skipping import`);
+						}
+					});
+				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+					// For blob files, use the same stability check before uploading
+					if (this.pendingStabilityChecks.has(file.path)) return;
+					this.pendingStabilityChecks.add(file.path);
+
+					void waitForStable(this.app, file.path).then((stable) => {
+						this.pendingStabilityChecks.delete(file.path);
+						if (stable) {
+							this.blobSync?.handleFileChange(file);
+						} else {
+							this.log(`Create (blob): "${file.path}" unstable after timeout, skipping`);
+						}
+					});
+				}
 			}),
 		);
 	}
@@ -720,6 +834,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.editorBindings?.unbindAll();
 		this.diskMirror?.destroy();
 
+		// Persist blob queue before destroying (crash resilience)
+		if (this.blobSync) {
+			const snapshot = this.blobSync.exportQueue();
+			if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
+				// Fire-and-forget — teardown can't be async
+				void this.saveBlobQueue();
+			}
+		}
+		this.blobSync?.destroy();
+
 		if (this.statusInterval) {
 			clearInterval(this.statusInterval);
 			this.statusInterval = null;
@@ -734,6 +858,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.vaultSync = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
+		this.blobSync = null;
 		this.reconciled = false;
 		this.reconcileInFlight = false;
 		this.reconcilePending = false;
@@ -777,27 +902,41 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "vault-crdt-sync-debug-status",
 			name: "Show sync debug info",
 			callback: () => {
+				const info = this.buildDebugInfo();
+				new Notice(info, 10000);
+				console.log("[vault-crdt-sync] Debug status:\n" + info);
+			},
+		});
+
+		this.addCommand({
+			id: "vault-crdt-sync-copy-debug",
+			name: "Copy debug info to clipboard",
+			callback: () => {
+				const info = this.buildDebugInfo();
+				navigator.clipboard.writeText(info).then(
+					() => new Notice("Debug info copied to clipboard."),
+					() => new Notice("Failed to copy to clipboard. Check console.", 5000),
+				);
+				console.log("[vault-crdt-sync] Debug info:\n" + info);
+			},
+		});
+
+		this.addCommand({
+			id: "vault-crdt-sync-import-untracked",
+			name: "Import untracked files now",
+			callback: () => {
 				if (!this.vaultSync) {
 					new Notice("Sync not initialized");
 					return;
 				}
-				const info = [
-					`Connected: ${this.vaultSync.connected}`,
-					`Local ready: ${this.vaultSync.localReady}`,
-					`Provider synced: ${this.vaultSync.providerSynced}`,
-					`Initialized (sentinel): ${this.vaultSync.isInitialized}`,
-					`Reconcile mode: ${this.vaultSync.getSafeReconcileMode()}`,
-					`Reconciled: ${this.reconciled}`,
-					`Connection generation: ${this.vaultSync.connectionGeneration}`,
-					`Last reconciled gen: ${this.lastReconciledGeneration}`,
-					`Fatal auth error: ${this.vaultSync.fatalAuthError}`,
-					`IndexedDB error: ${this.vaultSync.idbError}`,
-					`CRDT paths: ${this.vaultSync.pathToId.size}`,
-					`Untracked files: ${this.untrackedFiles.length}`,
-					`Active disk observers: ${this.diskMirror?.activeObserverCount ?? 0}`,
-				].join("\n");
-				new Notice(info, 10000);
-				console.log("[vault-crdt-sync] Debug status:\n" + info);
+				if (this.untrackedFiles.length === 0) {
+					new Notice("No untracked files to import.");
+					return;
+				}
+				const count = this.untrackedFiles.length;
+				void this.importUntrackedFiles().then(() => {
+					new Notice(`Imported ${count} untracked file(s).`);
+				});
 			},
 		});
 
@@ -837,6 +976,63 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 		});
 
+		// --- Snapshot commands ---
+
+		this.addCommand({
+			id: "vault-crdt-sync-snapshot-now",
+			name: "Take snapshot now",
+			callback: async () => {
+				if (!this.vaultSync) {
+					new Notice("Sync not initialized");
+					return;
+				}
+				if (!this.vaultSync.connected) {
+					new Notice("Not connected to server — cannot create snapshot.");
+					return;
+				}
+
+				new Notice("Creating snapshot...");
+				try {
+					const result = await requestSnapshotNow(
+						this.settings,
+						this.settings.deviceName,
+					);
+					if (result.status === "created" && result.index) {
+						new Notice(
+							`Snapshot created: ${result.index.markdownFileCount} notes, ` +
+							`${result.index.blobFileCount} attachments ` +
+							`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)`,
+						);
+					} else if (result.status === "unavailable") {
+						new Notice(`Snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
+					} else {
+						new Notice("Snapshot created.");
+					}
+				} catch (err) {
+					console.error("[vault-crdt-sync] Snapshot failed:", err);
+					new Notice(`Snapshot failed: ${err}`);
+				}
+			},
+		});
+
+		this.addCommand({
+			id: "vault-crdt-sync-snapshot-list",
+			name: "Browse and restore snapshots",
+			callback: async () => {
+				if (!this.vaultSync) {
+					new Notice("Sync not initialized");
+					return;
+				}
+				if (!this.vaultSync.connected) {
+					new Notice("Not connected to server — cannot browse snapshots.");
+					return;
+				}
+				await this.showSnapshotList();
+			},
+		});
+
+		// --- Reset commands ---
+
 		this.addCommand({
 			id: "vault-crdt-sync-nuclear-reset",
 			name: "Nuclear reset (wipe CRDT, re-seed from disk)",
@@ -862,7 +1058,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						const counts = this.vaultSync!.clearAllMaps();
 						this.log(
 							`Nuclear reset: cleared ${counts.pathCount} paths, ` +
-							`${counts.idCount} texts, ${counts.metaCount} meta`,
+							`${counts.idCount} texts, ${counts.metaCount} meta, ` +
+							`${counts.blobCount} blob paths`,
 						);
 
 						// Give the provider a moment to sync the deletions to server
@@ -894,9 +1091,82 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	// Helpers
 	// -------------------------------------------------------------------
 
+	/**
+	 * When a note opens, parse its embedded links (![[...]]) via Obsidian's
+	 * metadata cache and prefetch any missing blob attachments from R2.
+	 * This ensures images/PDFs render immediately rather than waiting for
+	 * the next reconcile or CRDT observer to trigger the download.
+	 */
+	private prefetchEmbeddedAttachments(file: TFile): void {
+		if (!this.blobSync) return;
+
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache?.embeds) return;
+
+		const pathsToFetch: string[] = [];
+
+		for (const embed of cache.embeds) {
+			// Resolve the link to an actual vault path.
+			// getFirstLinkpathDest handles relative paths, aliases, etc.
+			const resolved = this.app.metadataCache.getFirstLinkpathDest(
+				embed.link,
+				file.path,
+			);
+
+			if (resolved) {
+				// File already exists on disk — skip
+				continue;
+			}
+
+			// File doesn't exist on disk. Try to find it in the CRDT blob map.
+			// The link could be just a filename (e.g. "image.png") or a path.
+			// Check both the raw link text and common attachment patterns.
+			const linkPath = (embed.link.split("#")[0] ?? "").split("|")[0] ?? ""; // strip anchors/aliases
+
+			// Search pathToBlob for a matching path
+			let blobPath: string | null = null;
+			this.vaultSync?.pathToBlob.forEach((_ref, candidatePath) => {
+				if (blobPath) return; // already found
+				// Exact match
+				if (candidatePath === linkPath) {
+					blobPath = candidatePath;
+					return;
+				}
+				// Filename-only match (Obsidian's default "shortest path" mode)
+				const candidateFilename = candidatePath.split("/").pop();
+				if (candidateFilename === linkPath) {
+					blobPath = candidatePath;
+				}
+			});
+
+			if (blobPath) {
+				pathsToFetch.push(blobPath);
+			}
+		}
+
+		if (pathsToFetch.length > 0) {
+			const queued = this.blobSync.prioritizeDownloads(pathsToFetch);
+			if (queued > 0) {
+				this.log(`prefetch: queued ${queued} attachments for "${file.path}"`);
+			}
+		}
+	}
+
 	private async syncFileFromDisk(file: TFile): Promise<void> {
 		if (!this.vaultSync) return;
-		if (isExcluded(file.path, this.excludePatterns)) return;
+		if (!isMarkdownSyncable(file.path, this.excludePatterns)) return;
+
+		// External edit policy gate: control whether disk changes are
+		// imported into the CRDT based on the user's setting.
+		const policy = this.settings.externalEditPolicy;
+		if (policy === "never") {
+			this.log(`syncFileFromDisk: skipping "${file.path}" (external edit policy: never)`);
+			return;
+		}
+		if (policy === "closed-only" && this.editorBindings?.isBound(file.path)) {
+			this.log(`syncFileFromDisk: skipping "${file.path}" (open in editor, policy: closed-only)`);
+			return;
+		}
 
 		try {
 			const content = await this.app.vault.read(file);
@@ -943,6 +1213,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Toggle remote cursor visibility via a CSS class on the document body.
+	 * The actual cursor styles from y-codemirror.next are hidden when the
+	 * class is absent; we add it when showRemoteCursors is true.
+	 */
+	applyCursorVisibility(): void {
+		document.body.toggleClass(
+			"vault-crdt-show-cursors",
+			this.settings.showRemoteCursors,
+		);
+	}
+
 	private refreshStatusBar(): void {
 		if (!this.vaultSync) {
 			this.updateStatusBar("disconnected");
@@ -985,11 +1267,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			error: "CRDT: Error",
 			unauthorized: "CRDT: Unauthorized",
 		};
-		this.statusBarEl.setText(labels[state]);
+		let text = labels[state];
+
+		// Append blob transfer progress if active
+		const transfer = this.blobSync?.transferStatus;
+		if (transfer) {
+			text += ` (${transfer})`;
+		}
+
+		this.statusBarEl.setText(text);
 	}
 
 	onunload() {
 		this.log("Unloading plugin");
+		document.body.removeClass("vault-crdt-show-cursors");
 		this.teardownSync();
 	}
 
@@ -1004,12 +1295,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex as DiskIndex;
 		}
+		// Load blob hash cache
+		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
+			this.blobHashCache = data._blobHashCache as BlobHashCache;
+		}
+		// Load persisted blob queue
+		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
+			this.savedBlobQueue = data._blobQueue as BlobQueueSnapshot;
+		}
 	}
 
 	async saveSettings() {
 		await this.saveData({
 			...this.settings,
 			_diskIndex: this.diskIndex,
+			_blobHashCache: this.blobHashCache,
 		});
 	}
 
@@ -1021,7 +1321,215 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			...data,
 			...this.settings,
 			_diskIndex: this.diskIndex,
+			_blobHashCache: this.blobHashCache,
 		});
+	}
+
+	private async saveBlobQueue(): Promise<void> {
+		if (!this.blobSync) return;
+		const snapshot = this.blobSync.exportQueue();
+		// Only write if there's actually something to persist
+		if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) return;
+		const data = (await this.loadData()) as Record<string, unknown> | null;
+		await this.saveData({
+			...data,
+			...this.settings,
+			_blobQueue: snapshot,
+			_blobHashCache: this.blobHashCache,
+		});
+	}
+
+	/**
+	 * Clear the persisted blob queue once all transfers are done.
+	 * Only writes if there was previously a saved queue.
+	 */
+	private async clearSavedBlobQueue(): Promise<void> {
+		const data = (await this.loadData()) as Record<string, unknown> | null;
+		if (!data || !data._blobQueue) return;
+		delete data._blobQueue;
+		await this.saveData({
+			...data,
+			...this.settings,
+			_blobHashCache: this.blobHashCache,
+		});
+	}
+
+	private buildDebugInfo(): string {
+		if (!this.vaultSync) return "Sync not initialized";
+		return [
+			`Host: ${this.settings.host || "(not set)"}`,
+			`Vault ID: ${this.settings.vaultId || "(not set)"}`,
+			`Device: ${this.settings.deviceName || "(unnamed)"}`,
+			`Connected: ${this.vaultSync.connected}`,
+			`Local ready: ${this.vaultSync.localReady}`,
+			`Provider synced: ${this.vaultSync.providerSynced}`,
+			`Initialized (sentinel): ${this.vaultSync.isInitialized}`,
+			`Reconcile mode: ${this.vaultSync.getSafeReconcileMode()}`,
+			`Reconciled: ${this.reconciled}`,
+			`Connection generation: ${this.vaultSync.connectionGeneration}`,
+			`Last reconciled gen: ${this.lastReconciledGeneration}`,
+			`Fatal auth error: ${this.vaultSync.fatalAuthError}`,
+			`IndexedDB error: ${this.vaultSync.idbError}`,
+			`CRDT paths: ${this.vaultSync.pathToId.size}`,
+			`Blob paths: ${this.vaultSync.pathToBlob.size}`,
+			`Untracked files: ${this.untrackedFiles.length}`,
+			`Active disk observers: ${this.diskMirror?.activeObserverCount ?? 0}`,
+			`External edit policy: ${this.settings.externalEditPolicy}`,
+			`Attachment sync: ${this.settings.enableAttachmentSync ? "enabled" : "disabled"}`,
+			...(this.blobSync ? [
+				`Pending uploads: ${this.blobSync.pendingUploads}`,
+				`Pending downloads: ${this.blobSync.pendingDownloads}`,
+			] : []),
+			`Open files: ${this.openFilePaths.size}`,
+			`Remote cursors: ${this.settings.showRemoteCursors ? "shown" : "hidden"}`,
+		].join("\n");
+	}
+
+	// -------------------------------------------------------------------
+	// Snapshot helpers
+	// -------------------------------------------------------------------
+
+	/**
+	 * Request the daily snapshot from the server.
+	 * Called after provider syncs during startup.
+	 * Silent noop if R2 isn't configured or snapshot already taken today.
+	 */
+	private async triggerDailySnapshot(): Promise<void> {
+		try {
+			const result = await requestDailySnapshot(this.settings, this.settings.deviceName);
+			if (result.status === "created") {
+				this.log(`Daily snapshot created: ${result.snapshotId}`);
+			} else if (result.status === "noop") {
+				this.log(`Daily snapshot: already taken today`);
+			} else {
+				this.log(`Daily snapshot: ${result.reason ?? "unavailable"}`);
+			}
+		} catch (err) {
+			// Don't spam the user — snapshot failure is non-critical
+			console.warn("[vault-crdt-sync] Daily snapshot failed:", err);
+		}
+	}
+
+	/**
+	 * Show a list of available snapshots and let the user pick one to diff/restore.
+	 */
+	private async showSnapshotList(): Promise<void> {
+		new Notice("Loading snapshots...");
+
+		try {
+			const snapshots = await fetchSnapshotList(this.settings);
+
+			if (snapshots.length === 0) {
+				new Notice("No snapshots found. Take a snapshot first.");
+				return;
+			}
+
+			new SnapshotListModal(this.app, snapshots, async (selected) => {
+				await this.showSnapshotDiff(selected);
+			}).open();
+		} catch (err) {
+			console.error("[vault-crdt-sync] Failed to list snapshots:", err);
+			new Notice(`Failed to list snapshots: ${err}`);
+		}
+	}
+
+	/**
+	 * Download a snapshot, compute diff against current CRDT, and show the restore UI.
+	 */
+	private async showSnapshotDiff(snapshot: SnapshotIndex): Promise<void> {
+		if (!this.vaultSync) return;
+
+		new Notice("Downloading snapshot...");
+
+		try {
+			const snapshotDoc = await downloadSnapshot(this.settings, snapshot);
+			const diff = diffSnapshot(snapshotDoc, this.vaultSync.ydoc);
+
+			let destroyed = false;
+			const cleanup = () => {
+				if (!destroyed) {
+					destroyed = true;
+					snapshotDoc.destroy();
+				}
+			};
+
+			new SnapshotDiffModal(
+				this.app,
+				snapshot,
+				diff,
+				async (markdownPaths, blobPaths) => {
+					if (!this.vaultSync) return;
+
+					// --- Pre-restore backup ---
+					// Save current content of files we're about to overwrite
+					// so the user can recover if the restore goes wrong.
+					const backupDir = `.obsidian/plugins/vault-crdt-sync/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`;
+					let backedUp = 0;
+					for (const path of markdownPaths) {
+						try {
+							const file = this.app.vault.getAbstractFileByPath(path);
+							if (file instanceof TFile) {
+								const content = await this.app.vault.read(file);
+								const backupPath = `${backupDir}/${path}`;
+								// Ensure parent directories exist
+								const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
+								if (parentDir && !this.app.vault.getAbstractFileByPath(parentDir)) {
+									await this.app.vault.createFolder(parentDir);
+								}
+								await this.app.vault.create(backupPath, content);
+								backedUp++;
+							}
+						} catch (err) {
+							// Non-fatal: file might not exist on disk (undelete case)
+							this.log(`Backup skipped for "${path}": ${err}`);
+						}
+					}
+					if (backedUp > 0) {
+						this.log(`Pre-restore backup: ${backedUp} files saved to ${backupDir}`);
+					}
+
+					const result = restoreFromSnapshot(snapshotDoc, this.vaultSync.ydoc, {
+						markdownPaths,
+						blobPaths,
+						device: this.settings.deviceName,
+					});
+
+					// Flush restored files to disk
+					for (const path of markdownPaths) {
+						await this.diskMirror?.flushWrite(path);
+					}
+
+					// Kick blob downloads for restored blob references
+					if (blobPaths.length > 0 && this.blobSync) {
+						const queued = this.blobSync.prioritizeDownloads(blobPaths);
+						if (queued > 0) {
+							this.log(`Restore: queued ${queued} blob downloads`);
+						}
+					}
+
+					// Re-bind editors for restored files
+					this.bindAllOpenEditors();
+
+					const parts: string[] = [];
+					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
+					if (result.markdownUndeleted > 0) parts.push(`${result.markdownUndeleted} files undeleted`);
+					if (result.blobsRestored > 0) parts.push(`${result.blobsRestored} attachments restored`);
+					if (backedUp > 0) parts.push(`backup in ${backupDir}`);
+
+					const msg = parts.length > 0
+						? `Restore complete: ${parts.join(", ")}.`
+						: "No changes were applied.";
+					new Notice(msg, 8000);
+					this.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
+
+					cleanup();
+				},
+				cleanup,
+			).open();
+		} catch (err) {
+			console.error("[vault-crdt-sync] Snapshot diff failed:", err);
+			new Notice(`Failed to load snapshot: ${err}`);
+		}
 	}
 
 	private log(msg: string): void {
@@ -1076,5 +1584,263 @@ class ConfirmModal extends Modal {
 
 	onClose() {
 		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal that lists available snapshots and lets the user pick one.
+ */
+class SnapshotListModal extends Modal {
+	constructor(
+		app: import("obsidian").App,
+		private snapshots: SnapshotIndex[],
+		private onSelect: (snapshot: SnapshotIndex) => void | Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		contentEl.createEl("h3", { text: "Available snapshots" });
+		contentEl.createEl("p", {
+			text: `${this.snapshots.length} snapshot(s) found. Select one to see a diff and restore files.`,
+			cls: "setting-item-description",
+		});
+
+		const list = contentEl.createDiv({ cls: "snapshot-list" });
+
+		for (const snap of this.snapshots) {
+			const item = list.createDiv({ cls: "snapshot-list-item" });
+			item.style.padding = "8px 0";
+			item.style.borderBottom = "1px solid var(--background-modifier-border)";
+			item.style.cursor = "pointer";
+
+			const date = new Date(snap.createdAt);
+			const dateStr = date.toLocaleDateString(undefined, {
+				year: "numeric",
+				month: "short",
+				day: "numeric",
+				hour: "2-digit",
+				minute: "2-digit",
+			});
+
+			const title = item.createEl("div");
+			title.createEl("strong", { text: dateStr });
+			if (snap.triggeredBy) {
+				title.createEl("span", {
+					text: ` (${snap.triggeredBy})`,
+					cls: "setting-item-description",
+				});
+			}
+
+			item.createEl("div", {
+				text: `${snap.markdownFileCount} notes, ${snap.blobFileCount} attachments ` +
+					`(${Math.round(snap.crdtSizeBytes / 1024)} KB)`,
+				cls: "setting-item-description",
+			});
+
+			item.addEventListener("click", () => {
+				this.close();
+				void this.onSelect(snap);
+			});
+
+			// Hover effect
+			item.addEventListener("mouseenter", () => {
+				item.style.backgroundColor = "var(--background-modifier-hover)";
+			});
+			item.addEventListener("mouseleave", () => {
+				item.style.backgroundColor = "";
+			});
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/**
+ * Modal that shows a diff between a snapshot and the current CRDT state.
+ * Lets the user select files to restore.
+ */
+class SnapshotDiffModal extends Modal {
+	private selectedMd = new Set<string>();
+	private selectedBlobs = new Set<string>();
+	/** Set to true when restore is initiated — prevents cleanup from running twice. */
+	private didRestore = false;
+
+	constructor(
+		app: import("obsidian").App,
+		private snapshot: SnapshotIndex,
+		private diff: SnapshotDiff,
+		private onRestore: (markdownPaths: string[], blobPaths: string[]) => void | Promise<void>,
+		private cleanup: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+
+		const date = new Date(this.snapshot.createdAt);
+		const dateStr = date.toLocaleDateString(undefined, {
+			year: "numeric",
+			month: "short",
+			day: "numeric",
+			hour: "2-digit",
+			minute: "2-digit",
+		});
+		contentEl.createEl("h3", { text: `Snapshot: ${dateStr}` });
+
+		const { diff } = this;
+		const totalChanges = diff.deletedSinceSnapshot.length +
+			diff.contentChanged.length +
+			diff.blobsDeletedSinceSnapshot.length +
+			diff.blobsChanged.length;
+
+		if (totalChanges === 0 && diff.createdSinceSnapshot.length === 0) {
+			contentEl.createEl("p", { text: "No differences found between the snapshot and current state." });
+			return;
+		}
+
+		contentEl.createEl("p", {
+			text: "Select files to restore from the snapshot. " +
+				"Created-since-snapshot files are shown for reference but cannot be \"restored\" (they didn't exist yet).",
+			cls: "setting-item-description",
+		});
+
+		// --- Deleted since snapshot (can restore = undelete) ---
+		if (diff.deletedSinceSnapshot.length > 0) {
+			this.renderSection(
+				contentEl,
+				"Deleted since snapshot (can undelete)",
+				diff.deletedSinceSnapshot.map((d) => d.path),
+				this.selectedMd,
+			);
+		}
+
+		// --- Content changed (can restore to snapshot version) ---
+		if (diff.contentChanged.length > 0) {
+			this.renderSection(
+				contentEl,
+				"Content changed since snapshot",
+				diff.contentChanged.map((d) => d.path),
+				this.selectedMd,
+			);
+		}
+
+		// --- Created since snapshot (informational only) ---
+		if (diff.createdSinceSnapshot.length > 0) {
+			const section = contentEl.createDiv();
+			section.createEl("h4", { text: `Created since snapshot (${diff.createdSinceSnapshot.length})` });
+			const listEl = section.createEl("ul");
+			for (const path of diff.createdSinceSnapshot) {
+				listEl.createEl("li", { text: path, cls: "setting-item-description" });
+			}
+		}
+
+		// --- Blob changes ---
+		if (diff.blobsDeletedSinceSnapshot.length > 0) {
+			this.renderSection(
+				contentEl,
+				"Attachments deleted since snapshot",
+				diff.blobsDeletedSinceSnapshot.map((d) => d.path),
+				this.selectedBlobs,
+			);
+		}
+
+		if (diff.blobsChanged.length > 0) {
+			this.renderSection(
+				contentEl,
+				"Attachments changed since snapshot",
+				diff.blobsChanged.map((d) => d.path),
+				this.selectedBlobs,
+			);
+		}
+
+		// --- Unchanged summary ---
+		if (diff.unchanged.length > 0) {
+			contentEl.createEl("p", {
+				text: `${diff.unchanged.length} file(s) unchanged.`,
+				cls: "setting-item-description",
+			});
+		}
+
+		// --- Restore button ---
+		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+		buttonRow.style.marginTop = "16px";
+
+		buttonRow
+			.createEl("button", { text: "Cancel" })
+			.addEventListener("click", () => this.close());
+
+		const restoreBtn = buttonRow.createEl("button", {
+			text: "Restore selected",
+			cls: "mod-cta",
+		});
+		restoreBtn.addEventListener("click", () => {
+			const mdPaths = Array.from(this.selectedMd);
+			const blobPaths = Array.from(this.selectedBlobs);
+
+			if (mdPaths.length === 0 && blobPaths.length === 0) {
+				new Notice("No files selected for restore.");
+				return;
+			}
+
+			this.didRestore = true;
+			this.close();
+			void this.onRestore(mdPaths, blobPaths);
+		});
+	}
+
+	private renderSection(
+		container: HTMLElement,
+		title: string,
+		paths: string[],
+		selectedSet: Set<string>,
+	): void {
+		const section = container.createDiv();
+		section.createEl("h4", { text: `${title} (${paths.length})` });
+
+		// Select all toggle
+		const toggleRow = section.createDiv();
+		toggleRow.style.marginBottom = "4px";
+		const selectAll = toggleRow.createEl("a", { text: "Select all", href: "#" });
+		selectAll.addEventListener("click", (e) => {
+			e.preventDefault();
+			for (const p of paths) selectedSet.add(p);
+			// Re-check all checkboxes in this section
+			section.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach(
+				(cb) => { cb.checked = true; },
+			);
+		});
+
+		for (const path of paths) {
+			const row = section.createDiv();
+			row.style.padding = "2px 0";
+			const label = row.createEl("label");
+			const cb = label.createEl("input", { type: "checkbox" });
+			cb.style.marginRight = "6px";
+			label.appendText(path);
+
+			cb.addEventListener("change", () => {
+				if (cb.checked) {
+					selectedSet.add(path);
+				} else {
+					selectedSet.delete(path);
+				}
+			});
+		}
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		// Always clean up the snapshot doc unless restore already handled it.
+		if (!this.didRestore) {
+			this.cleanup();
+		}
 	}
 }

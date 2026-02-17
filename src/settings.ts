@@ -1,6 +1,9 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type VaultCrdtSyncPlugin from "./main";
 
+/** Controls how external disk edits (git, other editors) are imported into CRDT. */
+export type ExternalEditPolicy = "always" | "closed-only" | "never";
+
 export interface VaultSyncSettings {
 	/** PartyKit server host, e.g. "https://vault-crdt-sync.yourname.partykit.dev" */
 	host: string;
@@ -16,6 +19,31 @@ export interface VaultSyncSettings {
 	excludePatterns: string;
 	/** Maximum file size in KB to sync via CRDT. Files larger are skipped. */
 	maxFileSizeKB: number;
+	/**
+	 * How to handle external disk modifications (git pull, other editors).
+	 *   "always"      — always import into CRDT (default, current behavior)
+	 *   "closed-only" — import only for files not open in an editor
+	 *   "never"       — never import (CRDT is sole source of truth)
+	 */
+	externalEditPolicy: ExternalEditPolicy;
+
+	// ---------------------------------------------------------------
+	// Attachment sync (R2 blob store)
+	// ---------------------------------------------------------------
+
+	/** Enable attachment (non-markdown) sync via R2 blob store. */
+	enableAttachmentSync: boolean;
+	/** Maximum attachment size in KB. Files larger are skipped. Default 10240 (10 MB). */
+	maxAttachmentSizeKB: number;
+	/** Number of parallel upload/download slots. */
+	attachmentConcurrency: number;
+
+	// ---------------------------------------------------------------
+	// Collaboration display
+	// ---------------------------------------------------------------
+
+	/** Show remote cursors and selections in the editor. */
+	showRemoteCursors: boolean;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -26,6 +54,11 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	debug: false,
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
+	externalEditPolicy: "always",
+	enableAttachmentSync: false,
+	maxAttachmentSizeKB: 10240,
+	attachmentConcurrency: 2,
+	showRemoteCursors: true,
 };
 
 /** Generate a random vault ID (16 bytes, base64url). */
@@ -170,7 +203,95 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
+		containerEl.createEl("h3", { text: "Attachment sync" });
+
+		new Setting(containerEl)
+			.setName("Sync attachments")
+			.setDesc(
+				"Sync non-markdown files (images, PDFs, etc.) via R2 object storage. " +
+				"Requires R2 configuration on the server. Markdown notes always sync via CRDT.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableAttachmentSync)
+					.onChange(async (value) => {
+						this.plugin.settings.enableAttachmentSync = value;
+						await this.plugin.saveSettings();
+						this.display();
+					}),
+			);
+
+		if (this.plugin.settings.enableAttachmentSync) {
+			new Setting(containerEl)
+				.setName("Max attachment size (KB)")
+				.setDesc(
+					"Attachments larger than this are skipped. Default 10240 (10 MB).",
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("10240")
+						.setValue(String(this.plugin.settings.maxAttachmentSizeKB))
+						.onChange(async (value) => {
+							const n = parseInt(value, 10);
+							if (!isNaN(n) && n > 0) {
+								this.plugin.settings.maxAttachmentSizeKB = n;
+								await this.plugin.saveSettings();
+							}
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Concurrent transfers")
+				.setDesc(
+					"Number of parallel upload/download slots (1-5). Lower values reduce mobile battery use.",
+				)
+				.addSlider((slider) =>
+					slider
+						.setLimits(1, 5, 1)
+						.setValue(this.plugin.settings.attachmentConcurrency)
+						.setDynamicTooltip()
+						.onChange(async (value) => {
+							this.plugin.settings.attachmentConcurrency = value;
+							await this.plugin.saveSettings();
+						}),
+				);
+		}
+
 		containerEl.createEl("h3", { text: "Advanced" });
+
+		new Setting(containerEl)
+			.setName("Show remote cursors")
+			.setDesc(
+				"Display cursors and selections from other connected devices in the editor.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showRemoteCursors)
+					.onChange(async (value) => {
+						this.plugin.settings.showRemoteCursors = value;
+						await this.plugin.saveSettings();
+						this.plugin.applyCursorVisibility();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("External edit policy")
+			.setDesc(
+				"How to handle disk changes from external tools (git, other editors). " +
+				"\"Always\" imports all changes into CRDT. \"Only when closed\" skips files open in an editor. " +
+				"\"Never\" ignores external edits entirely.",
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("always", "Always import")
+					.addOption("closed-only", "Only when closed")
+					.addOption("never", "Never import")
+					.setValue(this.plugin.settings.externalEditPolicy)
+					.onChange(async (value) => {
+						this.plugin.settings.externalEditPolicy = value as ExternalEditPolicy;
+						await this.plugin.saveSettings();
+					}),
+			);
 
 		new Setting(containerEl)
 			.setName("Debug logging")

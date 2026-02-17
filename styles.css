@@ -6,3 +6,48 @@
 	font-size: 11px;
 	opacity: 0.8;
 }
+
+/*
+ * Remote cursor / selection styling (y-codemirror.next)
+ *
+ * Hidden by default. Shown when body has .vault-crdt-show-cursors
+ * (controlled by the "Show remote cursors" setting).
+ */
+
+.yRemoteSelection {
+	display: none;
+}
+
+.yRemoteSelectionHead {
+	display: none;
+}
+
+/* When enabled, show cursors with styling */
+.vault-crdt-show-cursors .yRemoteSelection {
+	display: inline;
+	opacity: 0.35;
+}
+
+.vault-crdt-show-cursors .yRemoteSelectionHead {
+	display: inline;
+	position: absolute;
+	border-left: 2px solid;
+	border-color: inherit;
+	height: 100%;
+}
+
+.vault-crdt-show-cursors .yRemoteSelectionHead::after {
+	content: attr(data-name);
+	position: absolute;
+	top: -1.4em;
+	left: -2px;
+	font-size: 10px;
+	font-family: var(--font-interface);
+	padding: 1px 4px;
+	border-radius: 3px 3px 3px 0;
+	white-space: nowrap;
+	color: var(--text-on-accent);
+	background-color: inherit;
+	opacity: 0.9;
+	pointer-events: none;
+}

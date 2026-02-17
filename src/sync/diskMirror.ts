@@ -317,6 +317,9 @@ export class DiskMirror {
 
 	private async handleRemoteDelete(path: string): Promise<void> {
 		const normalized = normalizePath(path);
+		// Unbind editor before suppressed delete so the vault `delete` event
+		// (which skips unbind due to suppression) doesn't leave a stale binding.
+		this.editorBindings.unbindByPath(normalized);
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
 			try {
