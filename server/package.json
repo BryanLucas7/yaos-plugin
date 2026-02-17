@@ -9,6 +9,8 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"aws4fetch": "^1.0.20",
+		"fflate": "^0.8.2",
 		"partykit": "^0.0.111",
 		"y-partykit": "^0.0.25",
 		"yjs": "^13.6.20"
