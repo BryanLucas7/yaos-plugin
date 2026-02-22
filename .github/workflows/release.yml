@@ -36,7 +36,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          zip vault-crdt-sync.zip main.js manifest.json styles.css
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
-            main.js manifest.json styles.css
+            main.js manifest.json styles.css vault-crdt-sync.zip
