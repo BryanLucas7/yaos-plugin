@@ -44,6 +44,18 @@ The default deploy is text-only:
 
 That claim page generates a token in the browser and returns an `obsidian://yaos?...` setup link you can use to configure the plugin.
 
+### How updates work after deploy
+
+The Deploy to Cloudflare button creates a new repository in your own Git account and connects this Worker to that new repo.
+
+That means future pushes to your generated repo will redeploy automatically, but future pushes to the original `kavinsood/yaos` template repo will not update your existing Worker on their own.
+
+To pick up new YAOS changes later, either:
+
+1. Merge upstream changes from `kavinsood/yaos` into the generated repo Cloudflare created for you.
+2. Push your own commits to that generated repo and let Cloudflare redeploy from there.
+3. Start a fresh deployment from the button if you would rather re-deploy than maintain Git history.
+
 ### Manual CLI deploy
 
 ```bash

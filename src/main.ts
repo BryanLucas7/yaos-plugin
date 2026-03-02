@@ -2121,7 +2121,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.serverCapabilities?.snapshots ?? true;
 	}
 
-	private async refreshServerCapabilities(): Promise<void> {
+	async refreshServerCapabilities(): Promise<void> {
 		if (!this.settings.host) {
 			this.serverCapabilities = null;
 			return;

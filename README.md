@@ -57,6 +57,20 @@ That gives you the fastest supported path:
 
 Later, if you want attachments and snapshots, add an R2 binding named `YAOS_BUCKET` in the Cloudflare dashboard and redeploy. The same deployed Worker will begin reporting those features as available.
 
+### How updates work after one-click deploy
+
+The Deploy to Cloudflare button does not keep your app attached to the original `kavinsood/yaos` repository.
+
+Instead, Cloudflare creates a new repository in your own Git account and connects your Worker to that new repo. Future pushes to **your generated repo** will redeploy automatically. Future pushes to the original YAOS template repo will not update your already-deployed app by themselves.
+
+From a user's perspective, that means you have three ways to pick up new YAOS changes later:
+
+1. Treat the generated repo as your real project and merge upstream YAOS changes into it.
+2. Push your own commits to that generated repo and let Cloudflare redeploy from there.
+3. Start fresh with the deploy button again if you prefer a clean re-deploy over syncing Git history.
+
+If you want the easiest ongoing setup, keep using the repo Cloudflare created for you as the source of truth for your deployment.
+
 ## Installation
 
 ### Manual install (recommended for personal use)

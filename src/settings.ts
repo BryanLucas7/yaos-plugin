@@ -213,6 +213,25 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h3", { text: "Attachment sync" });
 
+		if (this.plugin.settings.host) {
+			new Setting(containerEl)
+				.setName("R2 backend")
+				.setDesc(
+					attachmentsAvailable
+						? "Available on this server. The Worker detected an R2 bucket binding and can sync attachments plus snapshots."
+						: "Unavailable on this server. Add an R2 binding named YAOS_BUCKET in Cloudflare, then redeploy to enable attachments plus snapshots.",
+				)
+				.addButton((button) =>
+					button
+						.setButtonText("Refresh")
+						.onClick(async () => {
+							button.setDisabled(true);
+							await this.plugin.refreshServerCapabilities();
+							this.display();
+						}),
+				);
+		}
+
 		if (this.plugin.settings.host && !attachmentsAvailable) {
 			const note = containerEl.createEl("p", {
 				text:
