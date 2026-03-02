@@ -8,15 +8,15 @@
  *
  * Category 2: Live server endpoints (needs SYNC_TOKEN + R2)
  *   - Auth rejection
- *   - /snapshot/now, /snapshot/maybe, /snapshot/list, /snapshot/presign-get
- *   - Download actual snapshot from R2
- *   - /blob/presign-put, /blob/exists, /blob/presign-get
+ *   - /vault/:vaultId/snapshots, /vault/:vaultId/snapshots/maybe
+ *   - Download actual snapshot payload from the Worker
+ *   - /vault/:vaultId/blobs/:hash and /vault/:vaultId/blobs/exists
  *
  * Usage:
- *   npx tsx test-snapshots.ts
+ *   node --import jiti/register tests/snapshots.ts
  *
- * Reads server/.env for SYNC_TOKEN and R2 config.
- * Uses a dedicated test vault ID to avoid touching real data.
+ * Reads server/.env for local defaults when present.
+ * Uses a dedicated test vault ID unless YAOS_TEST_VAULT_ID is provided.
  */
 
 import * as Y from "yjs";
@@ -45,13 +45,15 @@ try {
 	console.warn("Could not read server/.env — Category 2 tests will be skipped.");
 }
 
-const HOST = "https://sync.tenetstack.com";
-const TOKEN = envVars.SYNC_TOKEN ?? "";
-const TEST_VAULT_ID = `cli-test-${Date.now().toString(36)}`;
-const ROOM_ID = `v1:${TEST_VAULT_ID}`;
+const HOST = process.env.YAOS_TEST_HOST ?? envVars.YAOS_TEST_HOST ?? "http://127.0.0.1:8787";
+const TOKEN = process.env.SYNC_TOKEN ?? envVars.SYNC_TOKEN ?? "";
+const TEST_VAULT_ID =
+	process.env.YAOS_TEST_VAULT_ID
+	?? envVars.YAOS_TEST_VAULT_ID
+	?? `cli-test-${Date.now().toString(36)}`;
 
 function baseUrl(): string {
-	return `${HOST}/parties/main/${encodeURIComponent(ROOM_ID)}`;
+	return `${HOST}/vault/${encodeURIComponent(TEST_VAULT_ID)}`;
 }
 
 // -------------------------------------------------------------------
@@ -428,6 +430,24 @@ async function serverPost(endpoint: string, body?: Record<string, unknown>): Pro
 	return { status: res.status, data };
 }
 
+async function serverPutBytes(
+	endpoint: string,
+	body: Uint8Array,
+	contentType: string,
+): Promise<{ status: number; data: any }> {
+	const url = `${baseUrl()}/${endpoint}`;
+	const res = await fetch(url, {
+		method: "PUT",
+		headers: {
+			"Content-Type": contentType,
+			Authorization: `Bearer ${TOKEN}`,
+		},
+		body,
+	});
+	const data = await res.json().catch(() => null);
+	return { status: res.status, data };
+}
+
 async function serverGet(endpoint: string): Promise<{ status: number; data: any }> {
 	const url = `${baseUrl()}/${endpoint}`;
 	const res = await fetch(url, {
@@ -440,11 +460,34 @@ async function serverGet(endpoint: string): Promise<{ status: number; data: any 
 	return { status: res.status, data };
 }
 
+async function serverGetCapabilities(): Promise<{ status: number; data: any }> {
+	const url = `${HOST.replace(/\/$/, "")}/api/capabilities`;
+	const res = await fetch(url, {
+		method: "GET",
+	});
+	const data = await res.json().catch(() => null);
+	return { status: res.status, data };
+}
+
+async function serverGetBytes(
+	endpoint: string,
+): Promise<{ status: number; bytes: Uint8Array }> {
+	const url = `${baseUrl()}/${endpoint}`;
+	const res = await fetch(url, {
+		method: "GET",
+		headers: {
+			Authorization: `Bearer ${TOKEN}`,
+		},
+	});
+	const bytes = new Uint8Array(await res.arrayBuffer());
+	return { status: res.status, bytes };
+}
+
 async function testCategory2(): Promise<void> {
 	console.log("\n═══════════════════════════════════════════════");
 	console.log("CATEGORY 2: Live server endpoints");
 	console.log(`  Host: ${HOST}`);
-	console.log(`  Room: ${ROOM_ID}`);
+	console.log(`  Vault: ${TEST_VAULT_ID}`);
 	console.log("═══════════════════════════════════════════════\n");
 
 	if (!TOKEN) {
@@ -452,40 +495,46 @@ async function testCategory2(): Promise<void> {
 		return;
 	}
 
+	const capabilities = await serverGetCapabilities();
+	assertEqual(capabilities.status, 200, "capabilities returns 200");
+	if (capabilities.data?.claimed === false) {
+		console.log("  SKIPPED: server is unclaimed");
+		return;
+	}
+
 	// --- Test: Auth rejection ---
 	console.log("--- Test: Auth rejection ---");
 	{
-		const badUrl = `${baseUrl()}/snapshot/list`;
+		const badUrl = `${baseUrl()}/snapshots`;
 		const res = await fetch(badUrl, {
 			method: "GET",
 			headers: { Authorization: "Bearer wrong-token" },
 		});
 		assertEqual(res.status, 401, "Wrong token returns 401");
 
-		const noTokenUrl = `${baseUrl()}/snapshot/list`;
+		const noTokenUrl = `${baseUrl()}/snapshots`;
 		const res2 = await fetch(noTokenUrl, { method: "GET" });
 		assertEqual(res2.status, 401, "Missing token returns 401");
+	}
+	if (!capabilities.data?.snapshots || !capabilities.data?.attachments) {
+		console.log("  SKIPPED: R2 binding is not configured for this server");
+		return;
 	}
 
 	// --- Seed a Y.Doc via WebSocket so the room has data ---
 	console.log("\n--- Seeding room with test data via WebSocket ---");
-	let wsConnected = false;
 	{
-		// We need y-partykit/provider which is a browser module.
-		// Instead, let's test the HTTP endpoints directly — they work with
-		// whatever doc state exists (even empty). The server will create
-		// the room on first HTTP request via unstable_getYDoc.
+		// These endpoints work even with an empty room.
+		// The Durable Object will be created on first request.
 		console.log("  (Using empty room — snapshot will have 0 files, which is valid)");
-		wsConnected = true; // Proceed with empty room
 	}
 
-	// --- Test: /snapshot/now ---
-	console.log("\n--- Test: POST /snapshot/now ---");
+	// --- Test: /snapshots ---
+	console.log("\n--- Test: POST /snapshots ---");
 	let snapshotId: string | undefined;
-	let snapshotDay: string | undefined;
 	{
-		const { status, data } = await serverPost("snapshot/now", { device: "cli-test" });
-		assertEqual(status, 200, "snapshot/now returns 200");
+		const { status, data } = await serverPost("snapshots", { device: "cli-test" });
+		assertEqual(status, 200, "snapshots returns 200");
 		assertEqual(data?.status, "created", "status is 'created'");
 		assert(typeof data?.snapshotId === "string", `snapshotId returned: ${data?.snapshotId}`);
 		assert(data?.index !== undefined, "index object returned");
@@ -494,25 +543,24 @@ async function testCategory2(): Promise<void> {
 			assert(typeof data.index.crdtSizeBytes === "number", `crdtSizeBytes: ${data.index.crdtSizeBytes}`);
 			assert(typeof data.index.crdtRawSizeBytes === "number", `crdtRawSizeBytes: ${data.index.crdtRawSizeBytes}`);
 			assert(Array.isArray(data.index.referencedBlobHashes), "referencedBlobHashes is array");
-			snapshotDay = data.index.day;
 		}
 		snapshotId = data?.snapshotId;
 	}
 
-	// --- Test: /snapshot/maybe (should noop since we just took one) ---
-	console.log("\n--- Test: POST /snapshot/maybe (should noop) ---");
+	// --- Test: /snapshots/maybe (should noop since we just took one) ---
+	console.log("\n--- Test: POST /snapshots/maybe (should noop) ---");
 	{
-		const { status, data } = await serverPost("snapshot/maybe", { device: "cli-test" });
-		assertEqual(status, 200, "snapshot/maybe returns 200");
+		const { status, data } = await serverPost("snapshots/maybe", { device: "cli-test" });
+		assertEqual(status, 200, "snapshots/maybe returns 200");
 		assertEqual(data?.status, "noop", "status is 'noop' (already taken today)");
 		assert(typeof data?.reason === "string", `reason: ${data?.reason}`);
 	}
 
-	// --- Test: /snapshot/list ---
-	console.log("\n--- Test: GET /snapshot/list ---");
+	// --- Test: /snapshots ---
+	console.log("\n--- Test: GET /snapshots ---");
 	{
-		const { status, data } = await serverGet("snapshot/list");
-		assertEqual(status, 200, "snapshot/list returns 200");
+		const { status, data } = await serverGet("snapshots");
+		assertEqual(status, 200, "snapshots returns 200");
 		assert(Array.isArray(data?.snapshots), "snapshots is an array");
 		assert(data.snapshots.length >= 1, `at least 1 snapshot (got ${data.snapshots.length})`);
 
@@ -523,32 +571,15 @@ async function testCategory2(): Promise<void> {
 		}
 	}
 
-	// --- Test: /snapshot/presign-get ---
-	console.log("\n--- Test: POST /snapshot/presign-get ---");
-	let presignedUrl: string | undefined;
-	if (snapshotId && snapshotDay) {
-		const { status, data } = await serverPost("snapshot/presign-get", {
-			snapshotId,
-			day: snapshotDay,
-		});
-		assertEqual(status, 200, "presign-get returns 200");
-		assert(typeof data?.url === "string", "presigned URL returned");
-		assert(typeof data?.expiresIn === "number", `expiresIn: ${data?.expiresIn}`);
-		presignedUrl = data?.url;
-	} else {
-		console.log("  SKIPPED: no snapshotId/day from previous test");
-	}
-
-	// --- Test: Download actual snapshot from R2 ---
-	console.log("\n--- Test: Download snapshot from R2 ---");
-	if (presignedUrl) {
-		const res = await fetch(presignedUrl);
-		assertEqual(res.status, 200, "R2 GET returns 200");
-		const compressed = new Uint8Array(await res.arrayBuffer());
-		assert(compressed.byteLength > 0, `downloaded ${compressed.byteLength} bytes`);
+	// --- Test: Download actual snapshot payload ---
+	console.log("\n--- Test: Download snapshot payload from Worker ---");
+	if (snapshotId) {
+		const { status, bytes } = await serverGetBytes(`snapshots/${snapshotId}`);
+		assertEqual(status, 200, "snapshot payload GET returns 200");
+		assert(bytes.byteLength > 0, `downloaded ${bytes.byteLength} bytes`);
 
 		try {
-			const raw = gunzipSync(compressed);
+			const raw = gunzipSync(bytes);
 			assert(raw.byteLength > 0, `decompressed to ${raw.byteLength} bytes`);
 
 			const doc = new Y.Doc();
@@ -563,11 +594,11 @@ async function testCategory2(): Promise<void> {
 			assert(false, `gunzip + Y.applyUpdate failed: ${err}`);
 		}
 	} else {
-		console.log("  SKIPPED: no presigned URL from previous test");
+		console.log("  SKIPPED: no snapshotId from previous test");
 	}
 
 	// --- Test: Blob endpoints ---
-	console.log("\n--- Test: Blob presign-put → upload → exists → presign-get → download ---");
+	console.log("\n--- Test: Blob PUT → exists → GET ---");
 	{
 		const testData = new TextEncoder().encode("Hello from CLI test " + Date.now());
 		// Compute a fake hash (not real SHA-256, just valid hex for testing)
@@ -576,74 +607,45 @@ async function testCategory2(): Promise<void> {
 			.join("")
 			.padEnd(64, "0");
 
-		// 1. Presign PUT
-		const putResult = await serverPost("blob/presign-put", {
-			hash: fakeHash,
-			contentType: "text/plain",
-			contentLength: testData.byteLength,
+		// 1. Direct PUT through the Worker
+		const putResult = await serverPutBytes(`blobs/${fakeHash}`, testData, "text/plain");
+		assertEqual(putResult.status, 204, "blob PUT returns 204");
+
+		// 2. Check exists
+		const existsResult = await serverPost("blobs/exists", {
+			hashes: [fakeHash, "0".repeat(64)],
 		});
-		assertEqual(putResult.status, 200, "blob/presign-put returns 200");
-		assert(typeof putResult.data?.url === "string", "presigned PUT URL returned");
+		assertEqual(existsResult.status, 200, "blobs/exists returns 200");
+		assert(
+			Array.isArray(existsResult.data?.present) && existsResult.data.present.includes(fakeHash),
+			"uploaded blob found in exists check",
+		);
+		assert(
+			!existsResult.data?.present?.includes("0".repeat(64)),
+			"non-existent blob not found (correct)",
+		);
 
-		if (putResult.data?.url) {
-			// 2. Actually upload to R2
-			const uploadRes = await fetch(putResult.data.url, {
-				method: "PUT",
-				headers: {
-					"Content-Type": "text/plain",
-					"Content-Length": String(testData.byteLength),
-				},
-				body: testData,
-			});
-			assertEqual(uploadRes.status, 200, `R2 PUT succeeded (${testData.byteLength} bytes)`);
+		// 3. Direct GET through the Worker
+		const downloadRes = await serverGetBytes(`blobs/${fakeHash}`);
+		assertEqual(downloadRes.status, 200, "blob GET returns 200");
+		assertEqual(downloadRes.bytes.byteLength, testData.byteLength, "downloaded size matches");
 
-			// 3. Check exists
-			const existsResult = await serverPost("blob/exists", {
-				hashes: [fakeHash, "0".repeat(64)],
-			});
-			assertEqual(existsResult.status, 200, "blob/exists returns 200");
-			assert(
-				Array.isArray(existsResult.data?.present) && existsResult.data.present.includes(fakeHash),
-				"uploaded blob found in exists check",
-			);
-			assert(
-				!existsResult.data?.present?.includes("0".repeat(64)),
-				"non-existent blob not found (correct)",
-			);
-
-			// 4. Presign GET
-			const getResult = await serverPost("blob/presign-get", { hash: fakeHash });
-			assertEqual(getResult.status, 200, "blob/presign-get returns 200");
-			assert(typeof getResult.data?.url === "string", "presigned GET URL returned");
-
-			if (getResult.data?.url) {
-				// 5. Download and verify
-				const downloadRes = await fetch(getResult.data.url);
-				assertEqual(downloadRes.status, 200, "R2 GET returns 200");
-				const downloaded = new Uint8Array(await downloadRes.arrayBuffer());
-				assertEqual(downloaded.byteLength, testData.byteLength, "downloaded size matches");
-
-				const downloadedStr = new TextDecoder().decode(downloaded);
-				const originalStr = new TextDecoder().decode(testData);
-				assertEqual(downloadedStr, originalStr, "downloaded content matches uploaded content");
-			}
-		}
+		const downloadedStr = new TextDecoder().decode(downloadRes.bytes);
+		const originalStr = new TextDecoder().decode(testData);
+		assertEqual(downloadedStr, originalStr, "downloaded content matches uploaded content");
 	}
 
 	// --- Test: Bad inputs ---
 	console.log("\n--- Test: Input validation ---");
 	{
-		const r1 = await serverPost("blob/presign-put", { hash: "not-a-hash" });
-		assertEqual(r1.status, 400, "invalid hash rejected (presign-put)");
+		const r1 = await serverPutBytes("blobs/not-a-hash", new TextEncoder().encode("x"), "text/plain");
+		assertEqual(r1.status, 400, "invalid hash rejected (blob PUT)");
 
-		const r2 = await serverPost("blob/presign-get", { hash: "short" });
-		assertEqual(r2.status, 400, "invalid hash rejected (presign-get)");
+		const r2 = await serverGet("blobs/short");
+		assertEqual(r2.status, 400, "invalid hash rejected (blob GET)");
 
-		const r3 = await serverPost("snapshot/presign-get", { snapshotId: "test" });
-		assertEqual(r3.status, 400, "missing day rejected (snapshot/presign-get)");
-
-		const r4 = await serverPost("snapshot/presign-get", { snapshotId: "test", day: "not-a-date" });
-		assertEqual(r4.status, 400, "invalid day format rejected");
+		const r3 = await serverGet("snapshots/does-not-exist");
+		assertEqual(r3.status, 404, "missing snapshot rejected");
 	}
 }
 
