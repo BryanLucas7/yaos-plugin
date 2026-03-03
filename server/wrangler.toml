@@ -12,11 +12,7 @@ class_name = "ServerConfig"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["VaultSyncServer"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["ServerConfig"]
+new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 
 [observability.logs]
 enabled = true
