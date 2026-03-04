@@ -263,30 +263,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.diskMirror.startMapObservers();
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
-			if (this.settings.enableAttachmentSync && this.serverSupportsAttachments) {
-				this.blobSync = new BlobSyncManager(
-					this.app,
-					this.vaultSync,
-					{
-						host: this.settings.host,
-						token: this.settings.token,
-						vaultId: this.settings.vaultId,
-						maxAttachmentSizeKB: this.settings.maxAttachmentSizeKB,
-						attachmentConcurrency: this.settings.attachmentConcurrency,
-						debug: this.settings.debug,
-						trace: this.getTraceHttpContext(),
-					},
-					this.blobHashCache,
-					(source, msg, details) => this.trace(source, msg, details),
-				);
-				this.blobSync.startObservers();
-
-				// Restore persisted queue from previous session
-				if (this.savedBlobQueue) {
-					this.blobSync.importQueue(this.savedBlobQueue);
-					this.savedBlobQueue = null;
-				}
-			}
+			await this.startBlobSyncEngine("startup", false);
 
 			// 5. Status tracking
 			this.vaultSync.provider.on("status", () => this.refreshStatusBar());
@@ -2119,6 +2096,77 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	get serverSupportsSnapshots(): boolean {
 		if (!this.settings.host) return true;
 		return this.serverCapabilities?.snapshots ?? true;
+	}
+
+	private createBlobSyncManager(): BlobSyncManager | null {
+		if (!this.vaultSync) return null;
+		if (!this.settings.host || !this.settings.token) return null;
+		return new BlobSyncManager(
+			this.app,
+			this.vaultSync,
+			{
+				host: this.settings.host,
+				token: this.settings.token,
+				vaultId: this.settings.vaultId,
+				maxAttachmentSizeKB: this.settings.maxAttachmentSizeKB,
+				attachmentConcurrency: this.settings.attachmentConcurrency,
+				debug: this.settings.debug,
+				trace: this.getTraceHttpContext(),
+			},
+			this.blobHashCache,
+			(source, msg, details) => this.trace(source, msg, details),
+		);
+	}
+
+	private async startBlobSyncEngine(reason: string, runInitialReconcile: boolean): Promise<void> {
+		if (this.blobSync) return;
+		if (!this.settings.enableAttachmentSync || !this.serverSupportsAttachments) return;
+
+		const blobSync = this.createBlobSyncManager();
+		if (!blobSync) return;
+
+		this.blobSync = blobSync;
+		this.blobSync.startObservers();
+		this.log(`Attachment sync engine started (${reason})`);
+
+		// Restore persisted queue from previous session
+		if (this.savedBlobQueue) {
+			this.blobSync.importQueue(this.savedBlobQueue);
+			this.savedBlobQueue = null;
+		}
+
+		if (runInitialReconcile) {
+			try {
+				const result = await this.blobSync.reconcile("authoritative", this.excludePatterns);
+				this.log(
+					`Attachment reconcile (${reason}): queued ` +
+					`${result.uploadQueued} uploads, ${result.downloadQueued} downloads, ${result.skipped} skipped`,
+				);
+			} catch (err) {
+				this.log(`Attachment reconcile (${reason}) failed: ${err}`);
+			}
+		}
+	}
+
+	private async stopBlobSyncEngine(reason: string): Promise<void> {
+		if (!this.blobSync) return;
+		const snapshot = this.blobSync.exportQueue();
+		if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
+			await this.saveBlobQueue();
+		}
+		this.blobSync.destroy();
+		this.blobSync = null;
+		this.log(`Attachment sync engine stopped (${reason})`);
+	}
+
+	async refreshAttachmentSyncRuntime(reason = "settings-change"): Promise<void> {
+		if (!this.vaultSync) return;
+		if (this.settings.enableAttachmentSync && this.serverSupportsAttachments) {
+			await this.startBlobSyncEngine(reason, true);
+		} else {
+			await this.stopBlobSyncEngine(reason);
+		}
+		this.refreshStatusBar();
 	}
 
 	async refreshServerCapabilities(): Promise<void> {

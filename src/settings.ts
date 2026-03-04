@@ -227,6 +227,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.onClick(async () => {
 							button.setDisabled(true);
 							await this.plugin.refreshServerCapabilities();
+							await this.plugin.refreshAttachmentSyncRuntime("capability-refresh");
 							this.display();
 						}),
 				);
@@ -255,6 +256,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.onChange(async (value) => {
 							this.plugin.settings.enableAttachmentSync = value;
 							await this.plugin.saveSettings();
+							await this.plugin.refreshAttachmentSyncRuntime("attachment-toggle");
 							this.display();
 						}),
 				);
