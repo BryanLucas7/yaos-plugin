@@ -10,7 +10,7 @@ import {
 	listSnapshots,
 	type SnapshotResult,
 } from "./snapshot";
-import { renderRunningPage, renderSetupPage } from "./setupPage";
+import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
 import { VaultSyncServer } from "./server";
 
 const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -414,6 +414,10 @@ const worker = {
 				})
 				: renderSetupPage({ host: url.origin });
 			return html(body);
+		}
+
+		if (req.method === "GET" && url.pathname === "/mobile-setup") {
+			return html(renderMobileSetupPage({ host: url.origin }));
 		}
 
 		if (req.method === "GET" && url.pathname === "/api/capabilities") {
