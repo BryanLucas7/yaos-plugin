@@ -5,6 +5,7 @@ import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
+import { randomBase64Url } from "../utils/base64url";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 const SCHEMA_VERSION = 1;
@@ -85,6 +86,7 @@ export class VaultSync {
 
 	/** Buffered renames for batch flush. */
 	private _renameBatch: Map<string, string> = new Map(); // oldPath -> newPath
+	private _renameBatchNewToOld: Map<string, string> = new Map(); // newPath -> oldPath
 	private _renameTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Callback invoked after a rename batch is flushed. */
 	private _onRenameBatchFlushed: ((renames: Map<string, string>) => void) | null = null;
@@ -549,11 +551,7 @@ export class VaultSync {
 	// -------------------------------------------------------------------
 
 	private generateFileId(): string {
-		const bytes = new Uint8Array(12);
-		crypto.getRandomValues(bytes);
-		let b64 = btoa(String.fromCharCode(...bytes));
-		b64 = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-		return b64;
+		return randomBase64Url(12);
 	}
 
 	ensureFile(path: string, currentContent: string, device?: string): Y.Text | null {
@@ -766,18 +764,14 @@ export class VaultSync {
 		oldPath = this.normPath(oldPath);
 		newPath = this.normPath(newPath);
 
-		// Check for transitive chains: if something already maps to oldPath,
-		// update that entry's target instead of adding a new one.
-		let replaced = false;
-		for (const [existingOld, existingNew] of this._renameBatch) {
-			if (existingNew === oldPath) {
-				this._renameBatch.set(existingOld, newPath);
-				replaced = true;
-				break;
-			}
+		const rootOldPath = this._renameBatchNewToOld.get(oldPath) ?? oldPath;
+		if (rootOldPath === newPath) {
+			this.deletePendingRenameByOldPath(rootOldPath);
+		} else {
+			this.setPendingRename(rootOldPath, newPath);
 		}
-		if (!replaced) {
-			this._renameBatch.set(oldPath, newPath);
+		if (rootOldPath !== oldPath) {
+			this.deletePendingRenameByOldPath(oldPath);
 		}
 
 		// Reset the debounce timer
@@ -787,12 +781,7 @@ export class VaultSync {
 
 	isPendingRenameTarget(path: string): boolean {
 		path = this.normPath(path);
-		for (const [, newPath] of this._renameBatch) {
-			if (newPath === path) {
-				return true;
-			}
-		}
-		return false;
+		return this._renameBatchNewToOld.has(path);
 	}
 
 	/**
@@ -808,7 +797,7 @@ export class VaultSync {
 		if (this._renameBatch.size === 0) return;
 
 		const batch = new Map(this._renameBatch);
-		this._renameBatch.clear();
+		this.clearPendingRenames();
 
 		this.log(`Flushing rename batch: ${batch.size} renames`);
 		this.applyRenameBatch(batch, this._device);
@@ -841,16 +830,10 @@ export class VaultSync {
 
 	private promotePendingRenameTarget(path: string, device?: string): void {
 		const normalizedPath = this.normPath(path);
-		let pendingOldPath: string | null = null;
-		for (const [oldPath, newPath] of this._renameBatch) {
-			if (newPath === normalizedPath) {
-				pendingOldPath = oldPath;
-				break;
-			}
-		}
+		const pendingOldPath = this._renameBatchNewToOld.get(normalizedPath);
 		if (!pendingOldPath) return;
 
-		this._renameBatch.delete(pendingOldPath);
+		this.deletePendingRenameByOldPath(pendingOldPath);
 		if (this._renameBatch.size === 0 && this._renameTimer) {
 			clearTimeout(this._renameTimer);
 			this._renameTimer = null;
@@ -934,33 +917,29 @@ export class VaultSync {
 		//    OLD name, rename hasn't flushed), cancel the rename and
 		//    delete from path (it's still in pathToId).
 		let resolvedPath = path;
-		for (const [oldPath, newPath] of this._renameBatch) {
-			if (newPath === path) {
-				// Case 1: delete target is the rename destination
-				this.trace?.("sync", "delete-cancelled-pending-rename", {
-					requestedPath: path,
-					pendingOldPath: oldPath,
-					pendingNewPath: newPath,
-					case: "rename-target",
-				});
-				this.log(`handleDelete: "${path}" is a pending rename target from "${oldPath}" — cancelling rename`);
-				this._renameBatch.delete(oldPath);
-				resolvedPath = oldPath;
-				break;
-			}
-			if (oldPath === path) {
-				// Case 2: delete target is the rename source
-				this.trace?.("sync", "delete-cancelled-pending-rename", {
-					requestedPath: path,
-					pendingOldPath: oldPath,
-					pendingNewPath: newPath,
-					case: "rename-source",
-				});
-				this.log(`handleDelete: "${path}" has pending rename to "${newPath}" — cancelling rename`);
-				this._renameBatch.delete(oldPath);
-				resolvedPath = path;
-				break;
-			}
+		const pendingOldPath = this._renameBatchNewToOld.get(path);
+		if (pendingOldPath) {
+			const pendingNewPath = this._renameBatch.get(pendingOldPath) ?? path;
+			this.trace?.("sync", "delete-cancelled-pending-rename", {
+				requestedPath: path,
+				pendingOldPath,
+				pendingNewPath,
+				case: "rename-target",
+			});
+			this.log(`handleDelete: "${path}" is a pending rename target from "${pendingOldPath}" — cancelling rename`);
+			this.deletePendingRenameByOldPath(pendingOldPath);
+			resolvedPath = pendingOldPath;
+		} else if (this._renameBatch.has(path)) {
+			const pendingNewPath = this._renameBatch.get(path)!;
+			this.trace?.("sync", "delete-cancelled-pending-rename", {
+				requestedPath: path,
+				pendingOldPath: path,
+				pendingNewPath,
+				case: "rename-source",
+			});
+			this.log(`handleDelete: "${path}" has pending rename to "${pendingNewPath}" — cancelling rename`);
+			this.deletePendingRenameByOldPath(path);
+			resolvedPath = path;
 		}
 
 		const fileId = this.pathToId.get(resolvedPath);
@@ -1090,9 +1069,42 @@ export class VaultSync {
 	destroy(): void {
 		this.log("Destroying VaultSync");
 		if (this._renameTimer) clearTimeout(this._renameTimer);
+		this.clearPendingRenames();
 		this.provider.destroy();
 		this.persistence.destroy();
 		this.ydoc.destroy();
+	}
+
+	private setPendingRename(oldPath: string, newPath: string): void {
+		if (oldPath === newPath) {
+			this.deletePendingRenameByOldPath(oldPath);
+			return;
+		}
+
+		const existingOldForTarget = this._renameBatchNewToOld.get(newPath);
+		if (existingOldForTarget && existingOldForTarget !== oldPath) {
+			this.deletePendingRenameByOldPath(existingOldForTarget);
+		}
+
+		const previousTarget = this._renameBatch.get(oldPath);
+		if (previousTarget) {
+			this._renameBatchNewToOld.delete(previousTarget);
+		}
+
+		this._renameBatch.set(oldPath, newPath);
+		this._renameBatchNewToOld.set(newPath, oldPath);
+	}
+
+	private deletePendingRenameByOldPath(oldPath: string): void {
+		const existingTarget = this._renameBatch.get(oldPath);
+		if (!existingTarget) return;
+		this._renameBatch.delete(oldPath);
+		this._renameBatchNewToOld.delete(existingTarget);
+	}
+
+	private clearPendingRenames(): void {
+		this._renameBatch.clear();
+		this._renameBatchNewToOld.clear();
 	}
 
 	getRecentEvents(limit = 120): Array<{ ts: string; msg: string }> {
