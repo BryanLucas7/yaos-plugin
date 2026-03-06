@@ -7,9 +7,11 @@ Under the hood, it is a real-time CRDT engine running on Cloudflare Durable Obje
 For the average user, hosting it yourself costs exactly $0/month on Cloudflare's free tier.
 
 ### One-click self-hosting
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+
 - Click this button, then 'Create and deploy'
 - Open the URL created for you, and continue from there.
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
 
 ### Features
 
@@ -27,7 +29,17 @@ If you want the absolute best, zero-effort experience, you should pay for the of
 
 YAOS syncs *keystrokes*. If you edit on two devices at once, the text merges flawlessly.
 
-If you want to read the longer rant, `<read here>`
+### Installation
+
+After you click deploy:
+
+- The Worker is deployed from this repo to your Cloudflare account.
+- The default deploy is **text sync first**. No R2 bucket is required up front.
+- On first visit to the deployed URL, the server starts in **unclaimed** mode and shows a small setup page.
+- That page generates a token in the browser and gives you a deep link `obsidian://yaos?...`, and a QR code, so you can open on desktop or mobile.
+
+Later, if you want attachments and snapshots, add an R2 binding named `YAOS_BUCKET` in the Cloudflare dashboard and redeploy. The same deployed Worker will begin reporting those features as available.
+
 If you want the design rationale and internals, read these:
 
 This repository keeps deep architecture notes under [`engineering/`](./engineering), with diagrams and operational limits documented alongside implementation details
@@ -40,16 +52,6 @@ This repository keeps deep architecture notes under [`engineering/`](./engineeri
 - **[Warts and limits](./engineering/warts-and-limits.md):** Canonical limits, safety invariants, and the pragmatic compromises currently in production.
 - **[Queue pool behavior](./engineering/queue-pool.md):** Why attachment transfer queues currently favor deterministic behavior over maximal throughput.
 
-### Installation
-
-After you click deploy:
-
-- The Worker is deployed from this repo to your Cloudflare account.
-- The default deploy is **text sync first**. No R2 bucket is required up front.
-- On first visit to the deployed URL, the server starts in **unclaimed** mode and shows a small setup page.
-- That page generates a token in the browser and gives you a deep link `obsidian://yaos?...`, and a QR code, so you can open on desktop or mobile.
-
-Later, if you want attachments and snapshots, add an R2 binding named `YAOS_BUCKET` in the Cloudflare dashboard and redeploy. The same deployed Worker will begin reporting those features as available.
 
 ### Configuration
 
