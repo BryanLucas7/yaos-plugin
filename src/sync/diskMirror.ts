@@ -106,40 +106,39 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	startMapObservers(): void {
-		const pathObserver = (event: import("yjs").YMapEvent<string>) => {
-			event.changes.keys.forEach((change, path) => {
-					if (change.action === "add" || change.action === "update") {
-						if (!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
-							this.log(`map: remote path added "${path}"`);
-							if (this.openPaths.has(path)) {
-								this.observeText(path);
-							}
-							this.scheduleWrite(path);
-						}
-					}
-				if (change.action === "delete") {
-					this.unobserveText(path);
-					if (!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
-						void this.handleRemoteDelete(path);
-					}
-				}
-			});
-		};
-		this.vaultSync.pathToId.observe(pathObserver);
-		this.mapObserverCleanups.push(() =>
-			this.vaultSync.pathToId.unobserve(pathObserver),
-		);
-
 		const metaObserver = (event: import("yjs").YMapEvent<import("../types").FileMeta>) => {
+			if (isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
+				return;
+			}
 			event.changes.keys.forEach((change, fileId) => {
-				if (change.action === "add" || change.action === "update") {
-					const meta = this.vaultSync.meta.get(fileId);
-					if (
-						meta?.deleted &&
-						!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)
-					) {
-						void this.handleRemoteDelete(meta.path);
-					}
+				const oldMeta = change.oldValue as import("../types").FileMeta | undefined;
+				const newMeta = this.vaultSync.meta.get(fileId);
+				const oldPath = typeof oldMeta?.path === "string" ? normalizePath(oldMeta.path) : null;
+				const newPath = typeof newMeta?.path === "string" ? normalizePath(newMeta.path) : null;
+				const wasDeleted = this.vaultSync.isFileMetaDeleted(oldMeta);
+				const isDeleted = this.vaultSync.isFileMetaDeleted(newMeta);
+
+				// Remote tombstone transition.
+				if (newPath && isDeleted && !wasDeleted) {
+					void this.handleRemoteDelete(newPath);
+					return;
+				}
+
+				// Remote undelete/restore transition.
+				if (newPath && !isDeleted && wasDeleted) {
+					this.scheduleWrite(newPath);
+					return;
+				}
+
+				// Remote rename/move transition from meta.path.
+				if (oldPath && newPath && oldPath !== newPath && !isDeleted) {
+					void this.handleRemoteRename(oldPath, newPath);
+					return;
+				}
+
+				// Remote create/update where the file is active.
+				if ((change.action === "add" || change.action === "update") && newPath && !isDeleted) {
+					this.scheduleWrite(newPath);
 				}
 			});
 		};
@@ -170,7 +169,7 @@ export class DiskMirror {
 
 				// Map fileId → path via meta (pathToId is path→id, not id→path)
 				const meta = this.vaultSync.meta.get(fileId);
-				if (!meta || meta.deleted) continue;
+				if (!meta || this.vaultSync.isFileMetaDeleted(meta)) continue;
 
 				const path = meta.path;
 
@@ -322,15 +321,20 @@ export class DiskMirror {
 
 		this.openWriteTimers.set(
 			path,
-			setTimeout(() => {
-				this.openWriteTimers.delete(path);
-				if (!this.pendingOpenWrites.has(path)) return;
+				setTimeout(() => {
+					this.openWriteTimers.delete(path);
+					if (!this.pendingOpenWrites.has(path)) return;
 
-				if (this.isActivelyViewedPath(path)) {
-					this.log(`open-write: deferring "${path}" (active editor focused)`);
-					this.scheduleOpenWrite(path);
-					return;
-				}
+					const ytext = this.vaultSync.getTextForPath(path);
+					const crdtContent = ytext?.toString() ?? null;
+					if (
+						this.isActivelyViewedPath(path)
+						&& this.hasFocusedEditorUnflushedChanges(path, crdtContent)
+					) {
+						this.log(`open-write: deferring "${path}" (active editor has unflushed changes)`);
+						this.scheduleOpenWrite(path);
+						return;
+					}
 
 				if (this.hasRecentEditorActivity(path)) {
 					this.log(`open-write: deferring "${path}" (recent editor activity)`);
@@ -407,10 +411,14 @@ export class DiskMirror {
 			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
 			return;
 		}
+		const content = ytext.toString();
 
 		if (!force && this.openPaths.has(path)) {
-			if (this.isActivelyViewedPath(path)) {
-				this.log(`flushWrite: deferring open "${path}" (active editor focused)`);
+			if (
+				this.isActivelyViewedPath(path)
+				&& this.hasFocusedEditorUnflushedChanges(path, content)
+			) {
+				this.log(`flushWrite: deferring open "${path}" (active editor has unflushed changes)`);
 				this.scheduleOpenWrite(path);
 				return;
 			}
@@ -421,7 +429,6 @@ export class DiskMirror {
 			}
 		}
 
-		const content = ytext.toString();
 		const normalized = normalizePath(path);
 
 		try {
@@ -458,12 +465,30 @@ export class DiskMirror {
 
 	private async handleRemoteDelete(path: string): Promise<void> {
 		const normalized = normalizePath(path);
+		const wasOpen = this.openPaths.has(normalized);
+		const wasObserved = this.textObservers.has(normalized);
+		const wasSuppressed = this.isSuppressed(normalized);
+		this.unobserveText(normalized);
+		this.openPaths.delete(normalized);
+		this.pendingOpenWrites.delete(normalized);
+		this.writeQueue.delete(normalized);
+		this.forcedWritePaths.delete(normalized);
+		const pending = this.debounceTimers.get(normalized);
+		if (pending) {
+			clearTimeout(pending);
+			this.debounceTimers.delete(normalized);
+		}
+		const openPending = this.openWriteTimers.get(normalized);
+		if (openPending) {
+			clearTimeout(openPending);
+			this.openWriteTimers.delete(normalized);
+		}
 		this.trace?.("disk", "remote-delete", {
 			path,
 			normalizedPath: normalized,
-			wasOpen: this.openPaths.has(path),
-			wasObserved: this.textObservers.has(path),
-			wasSuppressed: this.isSuppressed(path),
+			wasOpen,
+			wasObserved,
+			wasSuppressed,
 		});
 		// Unbind editor before suppressed delete so the vault `delete` event
 		// (which skips unbind due to suppression) doesn't leave a stale binding.
@@ -480,6 +505,65 @@ export class DiskMirror {
 					err,
 				);
 			}
+		}
+	}
+
+	private async handleRemoteRename(oldPath: string, newPath: string): Promise<void> {
+		const oldNormalized = normalizePath(oldPath);
+		const newNormalized = normalizePath(newPath);
+		if (oldNormalized === newNormalized) return;
+
+		const wasOpen = this.openPaths.delete(oldNormalized);
+		if (wasOpen) {
+			this.openPaths.add(newNormalized);
+		}
+		this.pendingOpenWrites.delete(oldNormalized);
+
+		const oldDebounce = this.debounceTimers.get(oldNormalized);
+		if (oldDebounce) {
+			clearTimeout(oldDebounce);
+			this.debounceTimers.delete(oldNormalized);
+		}
+		const oldOpenDebounce = this.openWriteTimers.get(oldNormalized);
+		if (oldOpenDebounce) {
+			clearTimeout(oldOpenDebounce);
+			this.openWriteTimers.delete(oldNormalized);
+		}
+
+		this.writeQueue.delete(oldNormalized);
+		this.forcedWritePaths.delete(oldNormalized);
+		this.unobserveText(oldNormalized);
+
+		this.editorBindings.updatePathsAfterRename(new Map([[oldNormalized, newNormalized]]));
+
+		const oldFile = this.app.vault.getAbstractFileByPath(oldNormalized);
+		if (oldFile instanceof TFile) {
+			try {
+				const target = this.app.vault.getAbstractFileByPath(newNormalized);
+				if (target instanceof TFile) {
+					this.suppressDelete(oldNormalized);
+					await this.app.vault.delete(oldFile);
+				} else {
+					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
+					if (dir) {
+						const dirNode = this.app.vault.getAbstractFileByPath(normalizePath(dir));
+						if (!dirNode) {
+							await this.app.vault.createFolder(dir);
+						}
+					}
+					await this.app.fileManager.renameFile(oldFile, newNormalized);
+				}
+				this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
+			} catch (err) {
+				console.error(`[yaos] handleRemoteRename failed for "${oldNormalized}" -> "${newNormalized}":`, err);
+			}
+		}
+
+		if (wasOpen) {
+			this.observeText(newNormalized);
+			this.scheduleOpenWrite(newNormalized);
+		} else {
+			this.scheduleWrite(newNormalized);
 		}
 	}
 
@@ -639,6 +723,18 @@ export class DiskMirror {
 		const lastEditorActivity = this.editorBindings.getLastEditorActivityForPath(path);
 		if (lastEditorActivity == null) return false;
 		return Date.now() - lastEditorActivity < OPEN_FILE_ACTIVE_GRACE_MS;
+	}
+
+	private hasFocusedEditorUnflushedChanges(path: string, expectedCrdtContent: string | null): boolean {
+		if (expectedCrdtContent == null) return false;
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeView?.file?.path !== path) return false;
+		try {
+			return activeView.editor.getValue() !== expectedCrdtContent;
+		} catch {
+			// If the editor instance is in flux, conservatively defer one cycle.
+			return true;
+		}
 	}
 
 	private isActivelyViewedPath(path: string): boolean {
