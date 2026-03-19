@@ -44,6 +44,8 @@ import {
 	type TraceEventDetails,
 	type TraceHttpContext,
 } from "./debug/trace";
+import { formatUnknown, yTextToString } from "./utils/format";
+import { obsidianRequest } from "./utils/http";
 
 type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
@@ -173,6 +175,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * provider sync event, even if connection generation did not change.
 	 */
 	private awaitingFirstProviderSyncAfterStartup = false;
+
+	private isMarkdownPathSyncable(path: string): boolean {
+		return isMarkdownSyncable(path, this.excludePatterns, this.app.vault.configDir);
+	}
+
+	private isBlobPathSyncable(path: string): boolean {
+		return isBlobSyncable(path, this.excludePatterns, this.app.vault.configDir);
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -444,7 +454,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		} catch (err) {
 			console.error("[yaos] Failed to initialize sync:", err);
-			new Notice(`YAOS: failed to initialize — ${err}`);
+			new Notice(`YAOS: failed to initialize — ${formatUnknown(err)}`);
 			this.updateStatusBar("error");
 		}
 	}
@@ -641,7 +651,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!live || live !== sync) return;
 				if (live.fatalAuthError) return;
 				if (live.connected || live.provider.wsconnecting) return;
-				live.provider.connect();
+					void live.provider.connect();
 			}, FAST_RECONNECT_JITTER_MS);
 		}, FAST_RECONNECT_DEBOUNCE_MS);
 	}
@@ -691,7 +701,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Filter by exclude patterns first
 			const eligibleFiles: TFile[] = [];
 			for (const file of allMdFiles) {
-				if (!isMarkdownSyncable(file.path, this.excludePatterns)) {
+				if (!this.isMarkdownPathSyncable(file.path)) {
 					excludedCount++;
 					continue;
 				}
@@ -1110,9 +1120,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
 
-				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+				if (this.isMarkdownPathSyncable(file.path)) {
 					void this.markMarkdownDirty(file, "modify");
-				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+				} else if (this.blobSync && this.isBlobPathSyncable(file.path) && !this.blobSync.isSuppressed(file.path)) {
 					this.blobSync.handleFileChange(file);
 				}
 			}),
@@ -1126,10 +1136,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
 				// Rename is relevant if either the old or new path is syncable
-				const newSyncable = isMarkdownSyncable(file.path, this.excludePatterns)
-					|| isBlobSyncable(file.path, this.excludePatterns);
-				const oldSyncable = isMarkdownSyncable(oldPath, this.excludePatterns)
-					|| isBlobSyncable(oldPath, this.excludePatterns);
+				const newSyncable = this.isMarkdownPathSyncable(file.path)
+					|| this.isBlobPathSyncable(file.path);
+				const oldSyncable = this.isMarkdownPathSyncable(oldPath)
+					|| this.isBlobPathSyncable(oldPath);
 				if (!newSyncable && !oldSyncable) return;
 				this.vaultSync?.queueRename(oldPath, file.path);
 				this.log(`Rename queued: "${oldPath}" -> "${file.path}"`);
@@ -1141,7 +1151,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
 
-				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+				if (this.isMarkdownPathSyncable(file.path)) {
 					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
 						this.log(`Suppressed delete event for "${file.path}"`);
 						return;
@@ -1155,7 +1165,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this.settings.deviceName,
 					);
 					this.log(`Delete: "${file.path}"`);
-				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+				} else if (this.blobSync && this.isBlobPathSyncable(file.path) && !this.blobSync.isSuppressed(file.path)) {
 					this.blobSync.handleFileDelete(file.path, this.settings.deviceName);
 					this.log(`Delete (blob): "${file.path}"`);
 				}
@@ -1167,9 +1177,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!this.reconciled) return;
 				if (!(file instanceof TFile)) return;
 
-				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
+				if (this.isMarkdownPathSyncable(file.path)) {
 					void this.markMarkdownDirty(file, "create");
-				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
+				} else if (this.blobSync && this.isBlobPathSyncable(file.path) && !this.blobSync.isSuppressed(file.path)) {
 					// For blob files, use the same stability check before uploading
 					if (this.pendingStabilityChecks.has(file.path)) return;
 					this.pendingStabilityChecks.add(file.path);
@@ -1264,7 +1274,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			callback: () => {
 				if (this.vaultSync) {
 					this.vaultSync.provider.disconnect();
-					this.vaultSync.provider.connect();
+					void this.vaultSync.provider.connect();
 					new Notice("YAOS: reconnecting...");
 				}
 			},
@@ -1289,7 +1299,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			callback: () => {
 				const info = this.buildDebugInfo();
 				new Notice(info, 10000);
-				console.log("[yaos] Debug status:\n" + info);
+				console.debug("[yaos] Debug status:\n" + info);
 			},
 		});
 
@@ -1302,7 +1312,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					() => new Notice("Debug info copied to clipboard."),
 					() => new Notice("Failed to copy to clipboard. Check console.", 5000),
 				);
-				console.log("[yaos] Debug info:\n" + info);
+				console.debug("[yaos] Debug info:\n" + info);
 			},
 		});
 
@@ -1312,7 +1322,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			callback: () => {
 				const text = this.buildRecentEventsText(80);
 				new Notice("Recent sync events printed to console.", 5000);
-				console.log("[yaos] Recent sync events:\n" + text);
+				console.debug("[yaos] Recent sync events:\n" + text);
 			},
 		});
 
@@ -1438,7 +1448,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					}
 				} catch (err) {
 					console.error("[yaos] Snapshot failed:", err);
-					new Notice(`Snapshot failed: ${err}`);
+					new Notice(`Snapshot failed: ${formatUnknown(err)}`);
 				}
 			},
 		});
@@ -1671,7 +1681,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async syncFileFromDisk(file: TFile): Promise<void> {
 		if (!this.vaultSync) return;
-		if (!isMarkdownSyncable(file.path, this.excludePatterns)) return;
+		if (!this.isMarkdownPathSyncable(file.path)) return;
 
 		const wasBound = this.editorBindings?.isBound(file.path) ?? false;
 
@@ -1712,7 +1722,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			if (existingText) {
-				const crdtContent = existingText.toString();
+				const crdtContent = existingText.toJSON();
 				if (crdtContent === content) return;
 
 				// Apply a line-level diff to the Y.Text instead of delete-all + insert-all.
@@ -1778,7 +1788,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			return false;
 		}
 
-		const crdtContent = existingText?.toString() ?? null;
+		const crdtContent = yTextToString(existingText);
 		if (crdtContent === content) {
 			this.boundRecoveryLocks.delete(file.path);
 			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
@@ -2147,17 +2157,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				`${host}/vault/${encodeURIComponent(roomId)}/debug/recent`,
 				this.getTraceHttpContext(),
 			);
-			const res = await fetch(url, {
+			const res = await obsidianRequest({
+				url,
 				method: "GET",
 				headers: {
 					Authorization: `Bearer ${this.settings.token}`,
 				},
 			});
-			if (!res.ok) {
+			if (res.status !== 200) {
 				throw new Error(`server debug fetch failed (${res.status})`);
 			}
 
-			const payload = (await res.json()) as {
+			const payload = res.json as {
 				recent?: unknown[];
 				roomId?: unknown;
 			};
@@ -2232,7 +2243,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const path = file.path;
 			const editorContent = view.editor.getValue();
 			const diskContent = await this.app.vault.read(file).catch(() => null);
-			const crdtContent = this.vaultSync.getTextForPath(path)?.toString() ?? null;
+			const crdtContent = yTextToString(this.vaultSync.getTextForPath(path));
 			const binding = this.editorBindings?.getBindingDebugInfoForView(view) ?? null;
 			const collab = this.editorBindings?.getCollabDebugInfoForView(view) ?? null;
 
@@ -2340,15 +2351,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
-			this.diskIndex = data._diskIndex as DiskIndex;
+			this.diskIndex = data._diskIndex;
 		}
 		// Load blob hash cache
 		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
-			this.blobHashCache = data._blobHashCache as BlobHashCache;
+			this.blobHashCache = data._blobHashCache;
 		}
 		// Load persisted blob queue
 		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
-			this.savedBlobQueue = data._blobQueue as BlobQueueSnapshot;
+			this.savedBlobQueue = data._blobQueue;
 		}
 		this.refreshPersistedState();
 		if (migratedSettings) {
@@ -2463,7 +2474,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					`${result.uploadQueued} uploads, ${result.downloadQueued} downloads, ${result.skipped} skipped`,
 				);
 			} catch (err) {
-				this.log(`Attachment reconcile (${reason}) failed: ${err}`);
+				this.log(`Attachment reconcile (${reason}) failed: ${formatUnknown(err)}`);
 			}
 		}
 	}
@@ -2515,7 +2526,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.serverCapabilities = await fetchServerCapabilities(this.settings.host);
 		} catch (err) {
 			this.serverCapabilities = null;
-			this.log(`Server capability probe failed: ${err}`);
+			this.log(`Server capability probe failed: ${formatUnknown(err)}`);
 		}
 
 		await this.handleCapabilityChange(previous, this.serverCapabilities, reason);
@@ -2587,7 +2598,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (incomingVaultId && currentVaultId && incomingVaultId !== currentVaultId) {
 			const localMarkdownCount = this.app.vault
 				.getMarkdownFiles()
-				.filter((file) => isMarkdownSyncable(file.path, this.excludePatterns))
+				.filter((file) => this.isMarkdownPathSyncable(file.path))
 				.length;
 			if (localMarkdownCount > 5) {
 				const confirmed = window.confirm(
@@ -2777,11 +2788,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const startedAt = Date.now();
 
 		const diskFiles = this.app.vault.getMarkdownFiles()
-			.filter((f) => isMarkdownSyncable(f.path, this.excludePatterns));
+			.filter((f) => this.isMarkdownPathSyncable(f.path));
 
 		const crdtPaths = new Set<string>(
 			this.vaultSync.getActiveMarkdownPaths().filter((path) =>
-				isMarkdownSyncable(path, this.excludePatterns),
+				this.isMarkdownPathSyncable(path),
 			),
 		);
 
@@ -2802,7 +2813,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		for (const path of crdtPaths) {
 			const ytext = this.vaultSync.getTextForPath(path);
 			if (!ytext) continue;
-			const content = ytext.toString();
+			const content = ytext.toJSON();
 			crdtHashes.set(path, {
 				hash: await this.sha256Hex(content),
 				length: content.length,
@@ -3258,7 +3269,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}).open();
 		} catch (err) {
 			console.error("[yaos] Failed to list snapshots:", err);
-			new Notice(`Failed to list snapshots: ${err}`);
+			new Notice(`Failed to list snapshots: ${formatUnknown(err)}`);
 		}
 	}
 
@@ -3296,7 +3307,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// --- Pre-restore backup ---
 					// Save current content of files we're about to overwrite
 					// so the user can recover if the restore goes wrong.
-					const backupDir = `.obsidian/plugins/yaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`;
+					const backupDir = normalizePath(
+						`${this.app.vault.configDir}/plugins/yaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
+					);
 					let backedUp = 0;
 					for (const path of markdownPaths) {
 						try {
@@ -3314,7 +3327,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							}
 						} catch (err) {
 							// Non-fatal: file might not exist on disk (undelete case)
-							this.log(`Backup skipped for "${path}": ${err}`);
+							this.log(`Backup skipped for "${path}": ${formatUnknown(err)}`);
 						}
 					}
 					if (backedUp > 0) {
@@ -3362,7 +3375,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			).open();
 		} catch (err) {
 			console.error("[yaos] Snapshot diff failed:", err);
-			new Notice(`Failed to load snapshot: ${err}`);
+			new Notice(`Failed to load snapshot: ${formatUnknown(err)}`);
 		}
 	}
 
@@ -3373,7 +3386,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		this.trace("plugin", msg);
 		if (this.settings.debug) {
-			console.log(`[yaos] ${msg}`);
+				console.debug(`[yaos] ${msg}`);
 		}
 	}
 
@@ -3386,7 +3399,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const message =
 			typeof (err as { message?: unknown })?.message === "string"
 				? (err as { message: string }).message
-				: String(err);
+				: formatUnknown(err);
 		const haystack = `${name} ${message}`.toLowerCase();
 		return haystack.includes("quotaexceeded")
 			|| haystack.includes("quota exceeded")
