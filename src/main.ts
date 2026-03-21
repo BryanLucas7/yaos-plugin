@@ -1269,7 +1269,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private registerCommands(): void {
 		this.addCommand({
-			id: "yaos-reconnect",
+			id: "reconnect",
 			name: "Reconnect to sync server",
 			callback: () => {
 					if (this.vaultSync) {
@@ -1281,7 +1281,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 
 			this.addCommand({
-				id: "yaos-force-reconcile",
+				id: "force-reconcile",
 				name: "Force reconcile vault with sync state",
 				callback: () => {
 					if (!this.vaultSync) return;
@@ -1294,7 +1294,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-debug-status",
+			id: "debug-status",
 			name: "Show sync debug info",
 			callback: () => {
 				const info = this.buildDebugInfo();
@@ -1304,7 +1304,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-copy-debug",
+			id: "copy-debug",
 			name: "Copy debug info to clipboard",
 			callback: () => {
 				const info = this.buildDebugInfo();
@@ -1317,7 +1317,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-show-recent-events",
+			id: "show-recent-events",
 			name: "Show recent sync events",
 			callback: () => {
 				const text = this.buildRecentEventsText(80);
@@ -1327,7 +1327,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-export-diagnostics",
+			id: "export-diagnostics",
 			name: "Export sync diagnostics",
 			callback: () => {
 				void this.exportDiagnostics();
@@ -1335,7 +1335,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-migrate-schema-v2",
+			id: "migrate-schema-v2",
 			name: "Migrate sync schema to v2",
 			callback: () => {
 				void this.runSchemaMigrationToV2();
@@ -1343,7 +1343,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 			this.addCommand({
-				id: "yaos-debug-vfs-torture-test",
+				id: "debug-vfs-torture-test",
 				name: "Run filesystem torture test (debug)",
 				checkCallback: (checking: boolean) => {
 					if (!this.settings.debug) return false;
@@ -1355,7 +1355,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-import-untracked",
+			id: "import-untracked",
 			name: "Import untracked files now",
 			callback: () => {
 				if (!this.vaultSync) {
@@ -1374,7 +1374,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-reset-cache",
+			id: "reset-cache",
 			name: "Reset local cache (re-sync from server)",
 			callback: () => {
 				if (!this.vaultSync) {
@@ -1412,7 +1412,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// --- Snapshot commands ---
 
 		this.addCommand({
-			id: "yaos-snapshot-now",
+			id: "snapshot-now",
 			name: "Take snapshot now",
 			callback: async () => {
 				if (!this.vaultSync) {
@@ -1454,7 +1454,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "yaos-snapshot-list",
+			id: "snapshot-list",
 			name: "Browse and restore snapshots",
 			callback: async () => {
 				if (!this.vaultSync) {
@@ -1476,7 +1476,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// --- Reset commands ---
 
 			this.addCommand({
-				id: "yaos-nuclear-reset",
+				id: "nuclear-reset",
 				name: "Nuclear reset (wipe sync state and reseed from disk)",
 				callback: () => {
 					if (!this.vaultSync) {
