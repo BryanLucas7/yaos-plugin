@@ -49,10 +49,16 @@ import { obsidianRequest } from "./utils/http";
 
 type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
+type PersistedServerCapabilitiesCache = {
+	host: string;
+	capabilities: ServerCapabilities;
+};
+
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
 	_blobHashCache?: BlobHashCache;
 	_blobQueue?: BlobQueueSnapshot;
+	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 };
 
 /** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
@@ -64,6 +70,30 @@ const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
 const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
+
+function isServerCapabilities(value: unknown): value is ServerCapabilities {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<ServerCapabilities>;
+	return typeof candidate.claimed === "boolean" &&
+		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
+		typeof candidate.attachments === "boolean" &&
+		typeof candidate.snapshots === "boolean";
+}
+
+function readPersistedServerCapabilitiesCache(value: unknown): PersistedServerCapabilitiesCache | null {
+	if (typeof value !== "object" || value === null) return null;
+	const candidate = value as {
+		host?: unknown;
+		capabilities?: unknown;
+	};
+	if (typeof candidate.host !== "string" || !isServerCapabilities(candidate.capabilities)) {
+		return null;
+	}
+	return {
+		host: candidate.host,
+		capabilities: candidate.capabilities,
+	};
+}
 
 export default class VaultCrdtSyncPlugin extends Plugin {
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
@@ -175,7 +205,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * provider sync event, even if connection generation did not change.
 	 */
 	private awaitingFirstProviderSyncAfterStartup = false;
-
 	private isMarkdownPathSyncable(path: string): boolean {
 		return isMarkdownSyncable(path, this.excludePatterns, this.app.vault.configDir);
 	}
@@ -185,6 +214,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async onload() {
+		const onloadStartedAt = Date.now();
 		await this.loadSettings();
 		this.registerObsidianProtocolHandler("yaos", (params) => {
 			void this.handleSetupLink(params);
@@ -212,22 +242,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.statusBarEl = this.addStatusBarItem();
 		this.updateStatusBar("disconnected");
 
+		const finishOnload = (outcome: string): void => {
+			const durationMs = Date.now() - onloadStartedAt;
+			this.trace("trace", "startup-onload-complete", {
+				durationMs,
+				outcome,
+				hostConfigured: !!this.settings.host,
+				tokenConfigured: !!this.settings.token,
+			});
+			this.log(`Startup onload complete (${outcome}) in ${durationMs}ms`);
+		};
+
 		if (this.settings.host) {
-			await this.refreshServerCapabilities();
+			void this.refreshServerCapabilities("startup-background");
 		}
 
 		if (!this.settings.host) {
 			this.log("Host not configured — sync disabled");
 			new Notice("Configure the server host in settings to enable sync.");
-			return;
-		}
-
-		if (this.serverCapabilities?.claimed === false) {
-			this.log("Server is unclaimed — sync disabled");
-			new Notice(
-				"Open your server URL in a browser, claim it, then use the setup link.",
-				10000,
-			);
+			finishOnload("missing-host");
 			return;
 		}
 
@@ -236,9 +269,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const message = this.serverAuthMode === "env"
 				? "YAOS: configure the server token in settings to enable sync."
 				: this.serverAuthMode === "claim" || this.serverAuthMode === "unclaimed"
-					? "YAOS: claim the server in a browser, then use the YAOS setup link to fill in the token."
-					: "YAOS: configure a token in settings, or claim the server in a browser first.";
+						? "YAOS: claim the server in a browser, then use the YAOS setup link to fill in the token."
+						: "YAOS: configure a token in settings, or claim the server in a browser first.";
 			new Notice(message, 10000);
+			finishOnload("missing-token");
 			return;
 		}
 
@@ -264,12 +298,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		void this.initSync();
+		finishOnload("sync-started");
 	}
 
 	private async initSync(): Promise<void> {
+		const initSyncStartedAt = Date.now();
+		this.trace("trace", "startup-init-sync-start", {
+			hostConfigured: !!this.settings.host,
+			tokenConfigured: !!this.settings.token,
+			hasCachedCapabilities: this.serverCapabilities !== null,
+		});
 		try {
 			this.idbDegradedHandled = false;
-			await this.refreshServerCapabilities();
 			this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
 			this.maxFileSize = this.settings.maxFileSizeKB * 1024;
 			this.applyCursorVisibility();
@@ -444,8 +484,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.validateAllOpenBindings("startup");
 
 			this.refreshStatusBar();
+			this.trace("trace", "startup-init-sync-complete", {
+				durationMs: Date.now() - initSyncStartedAt,
+			});
 			this.log("Startup complete");
 			this.scheduleTraceStateSnapshot("startup-complete");
+			void this.refreshServerTrace();
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -2051,7 +2095,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.traceServerInterval = setInterval(() => {
 			void this.refreshServerTrace();
 		}, 15000);
-		void this.refreshServerTrace();
 
 		const errorHandler = (event: ErrorEvent) => {
 			if (this.isIndexedDbRelatedError(event.error ?? event.message)) {
@@ -2361,6 +2404,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
 			this.savedBlobQueue = data._blobQueue;
 		}
+		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
+		if (this.settings.host && cachedCapabilities?.host === this.settings.host) {
+			this.serverCapabilities = cachedCapabilities.capabilities;
+		} else {
+			this.serverCapabilities = null;
+		}
 		this.refreshPersistedState();
 		if (migratedSettings) {
 			await this.persistPluginState();
@@ -2377,12 +2426,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	get serverSupportsAttachments(): boolean {
 		if (!this.settings.host) return true;
-		return this.serverCapabilities?.attachments ?? true;
+		return this.serverCapabilities?.attachments ?? false;
 	}
 
 	get serverSupportsSnapshots(): boolean {
 		if (!this.settings.host) return true;
-		return this.serverCapabilities?.snapshots ?? true;
+		return this.serverCapabilities?.snapshots ?? false;
 	}
 
 	buildSetupDeepLink(): string | null {
@@ -2513,23 +2562,48 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async refreshServerCapabilitiesInner(reason: string): Promise<void> {
-		this.lastCapabilityRefreshAt = Date.now();
+		const startedAt = Date.now();
+		this.lastCapabilityRefreshAt = startedAt;
 		const previous = this.serverCapabilities;
+		this.trace("trace", "capability-refresh-start", {
+			reason,
+			host: this.settings.host || null,
+		});
 
 		if (!this.settings.host) {
 			this.serverCapabilities = null;
 			await this.handleCapabilityChange(previous, null, reason);
+			this.trace("trace", "capability-refresh-end", {
+				reason,
+				durationMs: Date.now() - startedAt,
+				outcome: "no-host",
+			});
 			return;
 		}
 
 		try {
 			this.serverCapabilities = await fetchServerCapabilities(this.settings.host);
 		} catch (err) {
-			this.serverCapabilities = null;
 			this.log(`Server capability probe failed: ${formatUnknown(err)}`);
+			this.trace("trace", "capability-refresh-end", {
+				reason,
+				durationMs: Date.now() - startedAt,
+				outcome: "error",
+				error: formatUnknown(err),
+			});
+			return;
 		}
 
 		await this.handleCapabilityChange(previous, this.serverCapabilities, reason);
+		this.trace("trace", "capability-refresh-end", {
+			reason,
+			durationMs: Date.now() - startedAt,
+			outcome: "ok",
+			claimed: this.serverCapabilities?.claimed ?? null,
+			authMode: this.serverCapabilities?.authMode ?? null,
+			attachments: this.serverCapabilities?.attachments ?? null,
+			snapshots: this.serverCapabilities?.snapshots ?? null,
+		});
 	}
 
 	private async handleCapabilityChange(
@@ -2553,6 +2627,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`claimed=${next?.claimed ?? "unknown"} auth=${next?.authMode ?? "unknown"} ` +
 			`attachments=${nextAttachments ?? "unknown"} snapshots=${nextSnapshots ?? "unknown"}`,
 		);
+		void this.persistPluginState();
 		this.scheduleTraceStateSnapshot(`capabilities:${reason}`);
 
 		if (this.vaultSync) {
@@ -2711,12 +2786,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private refreshPersistedState(): void {
-		this.persistedState = {
+		const nextState: PersistedPluginState = {
 			...this.persistedState,
 			...this.settings,
 			_diskIndex: this.diskIndex,
 			_blobHashCache: this.blobHashCache,
 		};
+		if (this.settings.host && this.serverCapabilities) {
+			nextState._serverCapabilitiesCache = {
+				host: this.settings.host,
+				capabilities: this.serverCapabilities,
+			};
+		} else {
+			delete nextState._serverCapabilitiesCache;
+		}
+		this.persistedState = nextState;
 	}
 
 	private async persistPluginState(
