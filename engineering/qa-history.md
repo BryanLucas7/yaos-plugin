@@ -3,6 +3,40 @@
 This document records what we tested, what broke, what we changed, and final
 QA outcomes.
 
+## Startup/load regression follow-up (March 24, 2026)
+
+Post-release validation for the "plugin taking too long to load" and early
+attachment startup race is documented in:
+
+- [`engineering/startup-load-and-blob-gate.md`](./startup-load-and-blob-gate.md)
+
+Summary:
+
+- startup capabilities are non-blocking in `onload()`
+- blob downloads are gated until both layout-ready and startup-ready
+- sampled garden logs show `startup-onload-complete` in ~`9-15ms`
+
+## Marketplace compliance follow-up (v1.2.1 cycle)
+
+Updates were merged to `main` and released in `v1.2.1`.
+
+What we fixed:
+
+- command IDs were normalized for marketplace compliance (13 IDs; removed
+  `yaos-` prefix)
+- non-core deletion paths (migration/debug surfaces) were moved to
+  `fileManager.trashFile()`
+
+What we intentionally skipped (and why):
+
+- 3 remaining `Vault.delete()` call sites in `src/sync/blobSync.ts` and
+  `src/sync/diskMirror.ts` stay as hard deletes by design
+- these paths are core network-mediated sync state-machine operations
+  (tombstones/rename conflict handling), not user-facing delete actions
+- switching to trash semantics changes event topology (delete -> rename into
+  trash), which can be misread by sync as new state and cause resurrection
+  loops across devices
+
 ## Final QA status (March 10, 2026)
 
 Release gate status: PASS for current v1.0.0 scope.
