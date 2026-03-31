@@ -31,10 +31,18 @@ try {
 
 	const baselineVersion = read("src/version.ts");
 	const baselineWrangler = read("wrangler.toml");
+	const currentServerVersionMatch = baselineVersion.match(/SERVER_VERSION = "([^"]+)"/);
+	if (!currentServerVersionMatch) {
+		throw new Error("Unable to read current server version from src/version.ts");
+	}
+	const currentServerVersion = currentServerVersionMatch[1];
 
 	writeFileSync(
 		join(repoDir, "src/version.ts"),
-		baselineVersion.replace('SERVER_VERSION = "0.2.0"', 'SERVER_VERSION = "0.1.9"'),
+		baselineVersion.replace(
+			`SERVER_VERSION = "${currentServerVersion}"`,
+			'SERVER_VERSION = "0.1.9"',
+		),
 	);
 	writeFileSync(join(repoDir, "wrangler.toml"), `${baselineWrangler}\n# local-test-preserved\n`);
 	run("git", ["add", "-A"]);
@@ -58,7 +66,7 @@ try {
 	}
 
 	run("git", ["add", "-A"]);
-	run("git", ["commit", "-qm", "yaos(server): update to 0.2.0"]);
+	run("git", ["commit", "-qm", `yaos(server): update to ${currentServerVersion}`]);
 	run("node", ["scripts/revert-last-update.mjs"]);
 
 	const revertedVersion = read("src/version.ts");
