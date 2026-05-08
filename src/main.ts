@@ -12,14 +12,8 @@ import { DiskMirror } from "./sync/diskMirror";
 import { BlobSyncManager, type BlobQueueSnapshot } from "./sync/blobSync";
 import { parseExcludePatterns } from "./sync/exclude";
 import {
-	fetchServerCapabilities,
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
-import {
-	fetchUpdateManifest,
-	isUpdateManifest,
-	type UpdateManifest,
-} from "./update/updateManifest";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { applyDiffToYText } from "./sync/diff";
 import { decideExternalEditImport } from "./sync/externalEditPolicy";
@@ -58,23 +52,20 @@ import {
 } from "./debug/trace";
 import { DiagnosticsService } from "./diagnostics/diagnosticsService";
 import {
+	CapabilityUpdateService,
+	readPersistedServerCapabilitiesCache,
+	readPersistedUpdateManifestCache,
+	type PersistedServerCapabilitiesCache,
+	type PersistedUpdateManifestCache,
+	type UpdateState,
+} from "./runtime/capabilityUpdateService";
+import {
 	getSyncStatusLabel,
 	renderSyncStatus,
 	type SyncStatus,
 } from "./status/statusBarController";
 import { formatUnknown, yTextToString } from "./utils/format";
-import { compareSemver } from "./utils/semver";
 import { obsidianRequest } from "./utils/http";
-
-type PersistedServerCapabilitiesCache = {
-	host: string;
-	capabilities: ServerCapabilities;
-};
-
-type PersistedUpdateManifestCache = {
-	fetchedAt: number;
-	manifest: UpdateManifest;
-};
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -93,87 +84,6 @@ const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
-const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
-const UPDATE_MANIFEST_URLS = [
-	"https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json",
-] as const;
-const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
-const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/yaos-ops.yml";
-
-function buildGithubOpsBootstrapWorkflowYaml(): string {
-	return [
-		"name: YAOS Server Ops",
-		"on:",
-		"  workflow_dispatch:",
-		"    inputs:",
-		"      action: { type: choice, required: true, default: update, options: [update, revert] }",
-		"      version: { type: string, required: false }",
-		"      release_repo: { type: string, required: false, default: kavinsood/yaos }",
-		"permissions:",
-		"  contents: write",
-		"jobs:",
-		"  run:",
-		"    uses: kavinsood/yaos/.github/workflows/yaos-ops-reusable.yml@main",
-		"    with:",
-		"      action: ${{ github.event.inputs.action }}",
-		"      version: ${{ github.event.inputs.version }}",
-		"      release_repo: ${{ github.event.inputs.release_repo }}",
-		"",
-	].join("\n");
-}
-
-function isServerCapabilities(value: unknown): value is ServerCapabilities {
-	if (typeof value !== "object" || value === null) return false;
-	const candidate = value as Partial<ServerCapabilities>;
-	return typeof candidate.claimed === "boolean" &&
-		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
-		typeof candidate.attachments === "boolean" &&
-		typeof candidate.snapshots === "boolean" &&
-		typeof candidate.serverVersion === "string" &&
-		(candidate.minPluginVersion === null || typeof candidate.minPluginVersion === "string") &&
-		(candidate.recommendedPluginVersion === null || typeof candidate.recommendedPluginVersion === "string") &&
-		(candidate.minSchemaVersion === null || typeof candidate.minSchemaVersion === "number") &&
-		(candidate.maxSchemaVersion === null || typeof candidate.maxSchemaVersion === "number") &&
-		typeof candidate.migrationRequired === "boolean" &&
-		(candidate.updateProvider === null ||
-			candidate.updateProvider === "github" ||
-			candidate.updateProvider === "gitlab" ||
-			candidate.updateProvider === "unknown") &&
-		(candidate.updateRepoUrl === null || typeof candidate.updateRepoUrl === "string") &&
-		(candidate.updateRepoBranch === undefined ||
-			candidate.updateRepoBranch === null ||
-			typeof candidate.updateRepoBranch === "string");
-}
-
-function readPersistedServerCapabilitiesCache(value: unknown): PersistedServerCapabilitiesCache | null {
-	if (typeof value !== "object" || value === null) return null;
-	const candidate = value as {
-		host?: unknown;
-		capabilities?: unknown;
-	};
-	if (typeof candidate.host !== "string" || !isServerCapabilities(candidate.capabilities)) {
-		return null;
-	}
-	return {
-		host: candidate.host,
-		capabilities: candidate.capabilities,
-	};
-}
-
-function readPersistedUpdateManifestCache(value: unknown): PersistedUpdateManifestCache | null {
-	if (typeof value !== "object" || value === null) return null;
-	const candidate = value as {
-		fetchedAt?: unknown;
-		manifest?: unknown;
-	};
-	if (typeof candidate.fetchedAt !== "number" || !isUpdateManifest(candidate.manifest)) {
-		return null;
-	}
-	return {
-		fetchedAt: candidate.fetchedAt,
-		manifest: candidate.manifest,
-	};
-}
 
 export default class VaultCrdtSyncPlugin extends Plugin {
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
@@ -279,18 +189,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private traceServerInterval: ReturnType<typeof setInterval> | null = null;
 	private traceServerInFlight = false;
 	private recentServerTrace: unknown[] = [];
-	private serverCapabilities: ServerCapabilities | null = null;
-	private capabilityRefreshPromise: Promise<void> | null = null;
-	private lastCapabilityRefreshAt = 0;
-	private updateManifest: UpdateManifest | null = null;
-	private updateManifestFetchedAt = 0;
-	private updateManifestRefreshPromise: Promise<void> | null = null;
-	private lastServerUpdateNoticeVersion: string | null = null;
-	private lastPluginUpdateNoticeVersion: string | null = null;
-	private compatibilityBlockReason: string | null = null;
-	private lastPushedUpdateMetadataFingerprint: string | null = null;
-	private legacyServerDetected = false;
-	private legacyServerNoticeShown = false;
+	private capabilityUpdateService: CapabilityUpdateService | null = null;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
 	private lastMetadataRaceRejectionAt = 0;
@@ -318,6 +217,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async onload() {
 		const onloadStartedAt = Date.now();
+		this.capabilityUpdateService = new CapabilityUpdateService({
+			getSettings: () => this.settings,
+			pluginVersion: this.manifest.version,
+			schemaVersion: SCHEMA_VERSION,
+			trace: (source, msg, details) => this.trace(source, msg, details),
+			log: (message) => this.log(message),
+			persistPluginState: () => this.persistPluginState(),
+			hasSyncRuntime: () => this.vaultSync !== null,
+			isSyncConnectedAndProviderSynced: () => !!this.vaultSync?.connected && !!this.vaultSync?.providerSynced,
+			refreshAttachmentSyncRuntime: (reason) => this.refreshAttachmentSyncRuntime(reason),
+			triggerDailySnapshot: () => { void this.snapshotService?.triggerDailySnapshot(); },
+			stopSyncRuntimeForCompatibility: () => {
+				if (this.vaultSync) {
+					this.teardownSync();
+				}
+			},
+			setStatusError: () => this.updateStatusBar("error"),
+			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+		});
 		await this.loadSettings();
 		this.snapshotService = new SnapshotService({
 			app: this.app,
@@ -459,7 +377,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.trace("trace", "startup-init-sync-start", {
 			hostConfigured: !!this.settings.host,
 			tokenConfigured: !!this.settings.token,
-			hasCachedCapabilities: this.serverCapabilities !== null,
+			hasCachedCapabilities: this.capabilityUpdateService?.hasCachedCapabilities ?? false,
 		});
 		try {
 			this.idbDegradedHandled = false;
@@ -531,11 +449,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						void this.clearSavedBlobQueue();
 					}
 				}
-				const capabilityState = this.serverCapabilities;
+				const capabilityState = this.capabilityUpdateService?.capabilities ?? null;
 				const waitingForR2 =
 					!!this.settings.host &&
 					(!capabilityState || !capabilityState.attachments || !capabilityState.snapshots);
-				if (waitingForR2 && Date.now() - this.lastCapabilityRefreshAt >= CAPABILITY_REFRESH_INTERVAL_MS) {
+				if (waitingForR2 && (this.capabilityUpdateService?.shouldRefreshCapabilities() ?? false)) {
 					void this.refreshServerCapabilities("background-poll");
 				}
 			}, 3000);
@@ -2815,19 +2733,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.savedBlobQueue = data._blobQueue;
 		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
-		if (this.settings.host && cachedCapabilities?.host === this.settings.host) {
-			this.serverCapabilities = cachedCapabilities.capabilities;
-		} else {
-			this.serverCapabilities = null;
-		}
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
-		if (cachedUpdateManifest) {
-			this.updateManifest = cachedUpdateManifest.manifest;
-			this.updateManifestFetchedAt = cachedUpdateManifest.fetchedAt;
-		} else {
-			this.updateManifest = null;
-			this.updateManifestFetchedAt = 0;
-		}
+		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
 		if (migratedSettings) {
@@ -2841,17 +2748,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	get serverAuthMode(): ServerCapabilities["authMode"] | "unknown" {
-		return this.serverCapabilities?.authMode ?? "unknown";
+		return this.capabilityUpdateService?.authMode ?? "unknown";
 	}
 
 	get serverSupportsAttachments(): boolean {
-		if (!this.settings.host) return true;
-		return this.serverCapabilities?.attachments ?? false;
+		return this.capabilityUpdateService?.supportsAttachments ?? true;
 	}
 
 	get serverSupportsSnapshots(): boolean {
-		if (!this.settings.host) return true;
-		return this.serverCapabilities?.snapshots ?? false;
+		return this.capabilityUpdateService?.supportsSnapshots ?? true;
 	}
 
 	buildSetupDeepLink(): string | null {
@@ -2991,536 +2896,47 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.refreshStatusBar();
 	}
 
-	private getHardCompatibilityBlockReason(): string | null {
-		if (!this.serverCapabilities) return null;
-
-		const minPluginVersion = this.serverCapabilities.minPluginVersion;
-		if (minPluginVersion && compareSemver(this.manifest.version, minPluginVersion) === -1) {
-			return `This server requires YAOS plugin ${minPluginVersion} or newer. Update this plugin before syncing.`;
-		}
-
-		const minSchemaVersion = this.serverCapabilities.minSchemaVersion;
-		if (minSchemaVersion !== null && SCHEMA_VERSION < minSchemaVersion) {
-			return `This server requires schema version ${minSchemaVersion} or newer. Update this plugin before syncing.`;
-		}
-
-		const maxSchemaVersion = this.serverCapabilities.maxSchemaVersion;
-		if (maxSchemaVersion !== null && SCHEMA_VERSION > maxSchemaVersion) {
-			return `This plugin uses schema version ${SCHEMA_VERSION}, but this server supports up to ${maxSchemaVersion}. Update server first.`;
-		}
-
-		const minCompatibleServer = this.updateManifest?.minCompatibleServerVersionForPlugin ?? null;
-		const latestPluginVersion = this.updateManifest?.latestPluginVersion ?? null;
-		const serverVersion = this.serverCapabilities.serverVersion;
-		if (!minCompatibleServer || !latestPluginVersion || !serverVersion) {
-			return null;
-		}
-
-		const pluginVsLatest = compareSemver(this.manifest.version, latestPluginVersion);
-		const serverVsRequired = compareSemver(serverVersion, minCompatibleServer);
-		if (pluginVsLatest !== null && serverVsRequired !== null && pluginVsLatest >= 0 && serverVsRequired === -1) {
-			return `This plugin requires YAOS server ${minCompatibleServer} or newer. Update server first.`;
-		}
-		return null;
-	}
-
 	private enforceCompatibilityGuard(reason: string): boolean {
-		const blockReason = this.getHardCompatibilityBlockReason();
-		if (!blockReason) {
-			if (this.compatibilityBlockReason) {
-				this.log(`Compatibility guard cleared (${reason})`);
-				this.compatibilityBlockReason = null;
-			}
-			return false;
-		}
-
-		const firstBlock = this.compatibilityBlockReason !== blockReason;
-		this.compatibilityBlockReason = blockReason;
-		this.log(`Compatibility guard (${reason}): ${blockReason}`);
-		if (firstBlock) {
-			new Notice(`YAOS: ${blockReason}`, 12000);
-		}
-
-		if (this.vaultSync) {
-			this.teardownSync();
-		}
-		this.updateStatusBar("error");
-		return true;
+		return this.capabilityUpdateService?.enforceCompatibilityGuard(reason) ?? false;
 	}
 
 	async refreshServerCapabilities(reason = "manual"): Promise<void> {
-		if (this.capabilityRefreshPromise) {
-			return await this.capabilityRefreshPromise;
-		}
-
-		this.capabilityRefreshPromise = this.refreshServerCapabilitiesInner(reason)
-			.finally(() => {
-				this.capabilityRefreshPromise = null;
-			});
-		return await this.capabilityRefreshPromise;
-	}
-
-	private async refreshServerCapabilitiesInner(reason: string): Promise<void> {
-		const startedAt = Date.now();
-		this.lastCapabilityRefreshAt = startedAt;
-		const previous = this.serverCapabilities;
-		this.trace("trace", "capability-refresh-start", {
-			reason,
-			host: this.settings.host || null,
-		});
-
-		if (!this.settings.host) {
-			this.legacyServerDetected = false;
-			this.serverCapabilities = null;
-			await this.handleCapabilityChange(previous, null, reason);
-			this.trace("trace", "capability-refresh-end", {
-				reason,
-				durationMs: Date.now() - startedAt,
-				outcome: "no-host",
-			});
-			return;
-		}
-
-		try {
-			this.serverCapabilities = await fetchServerCapabilities(this.settings.host);
-			const serverVersion = (this.serverCapabilities as { serverVersion?: unknown } | null)?.serverVersion;
-			if (typeof serverVersion === "string" && serverVersion.trim()) {
-				this.legacyServerDetected = false;
-			} else {
-				this.legacyServerDetected = true;
-				this.maybeShowLegacyServerNotice();
-			}
-		} catch (err) {
-			const errorText = formatUnknown(err);
-			this.log(`Server capability probe failed: ${errorText}`);
-			if (errorText.includes("capabilities request failed (404)")) {
-				this.legacyServerDetected = true;
-				this.maybeShowLegacyServerNotice();
-			}
-			this.trace("trace", "capability-refresh-end", {
-				reason,
-				durationMs: Date.now() - startedAt,
-				outcome: "error",
-				error: errorText,
-			});
-			return;
-		}
-
-		await this.handleCapabilityChange(previous, this.serverCapabilities, reason);
-		this.trace("trace", "capability-refresh-end", {
-			reason,
-			durationMs: Date.now() - startedAt,
-			outcome: "ok",
-			claimed: this.serverCapabilities?.claimed ?? null,
-			authMode: this.serverCapabilities?.authMode ?? null,
-			attachments: this.serverCapabilities?.attachments ?? null,
-			snapshots: this.serverCapabilities?.snapshots ?? null,
-			serverVersion: this.serverCapabilities?.serverVersion ?? null,
-			migrationRequired: this.serverCapabilities?.migrationRequired ?? null,
-			updateProvider: this.serverCapabilities?.updateProvider ?? null,
-		});
-	}
-
-	private async handleCapabilityChange(
-		previous: ServerCapabilities | null,
-		next: ServerCapabilities | null,
-		reason: string,
-	): Promise<void> {
-		const prevAttachments = previous?.attachments ?? null;
-		const prevSnapshots = previous?.snapshots ?? null;
-		const nextAttachments = next?.attachments ?? null;
-		const nextSnapshots = next?.snapshots ?? null;
-		const changed =
-			prevAttachments !== nextAttachments ||
-			prevSnapshots !== nextSnapshots ||
-			previous?.authMode !== next?.authMode ||
-			previous?.claimed !== next?.claimed ||
-			previous?.serverVersion !== next?.serverVersion ||
-			previous?.migrationRequired !== next?.migrationRequired ||
-			previous?.updateProvider !== next?.updateProvider ||
-				previous?.updateRepoUrl !== next?.updateRepoUrl ||
-				previous?.updateRepoBranch !== next?.updateRepoBranch;
-		await this.hydrateUpdateMetadataFromCapabilities(`capability-change:${reason}`);
-		if (!changed) return;
-
-		this.log(
-			`Server capabilities updated (${reason}): ` +
-			`claimed=${next?.claimed ?? "unknown"} auth=${next?.authMode ?? "unknown"} ` +
-			`attachments=${nextAttachments ?? "unknown"} snapshots=${nextSnapshots ?? "unknown"} ` +
-			`serverVersion=${next?.serverVersion ?? "unknown"} migrationRequired=${next?.migrationRequired ?? "unknown"} ` +
-			`updateProvider=${next?.updateProvider ?? "unknown"} updateBranch=${next?.updateRepoBranch ?? "unknown"}`,
-		);
-		void this.persistPluginState();
-		this.scheduleTraceStateSnapshot(`capabilities:${reason}`);
-
-		if (this.vaultSync) {
-			await this.refreshAttachmentSyncRuntime(`capability-change:${reason}`);
-		}
-
-		const gainedR2 = prevAttachments === false && nextAttachments === true;
-		const lostR2 = prevAttachments === true && nextAttachments === false;
-		if (gainedR2) {
-			new Notice(
-				this.settings.enableAttachmentSync
-					? "YAOS: R2 backend detected. Attachments and snapshots are now available."
-					: "YAOS: R2 backend detected. Attachments and snapshots are available if you enable them in settings.",
-				7000,
-			);
-			if (this.vaultSync?.connected && this.vaultSync.providerSynced && this.serverSupportsSnapshots) {
-				void this.snapshotService?.triggerDailySnapshot();
-			}
-			} else if (lostR2) {
-				new Notice(
-					"Object storage is unavailable. Attachment transfers are paused and snapshots are unavailable.",
-					7000,
-				);
-			}
-		this.maybeShowUpdateNotices(reason);
-		this.enforceCompatibilityGuard(`capability-change:${reason}`);
-	}
-
-	private async hydrateUpdateMetadataFromCapabilities(reason: string): Promise<void> {
-		const capabilities = this.serverCapabilities;
-		if (!capabilities?.updateRepoUrl) return;
-
-		let changed = false;
-		if (!this.settings.updateRepoUrl.trim()) {
-			this.settings.updateRepoUrl = capabilities.updateRepoUrl;
-			changed = true;
-		}
-		const localBranch = this.settings.updateRepoBranch.trim();
-		if ((!localBranch || localBranch === "main")
-			&& capabilities.updateRepoBranch
-			&& capabilities.updateRepoBranch.trim()
-			&& capabilities.updateRepoBranch !== localBranch) {
-			this.settings.updateRepoBranch = capabilities.updateRepoBranch;
-			changed = true;
-		}
-		if (!changed) return;
-
-		this.log(`Hydrated update metadata from server (${reason})`);
-		await this.persistPluginState();
+		await this.capabilityUpdateService?.refreshServerCapabilities(reason);
 	}
 
 	async refreshUpdateManifest(reason = "manual", force = false): Promise<void> {
-		if (this.updateManifestRefreshPromise) {
-			return await this.updateManifestRefreshPromise;
-		}
-
-		this.updateManifestRefreshPromise = this.refreshUpdateManifestInner(reason, force)
-			.finally(() => {
-				this.updateManifestRefreshPromise = null;
-			});
-		return await this.updateManifestRefreshPromise;
+		await this.capabilityUpdateService?.refreshUpdateManifest(reason, force);
 	}
 
-	private async refreshUpdateManifestInner(reason: string, force: boolean): Promise<void> {
-		const startedAt = Date.now();
-		const cacheAgeMs = startedAt - this.updateManifestFetchedAt;
-		if (!force && this.updateManifest && cacheAgeMs >= 0 && cacheAgeMs < UPDATE_MANIFEST_CACHE_MS) {
-			this.trace("trace", "update-manifest-refresh-end", {
-				reason,
-				durationMs: Date.now() - startedAt,
-				outcome: "cached",
-				cacheAgeMs,
-				latestServerVersion: this.updateManifest.latestServerVersion,
-				latestPluginVersion: this.updateManifest.latestPluginVersion,
-			});
-			this.maybeShowUpdateNotices(`manifest-cache:${reason}`);
-			return;
-		}
-
-		this.trace("trace", "update-manifest-refresh-start", {
-			reason,
-			urls: UPDATE_MANIFEST_URLS,
-			cacheAgeMs: this.updateManifestFetchedAt > 0 ? cacheAgeMs : null,
-		});
-
-		let fetchedFrom: string | null = null;
-		try {
-			let nextManifest: UpdateManifest | null = null;
-			let lastError: unknown = null;
-			for (const url of UPDATE_MANIFEST_URLS) {
-				try {
-					nextManifest = await fetchUpdateManifest(url);
-					fetchedFrom = url;
-					break;
-				} catch (err) {
-					lastError = err;
-					this.log(`Update manifest fetch failed from ${url}: ${formatUnknown(err)}`);
-				}
-				}
-				if (!nextManifest) {
-					throw lastError instanceof Error
-						? lastError
-						: new Error("all update manifest sources failed");
-				}
-			this.updateManifest = nextManifest;
-			this.updateManifestFetchedAt = Date.now();
-			await this.persistPluginState();
-			this.trace("trace", "update-manifest-refresh-end", {
-				reason,
-				durationMs: Date.now() - startedAt,
-				outcome: "ok",
-				sourceUrl: fetchedFrom,
-				latestServerVersion: this.updateManifest.latestServerVersion,
-				latestPluginVersion: this.updateManifest.latestPluginVersion,
-			});
-		} catch (err) {
-			this.log(`Update manifest fetch failed: ${formatUnknown(err)}`);
-			this.trace("trace", "update-manifest-refresh-end", {
-				reason,
-				durationMs: Date.now() - startedAt,
-				outcome: "error",
-				error: formatUnknown(err),
-			});
-			return;
-		}
-
-		this.maybeShowUpdateNotices(reason);
-		this.enforceCompatibilityGuard(`manifest-refresh:${reason}`);
-	}
-
-	private maybeShowUpdateNotices(reason: string): void {
-		const updateState = this.getUpdateState();
-		if (updateState.serverUpdateAvailable && updateState.latestServerVersion) {
-			if (this.lastServerUpdateNoticeVersion !== updateState.latestServerVersion) {
-				if (!updateState.updateActionUrl) {
-					new Notice(
-						`YAOS: server update ${updateState.latestServerVersion} is available. ` +
-						"Set your deployment repo URL in YAOS settings to enable 1-click updates.",
-						12000,
-					);
-				} else {
-					const actionLabel = updateState.updateActionLabel;
-					new Notice(
-						updateState.migrationRequired
-							? `YAOS: a server migration update (${updateState.latestServerVersion}) is available. Open ${actionLabel} before updating.`
-							: `YAOS: a server update (${updateState.latestServerVersion}) is available. Open ${actionLabel} to update when ready.`,
-						10000,
-					);
-				}
-				this.lastServerUpdateNoticeVersion = updateState.latestServerVersion;
-				this.log(
-					`Update notice (${reason}): server ${updateState.serverVersion ?? "unknown"} -> ${updateState.latestServerVersion}`,
-				);
-			}
-		}
-
-		if (updateState.pluginUpdateRecommended && updateState.latestPluginVersion) {
-			if (this.lastPluginUpdateNoticeVersion !== updateState.latestPluginVersion) {
-				new Notice(
-					`YAOS: plugin update recommended (${updateState.latestPluginVersion}). Update this device to stay current with server compatibility guidance.`,
-					10000,
-				);
-				this.lastPluginUpdateNoticeVersion = updateState.latestPluginVersion;
-				this.log(
-					`Update notice (${reason}): plugin ${this.manifest.version} -> ${updateState.latestPluginVersion}`,
-				);
-			}
-		}
-	}
-
-	private inferUpdateProvider(repoUrl: string | null | undefined): "github" | "gitlab" | "unknown" | null {
-		if (!repoUrl) return null;
-		try {
-			const parsed = new URL(repoUrl);
-			const host = parsed.hostname.toLowerCase();
-			if (host.includes("github.")) return "github";
-			if (host.includes("gitlab.")) return "gitlab";
-			return "unknown";
-		} catch {
-			return null;
-		}
-	}
-
-	private maybeShowLegacyServerNotice(): void {
-		if (this.legacyServerNoticeShown) return;
-		new Notice(
-			"Legacy server detected. Sync continues, but update metadata and 1-click updater features need a newer server.",
-			12000,
-		);
-		this.legacyServerNoticeShown = true;
-	}
-
-	getUpdateState(): {
-		serverVersion: string | null;
-		latestServerVersion: string | null;
-		serverUpdateAvailable: boolean;
-		pluginVersion: string;
-		latestPluginVersion: string | null;
-		pluginUpdateRecommended: boolean;
-		migrationRequired: boolean;
-		updateProvider: ServerCapabilities["updateProvider"] | "unknown";
-		updateRepoUrl: string | null;
-		updateActionUrl: string | null;
-		updateBootstrapUrl: string | null;
-		updateActionLabel: string;
-		legacyServerDetected: boolean;
-		pluginCompatibilityWarning: string | null;
-	} {
-		const serverVersion = this.serverCapabilities?.serverVersion ?? null;
-		const latestServerVersion = this.updateManifest?.latestServerVersion ?? null;
-		const serverUpdateAvailable =
-			serverVersion !== null &&
-			latestServerVersion !== null &&
-			compareSemver(serverVersion, latestServerVersion) === -1;
-
-		const latestPluginVersion = this.updateManifest?.latestPluginVersion ?? null;
-		const pluginUpdateRecommended =
-			latestPluginVersion !== null &&
-			compareSemver(this.manifest.version, latestPluginVersion) === -1;
-
-		const effectiveRepoUrl = this.settings.updateRepoUrl.trim() ||
-			this.serverCapabilities?.updateRepoUrl ||
-			null;
-		const effectiveProvider = this.inferUpdateProvider(effectiveRepoUrl) ||
-			this.serverCapabilities?.updateProvider ||
-			"unknown";
-
-		let pluginCompatibilityWarning: string | null = null;
-		const minPluginVersion = this.serverCapabilities?.minPluginVersion ?? null;
-		if (minPluginVersion && compareSemver(this.manifest.version, minPluginVersion) === -1) {
-			pluginCompatibilityWarning =
-				`This server requires YAOS plugin ${minPluginVersion} or newer.`;
-		} else {
-			const minSchemaVersion = this.serverCapabilities?.minSchemaVersion ?? null;
-			const maxSchemaVersion = this.serverCapabilities?.maxSchemaVersion ?? null;
-			if (minSchemaVersion !== null && SCHEMA_VERSION < minSchemaVersion) {
-				pluginCompatibilityWarning =
-					`This server requires schema version ${minSchemaVersion} or newer.`;
-			} else if (maxSchemaVersion !== null && SCHEMA_VERSION > maxSchemaVersion) {
-				pluginCompatibilityWarning =
-					`This plugin uses schema version ${SCHEMA_VERSION}, but the server currently supports up to ${maxSchemaVersion}.`;
-			}
-		}
-
-		return {
-			serverVersion,
-			latestServerVersion,
-			serverUpdateAvailable,
+	getUpdateState(): UpdateState {
+		return this.capabilityUpdateService?.getUpdateState() ?? {
+			serverVersion: null,
+			latestServerVersion: null,
+			serverUpdateAvailable: false,
 			pluginVersion: this.manifest.version,
-			latestPluginVersion,
-			pluginUpdateRecommended,
-			migrationRequired: this.updateManifest?.migrationRequired ?? this.serverCapabilities?.migrationRequired ?? false,
-			updateProvider: effectiveProvider,
-			updateRepoUrl: effectiveRepoUrl,
-			updateActionUrl: this.buildServerUpdateUrl(),
-			updateBootstrapUrl: this.buildGithubUpdaterBootstrapUrl(),
-			updateActionLabel: effectiveRepoUrl
-				? effectiveProvider === "gitlab"
-					? "your GitLab pipeline"
-					: "your GitHub workflow"
-				: "YAOS settings",
-			legacyServerDetected: this.legacyServerDetected,
-			pluginCompatibilityWarning,
+			latestPluginVersion: null,
+			pluginUpdateRecommended: false,
+			migrationRequired: false,
+			updateProvider: "unknown",
+			updateRepoUrl: null,
+			updateActionUrl: null,
+			updateBootstrapUrl: null,
+			updateActionLabel: "YAOS settings",
+			legacyServerDetected: false,
+			pluginCompatibilityWarning: null,
 		};
 	}
 
 	buildServerUpdateUrl(): string | null {
-		const repoUrl = this.settings.updateRepoUrl.trim() || this.serverCapabilities?.updateRepoUrl;
-		const provider = this.inferUpdateProvider(repoUrl) || this.serverCapabilities?.updateProvider;
-		if (!repoUrl || !provider) return null;
-		const normalizedRepoUrl = repoUrl.replace(/\/+$/, "").replace(/\.git$/, "");
-		const branch = this.settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main";
-		if (provider === "github") {
-			return `${normalizedRepoUrl}/actions/workflows/yaos-ops.yml`;
-		}
-		if (provider === "gitlab") {
-			return `${normalizedRepoUrl}/-/pipelines/new?ref=${encodeURIComponent(branch)}`;
-		}
-		return null;
+		return this.capabilityUpdateService?.buildServerUpdateUrl() ?? null;
 	}
 
 	buildGithubUpdaterBootstrapUrl(): string | null {
-		const repoUrl = this.settings.updateRepoUrl.trim() || this.serverCapabilities?.updateRepoUrl;
-		const provider = this.inferUpdateProvider(repoUrl) || this.serverCapabilities?.updateProvider;
-		if (!repoUrl || provider !== "github") return null;
-		const normalizedRepoUrl = repoUrl.replace(/\/+$/, "").replace(/\.git$/, "");
-		const branch = encodeURIComponent(
-			this.settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main",
-		);
-		const filename = encodeURIComponent(GITHUB_OPS_WORKFLOW_PATH);
-		const workflowValue = encodeURIComponent(buildGithubOpsBootstrapWorkflowYaml());
-		return `${normalizedRepoUrl}/new/${branch}?filename=${filename}&value=${workflowValue}`;
-	}
-
-	private buildUpdateMetadataPayload(): {
-		updateProvider: "github" | "gitlab" | "unknown";
-		updateRepoUrl: string;
-		updateRepoBranch: string | null;
-	} | null {
-		let updateRepoUrl: string | null = null;
-		const rawRepoUrl = this.settings.updateRepoUrl.trim();
-		if (rawRepoUrl) {
-			try {
-				const parsed = new URL(rawRepoUrl);
-				if ((parsed.protocol === "https:" || parsed.protocol === "http:")
-					&& parsed.pathname.split("/").filter(Boolean).length >= 2) {
-					parsed.search = "";
-					parsed.hash = "";
-					updateRepoUrl = parsed.toString().replace(/\/+$/, "").replace(/\.git$/i, "");
-				}
-			} catch {
-				updateRepoUrl = null;
-			}
-		}
-		if (!updateRepoUrl) {
-			return null;
-		}
-		const updateProvider = this.inferUpdateProvider(updateRepoUrl) ?? "unknown";
-
-		const branch = this.settings.updateRepoBranch.trim();
-		const updateRepoBranch = branch.length > 0 ? branch : (this.serverCapabilities?.updateRepoBranch ?? null);
-		return {
-			updateProvider,
-			updateRepoUrl,
-			updateRepoBranch,
-		};
+		return this.capabilityUpdateService?.buildGithubUpdaterBootstrapUrl() ?? null;
 	}
 
 	private async syncUpdateMetadataToServer(reason: string): Promise<void> {
-		const host = this.settings.host.trim().replace(/\/$/, "");
-		const token = this.settings.token.trim();
-		if (!host || !token) return;
-
-		const payload = this.buildUpdateMetadataPayload();
-		if (!payload) {
-			return;
-		}
-		const fingerprint = JSON.stringify(payload);
-		if (fingerprint === this.lastPushedUpdateMetadataFingerprint) {
-			return;
-		}
-
-		try {
-			const res = await obsidianRequest({
-				url: `${host}/api/update-metadata`,
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${token}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify(payload),
-			});
-			if (res.status !== 200) {
-				this.log(`Update metadata push (${reason}) failed (${res.status})`);
-				return;
-			}
-
-			const body = res.json as { capabilities?: unknown };
-			const nextCapabilities = isServerCapabilities(body?.capabilities) ? body.capabilities : null;
-			this.lastPushedUpdateMetadataFingerprint = fingerprint;
-			if (!nextCapabilities) {
-				return;
-			}
-
-			const previous = this.serverCapabilities;
-			this.serverCapabilities = nextCapabilities;
-			await this.handleCapabilityChange(previous, nextCapabilities, `metadata-sync:${reason}`);
-		} catch (err) {
-			this.log(`Update metadata push (${reason}) failed: ${formatUnknown(err)}`);
-		}
+		await this.capabilityUpdateService?.syncUpdateMetadataToServer(reason);
 	}
 
 		private async confirmVaultIdSwitch(
@@ -3661,19 +3077,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			_diskIndex: this.diskIndex,
 			_blobHashCache: this.blobHashCache,
 		};
-		if (this.settings.host && this.serverCapabilities) {
-			nextState._serverCapabilitiesCache = {
-				host: this.settings.host,
-				capabilities: this.serverCapabilities,
-			};
+		const cachedCapabilities = this.capabilityUpdateService?.getPersistedServerCapabilitiesCache();
+		if (cachedCapabilities) {
+			nextState._serverCapabilitiesCache = cachedCapabilities;
 		} else {
 			delete nextState._serverCapabilitiesCache;
 		}
-		if (this.updateManifest && this.updateManifestFetchedAt > 0) {
-			nextState._updateManifestCache = {
-				fetchedAt: this.updateManifestFetchedAt,
-				manifest: this.updateManifest,
-			};
+		const cachedUpdateManifest = this.capabilityUpdateService?.getPersistedUpdateManifestCache();
+		if (cachedUpdateManifest) {
+			nextState._updateManifestCache = cachedUpdateManifest;
 		} else {
 			delete nextState._updateManifestCache;
 		}
