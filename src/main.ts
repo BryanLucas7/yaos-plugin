@@ -60,6 +60,10 @@ import {
 	type UpdateState,
 } from "./runtime/capabilityUpdateService";
 import {
+	ConnectionController,
+	type ConnectionState,
+} from "./runtime/connectionController";
+import {
 	getSyncStatusLabel,
 	renderSyncStatus,
 	type SyncStatus,
@@ -78,9 +82,6 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 
 /** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
 const RECONCILE_COOLDOWN_MS = 10_000;
-const FAST_RECONNECT_DEBOUNCE_MS = 1_000;
-const FAST_RECONNECT_JITTER_MS = 500;
-const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
@@ -89,6 +90,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
 
 	private vaultSync: VaultSync | null = null;
+	private connectionController: ConnectionController | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private blobSync: BlobSyncManager | null = null;
@@ -120,14 +122,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * Used to detect reconnects that need re-reconciliation.
 	 */
 	private lastReconciledGeneration = 0;
-
-	/** Visibility change handler reference for cleanup. */
-	private visibilityHandler: (() => void) | null = null;
-	private onlineHandler: (() => void) | null = null;
-	private offlineHandler: (() => void) | null = null;
-	private fastReconnectDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-	private fastReconnectConnectTimer: ReturnType<typeof setTimeout> | null = null;
-	private lastFastReconnectAt = 0;
 
 	/** Track the set of currently observed file paths for disk mirror cleanup. */
 	private openFilePaths = new Set<string>();
@@ -430,7 +424,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.startBlobSyncEngine("startup", false);
 
 			// 5. Status tracking
-			this.vaultSync.provider.on("status", () => this.refreshStatusBar());
+			this.connectionController = new ConnectionController({
+				getVaultSync: () => this.vaultSync,
+				isReconciled: () => this.reconciled,
+				getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
+				setAwaitingFirstProviderSyncAfterStartup: (value) => {
+					this.awaitingFirstProviderSyncAfterStartup = value;
+				},
+				getLastReconciledGeneration: () => this.lastReconciledGeneration,
+				setReconnectPending: () => {
+					this.reconcilePending = true;
+				},
+				isReconcileInFlight: () => this.reconcileInFlight,
+				runReconnectReconciliation: (generation) => {
+					void this.runReconnectReconciliation(generation);
+				},
+				refreshServerCapabilities: (reason) => {
+					void this.refreshServerCapabilities(reason);
+				},
+				flushOpenWrites: (reason) => {
+					void this.diskMirror?.flushOpenWrites(reason);
+				},
+				updateOfflineStatus: () => this.updateStatusBar("offline"),
+				refreshStatusBar: () => this.refreshStatusBar(),
+				scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+				log: (message) => this.log(message),
+				trace: (source, msg, details) => this.trace(source, msg, details),
+				registerCleanup: (cleanup) => this.register(cleanup),
+			});
+			this.connectionController.start();
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
 				if (this.reconciled && this.editorBindings) {
@@ -495,13 +517,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					}
 				}
 			});
-
-			// 9. Reconnection: re-reconcile when provider re-syncs
-			this.setupReconnectionHandler();
-
-			// 10. Visibility change: force reconnect on foreground
-			this.setupVisibilityHandler();
-			this.setupNetworkHandlers();
 
 			// -----------------------------------------------------------
 			// STARTUP SEQUENCE
@@ -588,60 +603,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
-	// -------------------------------------------------------------------
-	// Reconnection
-	// -------------------------------------------------------------------
-
-	/**
-	 * Listen for provider sync events after initial startup.
-	 * When the provider syncs at a new generation (reconnect), trigger
-	 * an authoritative re-reconciliation to catch any drift.
-	 */
-	private setupReconnectionHandler(): void {
-		if (!this.vaultSync) return;
-
-		this.vaultSync.onProviderSync((generation) => {
-			// Skip the initial sync — that's handled by the startup sequence
-			if (!this.reconciled) {
-				this.log(`Provider sync ignored: initial startup still running (gen ${generation})`);
-				return;
-			}
-
-			// If startup timed out waiting for provider sync, the first late
-			// sync can arrive on the same connection generation. We still need
-			// one authoritative reconcile to import any remote changes.
-			if (this.awaitingFirstProviderSyncAfterStartup) {
-				this.awaitingFirstProviderSyncAfterStartup = false;
-				this.log(`Late first provider sync (gen ${generation}) — scheduling catch-up reconciliation`);
-				if (this.reconcileInFlight) {
-					this.log("Late first sync arrived during reconcile — marked pending");
-					this.reconcilePending = true;
-					return;
-				}
-				void this.runReconnectReconciliation(generation);
-				return;
-			}
-
-			// Skip if we already reconciled at this generation
-			if (generation <= this.lastReconciledGeneration) {
-				this.log(
-					`Provider sync ignored: generation ${generation} <= lastReconciledGeneration ${this.lastReconciledGeneration}`,
-				);
-				return;
-			}
-
-			this.log(`Reconnect detected (gen ${generation}) — scheduling re-reconciliation`);
-
-			if (this.reconcileInFlight) {
-				this.log("Reconnect sync arrived during reconcile — marked pending");
-				this.reconcilePending = true;
-				return;
-			}
-
-			void this.runReconnectReconciliation(generation);
-		});
-	}
-
 	/**
 	 * Lightweight authoritative reconcile after a reconnection.
 	 * Fresh disk read to catch any drift during disconnect.
@@ -671,118 +632,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
 			}
 		}
-	}
-
-	/**
-	 * On visibility change (foreground): if the provider is disconnected,
-	 * force a reconnect. Handles Android backgrounding and desktop
-	 * sleep/wake where sockets silently die.
-	 */
-	private setupVisibilityHandler(): void {
-		if (this.visibilityHandler) {
-			document.removeEventListener("visibilitychange", this.visibilityHandler);
-		}
-
-		this.visibilityHandler = () => {
-			if (document.visibilityState === "hidden") {
-				void this.diskMirror?.flushOpenWrites("app-backgrounded");
-				return;
-			}
-			if (document.visibilityState !== "visible") return;
-			if (!this.vaultSync) return;
-			if (this.vaultSync.fatalAuthError) return;
-
-			void this.refreshServerCapabilities("app-foregrounded");
-			this.requestFastReconnect("app-foregrounded");
-		};
-
-		document.addEventListener("visibilitychange", this.visibilityHandler);
-		this.register(() => {
-			if (this.visibilityHandler) {
-				document.removeEventListener("visibilitychange", this.visibilityHandler);
-			}
-			});
-	}
-
-	private setupNetworkHandlers(): void {
-		if (this.onlineHandler) {
-			window.removeEventListener("online", this.onlineHandler);
-		}
-		if (this.offlineHandler) {
-			window.removeEventListener("offline", this.offlineHandler);
-		}
-
-		this.onlineHandler = () => {
-			this.log("Network online event — requesting fast reconnect");
-			this.scheduleTraceStateSnapshot("network-online");
-			void this.refreshServerCapabilities("network-online");
-			this.requestFastReconnect("network-online");
-		};
-
-		this.offlineHandler = () => {
-			this.log("Network offline event — marking status offline");
-			this.scheduleTraceStateSnapshot("network-offline");
-			if (this.vaultSync?.fatalAuthError) {
-				this.refreshStatusBar();
-				return;
-			}
-			this.updateStatusBar("offline");
-		};
-
-		window.addEventListener("online", this.onlineHandler);
-		window.addEventListener("offline", this.offlineHandler);
-		this.register(() => {
-			if (this.onlineHandler) {
-				window.removeEventListener("online", this.onlineHandler);
-			}
-			if (this.offlineHandler) {
-				window.removeEventListener("offline", this.offlineHandler);
-			}
-		});
-	}
-
-	private requestFastReconnect(reason: "app-foregrounded" | "network-online"): void {
-		if (!this.vaultSync) return;
-		if (this.vaultSync.fatalAuthError) {
-			this.log(`Fast reconnect skipped (${reason}): fatal auth (${this.vaultSync.fatalAuthCode ?? "unknown"})`);
-			return;
-		}
-		if (this.vaultSync.connected || this.vaultSync.provider.wsconnecting) {
-			return;
-		}
-
-		const now = Date.now();
-		if (now - this.lastFastReconnectAt < FAST_RECONNECT_MIN_INTERVAL_MS) {
-			return;
-		}
-
-		if (this.fastReconnectDebounceTimer) {
-			clearTimeout(this.fastReconnectDebounceTimer);
-		}
-		this.fastReconnectDebounceTimer = setTimeout(() => {
-			this.fastReconnectDebounceTimer = null;
-
-			const sync = this.vaultSync;
-			if (!sync) return;
-			if (sync.fatalAuthError) return;
-			if (sync.connected || sync.provider.wsconnecting) return;
-
-			this.lastFastReconnectAt = Date.now();
-			this.log(`Fast reconnect triggered (${reason})`);
-			sync.provider.disconnect();
-
-			if (this.fastReconnectConnectTimer) {
-				clearTimeout(this.fastReconnectConnectTimer);
-			}
-			this.fastReconnectConnectTimer = setTimeout(() => {
-				this.fastReconnectConnectTimer = null;
-				const live = this.vaultSync;
-				if (!live || live !== sync) return;
-				if (live.fatalAuthError) return;
-				if (live.connected || live.provider.wsconnecting) return;
-					void live.provider.connect();
-			}, FAST_RECONNECT_JITTER_MS);
-		}, FAST_RECONNECT_DEBOUNCE_MS);
 	}
 
 	// -------------------------------------------------------------------
@@ -1392,18 +1241,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			clearTimeout(this.markdownDrainTimer);
 			this.markdownDrainTimer = null;
 		}
-		if (this.fastReconnectDebounceTimer) {
-			clearTimeout(this.fastReconnectDebounceTimer);
-			this.fastReconnectDebounceTimer = null;
-		}
-		if (this.fastReconnectConnectTimer) {
-			clearTimeout(this.fastReconnectConnectTimer);
-			this.fastReconnectConnectTimer = null;
-		}
+		this.connectionController?.stop();
 
 		this.vaultSync?.destroy();
 
 		this.vaultSync = null;
+		this.connectionController = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
 		this.blobSync = null;
@@ -1431,12 +1274,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "reconnect",
 			name: "Reconnect to sync server",
 			callback: () => {
-					if (this.vaultSync) {
-						this.vaultSync.provider.disconnect();
-						void this.vaultSync.provider.connect();
-						new Notice("Reconnecting...");
-					}
-				},
+				if (this.vaultSync) {
+					this.connectionController?.reconnect("manual-command");
+					new Notice("Reconnecting...");
+				}
+			},
 			});
 
 			this.addCommand({
@@ -2343,35 +2185,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private computeSyncStatus(): SyncStatus {
-		if (!this.vaultSync) {
-			return "disconnected";
-		}
-
-		if (this.vaultSync.fatalAuthError) {
-			return "unauthorized";
-		}
-
-		if (this.vaultSync.idbError) {
+		if (this.vaultSync?.idbError) {
 			return "error";
 		}
 
-		if (!this.reconciled) {
-			if (this.vaultSync.connected) {
-				return "syncing";
-			}
-			if (this.vaultSync.localReady) {
-				return "loading";
-			}
-			return "disconnected";
-		}
+		return this.syncStatusFromConnectionState(this.connectionController?.getState() ?? { kind: "disconnected" });
+	}
 
-		if (this.vaultSync.connected) {
-			return "connected";
+	private syncStatusFromConnectionState(state: ConnectionState): SyncStatus {
+		switch (state.kind) {
+			case "disconnected":
+				return "disconnected";
+			case "loading_cache":
+				return "loading";
+			case "connecting":
+				return "syncing";
+			case "online":
+				return "connected";
+			case "offline":
+				return "offline";
+			case "auth_failed":
+				return "unauthorized";
+			case "server_update_required":
+				return "error";
 		}
-		if (this.vaultSync.localReady) {
-			return "offline";
-		}
-		return "disconnected";
 	}
 
 	getSettingsStatusSummary(): { state: SyncStatus; label: string } {
