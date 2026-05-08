@@ -30,7 +30,6 @@ import {
 	type FrontmatterValidationResult,
 } from "./sync/frontmatterGuard";
 import {
-	buildFrontmatterQuarantineDebugLines,
 	clearFrontmatterQuarantinePath,
 	readPersistedFrontmatterQuarantine,
 	upsertFrontmatterQuarantineEntry,
@@ -57,6 +56,7 @@ import {
 	type TraceEventDetails,
 	type TraceHttpContext,
 } from "./debug/trace";
+import { DiagnosticsService } from "./diagnostics/diagnosticsService";
 import { formatUnknown, yTextToString } from "./utils/format";
 import { compareSemver } from "./utils/semver";
 import { obsidianRequest } from "./utils/http";
@@ -180,6 +180,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private diskMirror: DiskMirror | null = null;
 	private blobSync: BlobSyncManager | null = null;
 	private snapshotService: SnapshotService | null = null;
+	private diagnosticsService: DiagnosticsService | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -326,6 +327,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			log: (message) => this.log(message),
 			bindAllOpenEditors: () => this.bindAllOpenEditors(),
 			validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
+		});
+		this.diagnosticsService = new DiagnosticsService({
+			app: this.app,
+			getSettings: () => this.settings,
+			getTraceHttpContext: () => this.getTraceHttpContext(),
+			getVaultSync: () => this.vaultSync,
+			getDiskMirror: () => this.diskMirror,
+			getBlobSync: () => this.blobSync,
+			getEventRing: () => this.eventRing,
+			getRecentServerTrace: () => this.recentServerTrace,
+			getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
+			getState: () => ({
+				reconciled: this.reconciled,
+				reconcileInFlight: this.reconcileInFlight,
+				reconcilePending: this.reconcilePending,
+				lastReconcileStats: this.lastReconcileStats,
+				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
+				lastReconciledGeneration: this.lastReconciledGeneration,
+				untrackedFileCount: this.untrackedFiles.length,
+				openFileCount: this.openFilePaths.size,
+			}),
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
+			sha256Hex: (text) => this.sha256Hex(text),
+			log: (message) => this.log(message),
 		});
 		this.registerObsidianProtocolHandler("yaos", (params) => {
 			void this.handleSetupLink(params);
@@ -1509,7 +1535,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "debug-status",
 			name: "Show sync debug info",
 			callback: () => {
-				const info = this.buildDebugInfo();
+				const info = this.diagnosticsService?.buildDebugInfo() ?? "Sync not initialized";
 				new Notice(info, 10000);
 				console.debug("[yaos] Debug status:\n" + info);
 			},
@@ -1519,7 +1545,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "copy-debug",
 			name: "Copy debug info to clipboard",
 			callback: () => {
-				const info = this.buildDebugInfo();
+				const info = this.diagnosticsService?.buildDebugInfo() ?? "Sync not initialized";
 				navigator.clipboard.writeText(info).then(
 					() => new Notice("Debug info copied to clipboard."),
 					() => new Notice("Failed to copy to clipboard. Check console.", 5000),
@@ -1532,7 +1558,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "show-recent-events",
 			name: "Show recent sync events",
 			callback: () => {
-				const text = this.buildRecentEventsText(80);
+				const text = this.diagnosticsService?.buildRecentEventsText(80) ?? "No events recorded yet.";
 				new Notice("Recent sync events printed to console.", 5000);
 				console.debug("[yaos] Recent sync events:\n" + text);
 			},
@@ -1542,7 +1568,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "export-diagnostics",
 			name: "Export sync diagnostics",
 			callback: () => {
-				void this.exportDiagnostics();
+				void this.diagnosticsService?.exportDiagnostics();
 			},
 		});
 
@@ -3694,61 +3720,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.persistWriteChain;
 	}
 
-	private buildDebugInfo(): string {
-		if (!this.vaultSync) return "Sync not initialized";
-		return [
-			`Host: ${this.settings.host || "(not set)"}`,
-			`Vault ID: ${this.settings.vaultId || "(not set)"}`,
-			`Device: ${this.settings.deviceName || "(unnamed)"}`,
-			`Trace ID: ${this.getTraceHttpContext()?.traceId ?? "(disabled)"}`,
-			`Boot ID: ${this.getTraceHttpContext()?.bootId ?? "(disabled)"}`,
-			`Connected: ${this.vaultSync.connected}`,
-			`Local ready: ${this.vaultSync.localReady}`,
-			`Provider synced: ${this.vaultSync.providerSynced}`,
-			`Initialized (sentinel): ${this.vaultSync.isInitialized}`,
-			`Reconcile mode: ${this.vaultSync.getSafeReconcileMode()}`,
-			`Reconciled: ${this.reconciled}`,
-			`Connection generation: ${this.vaultSync.connectionGeneration}`,
-			`Last reconciled gen: ${this.lastReconciledGeneration}`,
-				`Fatal auth error: ${this.vaultSync.fatalAuthError}`,
-				`Fatal auth code: ${this.vaultSync.fatalAuthCode ?? "(none)"}`,
-				`IndexedDB error: ${this.vaultSync.idbError}`,
-				`IndexedDB error kind: ${this.vaultSync.idbErrorDetails?.kind ?? "(none)"}`,
-				`IndexedDB error phase: ${this.vaultSync.idbErrorDetails?.phase ?? "(none)"}`,
-				`IndexedDB error name: ${this.vaultSync.idbErrorDetails?.name ?? "(none)"}`,
-				`IndexedDB error message: ${this.vaultSync.idbErrorDetails?.message ?? "(none)"}`,
-				`Schema supported/local: ${this.vaultSync.supportedSchemaVersion}/${this.vaultSync.storedSchemaVersion ?? "(unset)"}`,
-				`CRDT paths: ${this.vaultSync.getActiveMarkdownPaths().length}`,
-				`Blob paths: ${this.vaultSync.pathToBlob.size}`,
-			`Untracked files: ${this.untrackedFiles.length}`,
-			`Active disk observers: ${this.diskMirror?.activeObserverCount ?? 0}`,
-			`External edit policy: ${this.settings.externalEditPolicy}`,
-			`Attachment sync: ${this.settings.enableAttachmentSync ? "enabled" : "disabled"}`,
-			...(this.blobSync ? [
-				`Pending uploads: ${this.blobSync.pendingUploads}`,
-				`Pending downloads: ${this.blobSync.pendingDownloads}`,
-			] : []),
-			`Open files: ${this.openFilePaths.size}`,
-			`Server trace events: ${this.recentServerTrace.length}`,
-			`Remote cursors: ${this.settings.showRemoteCursors ? "shown" : "hidden"}`,
-			...buildFrontmatterQuarantineDebugLines(this.frontmatterQuarantineEntries),
-		].join("\n");
-	}
-
-	private buildRecentEventsText(limit = 80): string {
-		const mainEvents = this.eventRing.slice(-limit).map((e) => `[plugin] ${e.ts} ${e.msg}`);
-		const syncEvents = this.vaultSync?.getRecentEvents(limit).map((e) => `[sync]   ${e.ts} ${e.msg}`) ?? [];
-		const serverEvents = this.recentServerTrace
-			.slice(-limit)
-			.map((e) => {
-				const entry = e as { ts?: string; event?: string; deviceName?: string; traceId?: string };
-				return `[server] ${entry.ts ?? ""} ${entry.event ?? "event"}${entry.deviceName ? ` device=${entry.deviceName}` : ""}${entry.traceId ? ` trace=${entry.traceId}` : ""}`;
-			});
-		const merged = [...mainEvents, ...syncEvents, ...serverEvents].sort();
-		if (merged.length === 0) return "No events recorded yet.";
-		return merged.slice(-limit).join("\n");
-	}
-
 	private async sha256Hex(text: string): Promise<string> {
 		const data = new TextEncoder().encode(text);
 		const digest = await crypto.subtle.digest("SHA-256", data);
@@ -3760,149 +3731,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const block = extractFrontmatter(content);
 		if (block.kind !== "present") return undefined;
 		return await this.sha256Hex(block.frontmatterText);
-	}
-
-	private async exportDiagnostics(): Promise<void> {
-		if (!this.vaultSync) {
-			new Notice("Sync not initialized");
-			return;
-		}
-
-		new Notice("Exporting sync diagnostics...");
-		const startedAt = Date.now();
-
-		const diskFiles = this.app.vault.getMarkdownFiles()
-			.filter((f) => this.isMarkdownPathSyncable(f.path));
-
-		const crdtPaths = new Set<string>(
-			this.vaultSync.getActiveMarkdownPaths().filter((path) =>
-				this.isMarkdownPathSyncable(path),
-			),
-		);
-
-		const diskHashes = new Map<string, { hash: string; length: number }>();
-		for (const file of diskFiles) {
-			try {
-				const content = await this.app.vault.read(file);
-				diskHashes.set(file.path, {
-					hash: await this.sha256Hex(content),
-					length: content.length,
-				});
-			} catch (err) {
-				this.log(`diagnostics: failed to read disk file "${file.path}": ${String(err)}`);
-			}
-		}
-
-		const crdtHashes = new Map<string, { hash: string; length: number }>();
-		for (const path of crdtPaths) {
-			const ytext = this.vaultSync.getTextForPath(path);
-			if (!ytext) continue;
-			const content = ytext.toJSON();
-			crdtHashes.set(path, {
-				hash: await this.sha256Hex(content),
-				length: content.length,
-			});
-		}
-
-		const allPaths = new Set<string>([
-			...Array.from(diskHashes.keys()),
-			...Array.from(crdtHashes.keys()),
-		]);
-
-		const missingOnDisk: string[] = [];
-		const missingInCrdt: string[] = [];
-		const hashMismatches: Array<{ path: string; diskHash: string; crdtHash: string; diskLength: number; crdtLength: number }> = [];
-
-		for (const path of allPaths) {
-			const disk = diskHashes.get(path);
-			const crdt = crdtHashes.get(path);
-			if (!disk && crdt) {
-				missingOnDisk.push(path);
-				continue;
-			}
-			if (disk && !crdt) {
-				missingInCrdt.push(path);
-				continue;
-			}
-			if (disk && crdt && disk.hash !== crdt.hash) {
-				hashMismatches.push({
-					path,
-					diskHash: disk.hash,
-					crdtHash: crdt.hash,
-					diskLength: disk.length,
-					crdtLength: crdt.length,
-				});
-			}
-		}
-
-		const diagnostics = {
-			generatedAt: new Date().toISOString(),
-			generationMs: Date.now() - startedAt,
-			trace: this.getTraceHttpContext() ?? null,
-			settings: {
-				host: this.settings.host,
-				tokenPrefix: this.settings.token ? `${this.settings.token.slice(0, 8)}...` : "",
-				vaultId: this.settings.vaultId,
-				deviceName: this.settings.deviceName,
-				debug: this.settings.debug,
-				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
-			},
-			state: {
-				reconciled: this.reconciled,
-				reconcileInFlight: this.reconcileInFlight,
-				reconcilePending: this.reconcilePending,
-				lastReconcile: this.lastReconcileStats,
-				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-				lastReconciledGeneration: this.lastReconciledGeneration,
-				connected: this.vaultSync.connected,
-				providerSynced: this.vaultSync.providerSynced,
-				localReady: this.vaultSync.localReady,
-				connectionGeneration: this.vaultSync.connectionGeneration,
-				fatalAuthError: this.vaultSync.fatalAuthError,
-				fatalAuthCode: this.vaultSync.fatalAuthCode,
-				fatalAuthDetails: this.vaultSync.fatalAuthDetails,
-				idbError: this.vaultSync.idbError,
-				idbErrorDetails: this.vaultSync.idbErrorDetails,
-				pathToIdCount: this.vaultSync.pathToId.size,
-				activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
-				blobPathCount: this.vaultSync.pathToBlob.size,
-				diskFileCount: diskFiles.length,
-				openFileCount: this.openFilePaths.size,
-				schema: {
-					supportedByClient: this.vaultSync.supportedSchemaVersion,
-					storedInDoc: this.vaultSync.storedSchemaVersion,
-				},
-			},
-			hashDiff: {
-				missingOnDisk,
-				missingInCrdt,
-				hashMismatches,
-				matchingCount: allPaths.size - missingOnDisk.length - missingInCrdt.length - hashMismatches.length,
-				totalCompared: allPaths.size,
-			},
-			recentEvents: {
-				plugin: this.eventRing.slice(-240),
-				sync: this.vaultSync.getRecentEvents(240),
-			},
-			openFiles: await this.collectOpenFileTraceState(),
-			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
-			blobSync: this.blobSync?.getDebugSnapshot() ?? null,
-			serverTrace: this.recentServerTrace,
-		};
-
-		const diagDir = await this.ensureDiagnosticsDir();
-
-		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const fileName = `sync-diagnostics-${stamp}-${this.settings.deviceName || "device"}.json`;
-		const outPath = normalizePath(`${diagDir}/${fileName}`);
-		await this.app.vault.adapter.write(outPath, JSON.stringify(diagnostics, null, 2));
-
-		this.log(
-			`Diagnostics exported: ${outPath} ` +
-			`(missingOnDisk=${missingOnDisk.length}, missingInCrdt=${missingInCrdt.length}, mismatches=${hashMismatches.length})`,
-		);
-		new Notice(`Sync diagnostics exported to ${outPath}`, 10000);
 	}
 
 	private runSchemaMigrationToV2(): void {
@@ -3927,7 +3755,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 					try {
 						new Notice("Exporting pre-migration diagnostics...", 7000);
-						await this.exportDiagnostics();
+						await this.diagnosticsService?.exportDiagnostics();
 					} catch (err) {
 						this.log(`schema migration: preflight diagnostics export failed: ${String(err)}`);
 				}
@@ -3948,7 +3776,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 					try {
 						new Notice("Exporting post-migration diagnostics...", 7000);
-						await this.exportDiagnostics();
+						await this.diagnosticsService?.exportDiagnostics();
 					} catch (err) {
 						this.log(`schema migration: postflight diagnostics export failed: ${String(err)}`);
 				}
@@ -3977,14 +3805,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 		return removed;
-	}
-
-	private async ensureDiagnosticsDir(): Promise<string> {
-		const diagDir = normalizePath(`${this.app.vault.configDir}/plugins/yaos/diagnostics`);
-		if (!(await this.app.vault.adapter.exists(diagDir))) {
-			await this.app.vault.adapter.mkdir(diagDir);
-		}
-		return diagDir;
 	}
 
 	private async runVfsTortureTest(): Promise<void> {
@@ -4171,7 +3991,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 		};
 
-		const diagDir = await this.ensureDiagnosticsDir();
+		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir()
+			?? normalizePath(`${this.app.vault.configDir}/plugins/yaos/diagnostics`);
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 		const outPath = normalizePath(
 			`${diagDir}/vfs-torture-${stamp}-${this.settings.deviceName || "device"}.json`,
