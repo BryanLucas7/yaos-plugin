@@ -352,7 +352,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log(`Generated vault ID: ${this.settings.vaultId}`);
 		}
 
-		this.addSettingTab(new VaultSyncSettingTab(this.app, this));
+		this.addSettingTab(new VaultSyncSettingTab(this.app, this, this));
 
 		this.statusBarEl = this.addStatusBarItem();
 		this.updateStatusBar("disconnected");

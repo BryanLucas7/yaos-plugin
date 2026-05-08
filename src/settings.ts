@@ -1,6 +1,5 @@
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import * as QRCode from "qrcode";
-import type VaultCrdtSyncPlugin from "./main";
 import { randomBase64Url } from "./utils/base64url";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
@@ -65,6 +64,40 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
 };
+
+type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
+type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
+
+interface SettingsUpdateState {
+	serverVersion: string | null;
+	latestServerVersion: string | null;
+	serverUpdateAvailable: boolean;
+	pluginVersion: string;
+	latestPluginVersion: string | null;
+	pluginUpdateRecommended: boolean;
+	migrationRequired: boolean;
+	updateRepoUrl: string | null;
+	updateActionUrl: string | null;
+	updateBootstrapUrl: string | null;
+	legacyServerDetected: boolean;
+	pluginCompatibilityWarning: string | null;
+}
+
+export interface VaultSyncSettingsHost {
+	settings: VaultSyncSettings;
+	serverAuthMode: SettingsAuthMode;
+	serverSupportsAttachments: boolean;
+	saveSettings(): Promise<void>;
+	refreshServerCapabilities(reason?: string): Promise<void>;
+	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
+	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
+	applyCursorVisibility(): void;
+	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
+	getUpdateState(): SettingsUpdateState;
+	buildSetupDeepLink(): string | null;
+	buildMobileSetupUrl(): string | null;
+	buildRecoveryKitText(): string | null;
+}
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
 
@@ -281,21 +314,22 @@ class RecoveryKitModal extends Modal {
 }
 
 export class VaultSyncSettingTab extends PluginSettingTab {
-	plugin: VaultCrdtSyncPlugin;
-
-	constructor(app: App, plugin: VaultCrdtSyncPlugin) {
+	constructor(
+		app: App,
+		plugin: Plugin,
+		private readonly host: VaultSyncSettingsHost,
+	) {
 		super(app, plugin);
-		this.plugin = plugin;
 	}
 
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
 		containerEl.addClass("yaos-settings-tab");
-		const authMode = this.plugin.serverAuthMode;
-		const attachmentsAvailable = this.plugin.serverSupportsAttachments;
-		const setupIncomplete = !this.plugin.settings.host || !this.plugin.settings.token;
-		const syncStatus = this.plugin.getSettingsStatusSummary();
+		const authMode = this.host.serverAuthMode;
+		const attachmentsAvailable = this.host.serverSupportsAttachments;
+		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
+		const syncStatus = this.host.getSettingsStatusSummary();
 
 		addSectionHeading(containerEl, "YAOS");
 
@@ -352,15 +386,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			});
 
 			addCardRow(card, "Status", syncStatus.label);
-			addCardRow(card, "Server", this.plugin.settings.host);
-			addCardRow(card, "Vault", shortenMiddle(this.plugin.settings.vaultId || "(not set)"));
-			addCardRow(card, "This device", this.plugin.settings.deviceName || "(unnamed)");
+			addCardRow(card, "Server", this.host.settings.host);
+			addCardRow(card, "Vault", shortenMiddle(this.host.settings.vaultId || "(not set)"));
+			addCardRow(card, "This device", this.host.settings.deviceName || "(unnamed)");
 
 			const actionRow = card.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
 
 				actionRow.createEl("button", { text: "Pair another device" }).addEventListener("click", () => {
-					const deepLink = this.plugin.buildSetupDeepLink();
-					const mobileUrl = this.plugin.buildMobileSetupUrl();
+					const deepLink = this.host.buildSetupDeepLink();
+					const mobileUrl = this.host.buildMobileSetupUrl();
 					if (!deepLink || !mobileUrl) {
 						new Notice("Configure the server URL, sync token, and vault ID before pairing.", 7000);
 						return;
@@ -369,7 +403,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			});
 
 				actionRow.createEl("button", { text: "Backup connection details" }).addEventListener("click", () => {
-					const recoveryKit = this.plugin.buildRecoveryKitText();
+					const recoveryKit = this.host.buildRecoveryKitText();
 					if (!recoveryKit) {
 						new Notice("Configure the server URL, sync token, and vault ID before exporting connection details.", 7000);
 						return;
@@ -379,7 +413,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		}
 
 		if (!setupIncomplete) {
-			const updateState = this.plugin.getUpdateState();
+			const updateState = this.host.getUpdateState();
 			addSectionHeading(containerEl, "Updates");
 
 			const updateCard = containerEl.createDiv({ cls: "yaos-settings-status-card" });
@@ -420,8 +454,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			const updateActions = updateCard.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
 			updateActions.createEl("button", { text: "Refresh update info" }).addEventListener("click", () => {
-				void this.plugin.refreshServerCapabilities("settings-refresh");
-				void this.plugin.refreshUpdateManifest("settings-refresh", true).then(() => this.display());
+				void this.host.refreshServerCapabilities("settings-refresh");
+				void this.host.refreshUpdateManifest("settings-refresh", true).then(() => this.display());
 			});
 			const updateActionUrl = updateState.updateActionUrl;
 			if (updateActionUrl) {
@@ -446,10 +480,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			.addText((text) =>
 				text
 					.setPlaceholder("My laptop")
-					.setValue(this.plugin.settings.deviceName)
+					.setValue(this.host.settings.deviceName)
 					.onChange(async (value) => {
-						this.plugin.settings.deviceName = value.trim();
-						await this.plugin.saveSettings();
+						this.host.settings.deviceName = value.trim();
+						await this.host.saveSettings();
 					}),
 			);
 
@@ -460,10 +494,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addText((text) =>
 					text
 						.setPlaceholder("Example: templates/, daily-notes/")
-						.setValue(this.plugin.settings.excludePatterns)
+						.setValue(this.host.settings.excludePatterns)
 						.onChange(async (value) => {
-							this.plugin.settings.excludePatterns = value;
-						await this.plugin.saveSettings();
+							this.host.settings.excludePatterns = value;
+						await this.host.saveSettings();
 					}),
 			);
 
@@ -473,19 +507,19 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			.addText((text) =>
 				text
 					.setPlaceholder("2048")
-					.setValue(String(this.plugin.settings.maxFileSizeKB))
+					.setValue(String(this.host.settings.maxFileSizeKB))
 					.onChange(async (value) => {
 						const n = parseInt(value, 10);
 						if (!isNaN(n) && n > 0) {
-							this.plugin.settings.maxFileSizeKB = n;
-							await this.plugin.saveSettings();
+							this.host.settings.maxFileSizeKB = n;
+							await this.host.saveSettings();
 						}
 					}),
 			);
 
 				addSectionHeading(containerEl, "Attachments");
 
-			if (this.plugin.settings.host) {
+			if (this.host.settings.host) {
 				new Setting(containerEl)
 					.setName("Attachment storage")
 					.setDesc(
@@ -498,14 +532,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setButtonText("Refresh")
 						.onClick(async () => {
 							button.setDisabled(true);
-							await this.plugin.refreshServerCapabilities();
-							await this.plugin.refreshAttachmentSyncRuntime("capability-refresh");
+							await this.host.refreshServerCapabilities();
+							await this.host.refreshAttachmentSyncRuntime("capability-refresh");
 							this.display();
 						}),
 				);
 		}
 
-				if (this.plugin.settings.host && !attachmentsAvailable) {
+				if (this.host.settings.host && !attachmentsAvailable) {
 					const callout = containerEl.createDiv({ cls: "yaos-settings-attachment-callout" });
 					callout.createEl("p", {
 						text: "Images, PDFs, and other attachments are not syncing yet.",
@@ -520,7 +554,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					link.setAttr("target", "_blank");
 				}
 
-		if (attachmentsAvailable || !this.plugin.settings.host) {
+		if (attachmentsAvailable || !this.host.settings.host) {
 				new Setting(containerEl)
 					.setName("Sync attachments")
 					.setDesc(
@@ -528,30 +562,30 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					)
 				.addToggle((toggle) =>
 					toggle
-						.setValue(this.plugin.settings.enableAttachmentSync)
+						.setValue(this.host.settings.enableAttachmentSync)
 						.onChange(async (value) => {
-							this.plugin.settings.enableAttachmentSync = value;
-							this.plugin.settings.attachmentSyncExplicitlyConfigured = true;
-							await this.plugin.saveSettings();
-							await this.plugin.refreshAttachmentSyncRuntime("attachment-toggle");
+							this.host.settings.enableAttachmentSync = value;
+							this.host.settings.attachmentSyncExplicitlyConfigured = true;
+							await this.host.saveSettings();
+							await this.host.refreshAttachmentSyncRuntime("attachment-toggle");
 							this.display();
 						}),
 				);
 		}
 
-			if ((attachmentsAvailable || !this.plugin.settings.host) && this.plugin.settings.enableAttachmentSync) {
+			if ((attachmentsAvailable || !this.host.settings.host) && this.host.settings.enableAttachmentSync) {
 				new Setting(containerEl)
 					.setName("Max attachment size in kilobytes")
 					.setDesc("Attachments larger than this are skipped.")
 				.addText((text) =>
 					text
 						.setPlaceholder("10240")
-						.setValue(String(this.plugin.settings.maxAttachmentSizeKB))
+						.setValue(String(this.host.settings.maxAttachmentSizeKB))
 						.onChange(async (value) => {
 							const n = parseInt(value, 10);
 							if (!isNaN(n) && n > 0) {
-								this.plugin.settings.maxAttachmentSizeKB = n;
-								await this.plugin.saveSettings();
+								this.host.settings.maxAttachmentSizeKB = n;
+								await this.host.saveSettings();
 							}
 						}),
 				);
@@ -562,11 +596,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addSlider((slider) =>
 					slider
 						.setLimits(1, 5, 1)
-						.setValue(this.plugin.settings.attachmentConcurrency)
+						.setValue(this.host.settings.attachmentConcurrency)
 						.setDynamicTooltip()
 						.onChange(async (value) => {
-							this.plugin.settings.attachmentConcurrency = value;
-							await this.plugin.saveSettings();
+							this.host.settings.attachmentConcurrency = value;
+							await this.host.saveSettings();
 						}),
 				);
 		}
@@ -577,11 +611,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			.setDesc("Show other devices' cursors and selections while editing.")
 			.addToggle((toggle) =>
 				toggle
-					.setValue(this.plugin.settings.showRemoteCursors)
+					.setValue(this.host.settings.showRemoteCursors)
 					.onChange(async (value) => {
-						this.plugin.settings.showRemoteCursors = value;
-						await this.plugin.saveSettings();
-						this.plugin.applyCursorVisibility();
+						this.host.settings.showRemoteCursors = value;
+						await this.host.saveSettings();
+						this.host.applyCursorVisibility();
 					}),
 			);
 
@@ -600,15 +634,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.addText((text) =>
 						text
 							.setPlaceholder("Paste the server URL")
-							.setValue(this.plugin.settings.host)
+							.setValue(this.host.settings.host)
 						.onChange(async (value) => {
-							this.plugin.settings.host = value.trim();
-						await this.plugin.saveSettings();
+							this.host.settings.host = value.trim();
+						await this.host.saveSettings();
 						this.display();
 					}),
 			);
 
-			if (isInsecureRemoteHost(this.plugin.settings.host)) {
+			if (isInsecureRemoteHost(this.host.settings.host)) {
 				manualBody.createEl("p", {
 					text: "This remote connection is unencrypted. Your sync token will be sent in plaintext. Use HTTPS for production.",
 					cls: "yaos-settings-security-warning",
@@ -627,10 +661,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addText((text) =>
 					text
 						.setPlaceholder("Paste your sync token")
-						.setValue(this.plugin.settings.token)
+						.setValue(this.host.settings.token)
 						.onChange(async (value) => {
-							this.plugin.settings.token = value.trim();
-						await this.plugin.saveSettings();
+							this.host.settings.token = value.trim();
+						await this.host.saveSettings();
 						this.display();
 					}),
 			);
@@ -644,10 +678,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addText((text) =>
 					text
 						.setPlaceholder("Generated automatically")
-						.setValue(this.plugin.settings.vaultId)
+						.setValue(this.host.settings.vaultId)
 						.onChange(async (value) => {
-							this.plugin.settings.vaultId = value.trim();
-						await this.plugin.saveSettings();
+							this.host.settings.vaultId = value.trim();
+						await this.host.saveSettings();
 						this.display();
 					}),
 			);
@@ -658,10 +692,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addText((text) =>
 					text
 						.setPlaceholder("Paste the generated GitHub or GitLab repo URL")
-						.setValue(this.plugin.settings.updateRepoUrl)
+						.setValue(this.host.settings.updateRepoUrl)
 						.onChange(async (value) => {
-							this.plugin.settings.updateRepoUrl = value.trim();
-							await this.plugin.saveSettings();
+							this.host.settings.updateRepoUrl = value.trim();
+							await this.host.saveSettings();
 							this.display();
 						}),
 				);
@@ -672,10 +706,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addText((text) =>
 						text
 							.setPlaceholder("Default branch (for example, main)")
-							.setValue(this.plugin.settings.updateRepoBranch)
+							.setValue(this.host.settings.updateRepoBranch)
 						.onChange(async (value) => {
-							this.plugin.settings.updateRepoBranch = value.trim() || "main";
-							await this.plugin.saveSettings();
+							this.host.settings.updateRepoBranch = value.trim() || "main";
+							await this.host.saveSettings();
 						}),
 				);
 
@@ -687,10 +721,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.addOption("always", "Always import")
 					.addOption("closed-only", "Only when file is closed")
 					.addOption("never", "Never import")
-					.setValue(this.plugin.settings.externalEditPolicy)
+					.setValue(this.host.settings.externalEditPolicy)
 					.onChange(async (value) => {
-						this.plugin.settings.externalEditPolicy = value as ExternalEditPolicy;
-						await this.plugin.saveSettings();
+						this.host.settings.externalEditPolicy = value as ExternalEditPolicy;
+						await this.host.saveSettings();
 					}),
 			);
 
@@ -699,10 +733,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			.setDesc("Pause suspicious YAML property updates before they spread. Disable only while troubleshooting valid frontmatter that is being blocked.")
 			.addToggle((toggle) =>
 				toggle
-					.setValue(this.plugin.settings.frontmatterGuardEnabled)
+					.setValue(this.host.settings.frontmatterGuardEnabled)
 					.onChange(async (value) => {
-						this.plugin.settings.frontmatterGuardEnabled = value;
-						await this.plugin.saveSettings();
+						this.host.settings.frontmatterGuardEnabled = value;
+						await this.host.saveSettings();
 					}),
 			);
 
@@ -711,10 +745,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			.setDesc("Enable verbose console logs for troubleshooting.")
 			.addToggle((toggle) =>
 				toggle
-					.setValue(this.plugin.settings.debug)
+					.setValue(this.host.settings.debug)
 					.onChange(async (value) => {
-						this.plugin.settings.debug = value;
-						await this.plugin.saveSettings();
+						this.host.settings.debug = value;
+						await this.host.saveSettings();
 					}),
 			);
 
