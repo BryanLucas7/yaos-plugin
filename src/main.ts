@@ -57,11 +57,14 @@ import {
 	type TraceHttpContext,
 } from "./debug/trace";
 import { DiagnosticsService } from "./diagnostics/diagnosticsService";
+import {
+	getSyncStatusLabel,
+	renderSyncStatus,
+	type SyncStatus,
+} from "./status/statusBarController";
 import { formatUnknown, yTextToString } from "./utils/format";
 import { compareSemver } from "./utils/semver";
 import { obsidianRequest } from "./utils/http";
-
-type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
 type PersistedServerCapabilitiesCache = {
 	host: string;
@@ -2421,19 +2424,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.updateStatusBar(state);
 	}
 
-	private getSyncStatusLabel(state: SyncStatus): string {
-		const labels: Record<SyncStatus, string> = {
-			disconnected: "CRDT: Disconnected",
-			loading: "CRDT: Loading cache...",
-			syncing: "CRDT: Syncing...",
-			connected: "CRDT: Connected",
-			offline: "CRDT: Offline",
-			error: "CRDT: Error",
-			unauthorized: "CRDT: Unauthorized",
-		};
-		return labels[state];
-	}
-
 	private computeSyncStatus(): SyncStatus {
 		if (!this.vaultSync) {
 			return "disconnected";
@@ -2470,21 +2460,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const state = this.computeSyncStatus();
 		return {
 			state,
-			label: this.getSyncStatusLabel(state).replace(/^CRDT:\s*/, ""),
+			label: getSyncStatusLabel(state).replace(/^CRDT:\s*/, ""),
 		};
 	}
 
 	private updateStatusBar(state: SyncStatus): void {
 		if (!this.statusBarEl) return;
-		let text = this.getSyncStatusLabel(state);
-
-		// Append blob transfer progress if active
-		const transfer = this.blobSync?.transferStatus;
-		if (transfer) {
-			text += ` (${transfer})`;
-		}
-
-		this.statusBarEl.setText(text);
+		renderSyncStatus(this.statusBarEl, state, this.blobSync?.transferStatus);
 	}
 
 	private setupTraceLogger(): void {
