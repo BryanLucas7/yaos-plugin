@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, arrayBufferToHex, normalizePath } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -10,7 +10,7 @@ import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
-import { BlobSyncManager, type BlobQueueSnapshot } from "./sync/blobSync";
+import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
 import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
@@ -40,8 +40,6 @@ import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
 import {
-	appendTraceParams,
-	PersistentTraceLogger,
 	type TraceEventDetails,
 	type TraceHttpContext,
 } from "./debug/trace";
@@ -65,6 +63,10 @@ import {
 import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
+import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
+import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
+import { SetupLinkController } from "./runtime/setupLinkController";
+import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -72,7 +74,9 @@ import {
 	type SyncStatus,
 } from "./status/statusBarController";
 import { formatUnknown, yTextToString } from "./utils/format";
-import { obsidianRequest } from "./utils/http";
+import { ConfirmModal } from "./ui/ConfirmModal";
+import { runVfsTortureTest } from "./dev/vfsTortureTest";
+import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -89,25 +93,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		loadData: () => this.loadData(),
 		saveData: (data) => this.saveData(data),
 	});
-	private runtimeConfig: RuntimeConfig = buildRuntimeConfig(
-		DEFAULT_SETTINGS,
-		".obsidian",
-	);
+	private runtimeConfig: RuntimeConfig | null = null;
 
 	private vaultSync: VaultSync | null = null;
 	private connectionController: ConnectionController | null = null;
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
-	private blobSync: BlobSyncManager | null = null;
+	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
+	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
 	private diagnosticsService: DiagnosticsService | null = null;
 	private reconciliationController!: ReconciliationController;
+	private setupLinkController: SetupLinkController | null = null;
+	private traceRuntime: TraceRuntimeController | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
-
-	/** Track the set of currently observed file paths for disk mirror cleanup. */
-	private openFilePaths = new Set<string>();
-	private activeMarkdownPath: string | null = null;
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -121,9 +121,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
 	private blobHashCache: BlobHashCache = {};
 
-	/** True once we've shown the R2 nudge notice this session. */
-	private shownAttachmentNudge = false;
-
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
 	private persistedState: PersistedPluginState = {};
@@ -135,17 +132,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** In-memory ring of recent high-level plugin events. */
 	private eventRing: Array<{ ts: string; msg: string }> = [];
 
-	/** Persistent trace journal/state writer (active when debug is enabled). */
-	private traceLogger: PersistentTraceLogger | null = null;
-	private traceStateInterval: ReturnType<typeof setInterval> | null = null;
-	private traceStateTimer: ReturnType<typeof setTimeout> | null = null;
-	private traceServerInterval: ReturnType<typeof setInterval> | null = null;
-	private traceServerInFlight = false;
-	private recentServerTrace: unknown[] = [];
 	private capabilityUpdateService: CapabilityUpdateService | null = null;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
-	private lastMetadataRaceRejectionAt = 0;
 	private frontmatterGuardNoticeFingerprints = new Map<string, string>();
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 
@@ -155,19 +144,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * provider sync event, even if connection generation did not change.
 	 */
 	private awaitingFirstProviderSyncAfterStartup = false;
-	/** Host workspace/layout reached a usable post-boot state. */
-	private blobDownloadGateLayoutReady = false;
-	/** YAOS startup/reconciliation has completed enough to trust local attachment presence checks. */
-	private blobDownloadGateStartupReady = false;
-
 	private createReconciliationController(): ReconciliationController {
 		this.reconciliationController = new ReconciliationController({
 			app: this.app,
 			getSettings: () => this.settings,
-			getRuntimeConfig: () => this.runtimeConfig,
+			getRuntimeConfig: () => this.getRuntimeConfig(),
 			getVaultSync: () => this.vaultSync,
 			getDiskMirror: () => this.diskMirror,
-			getBlobSync: () => this.blobSync,
+			getBlobSync: () => this.getBlobSync(),
 			getEditorBindings: () => this.editorBindings,
 			getDiskIndex: () => this.diskIndex,
 			setDiskIndex: (index) => {
@@ -177,8 +161,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
 				this.shouldBlockFrontmatterIngest(path, previousContent, nextContent, reason),
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
-			validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
-			bindAllOpenEditors: () => this.bindAllOpenEditors(),
+			validateOpenEditorBindings: (reason) => this.editorWorkspace?.validateOpenBindings(reason),
+			onReconciled: (reason) => this.editorWorkspace?.onReconciled(reason),
 			getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
 			setAwaitingFirstProviderSyncAfterStartup: (value) => {
 				this.awaitingFirstProviderSyncAfterStartup = value;
@@ -193,11 +177,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
-		return isMarkdownSyncable(path, this.excludePatterns, this.runtimeConfig.vaultConfigDir);
+		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
-		return isBlobSyncable(path, this.excludePatterns, this.runtimeConfig.vaultConfigDir);
+		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private getRuntimeConfig(): RuntimeConfig {
+		if (!this.runtimeConfig) {
+			this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		}
+		return this.runtimeConfig;
+	}
+
+	private getBlobSync(): BlobSyncManager | null {
+		return this.attachmentOrchestrator?.manager ?? null;
 	}
 
 	async onload() {
@@ -225,17 +220,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
 		this.createReconciliationController();
+		this.editorWorkspace = new EditorWorkspaceOrchestrator({
+			app: this.app,
+			getSettings: () => this.settings,
+			getEditorBindings: () => this.editorBindings,
+			getDiskMirror: () => this.diskMirror,
+			maybeImportDeferredClosedOnlyPath: (path, reason) =>
+				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
+			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+			log: (message) => this.log(message),
+		});
 		this.snapshotService = new SnapshotService({
 			app: this.app,
 			getSettings: () => this.settings,
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			getVaultSync: () => this.vaultSync,
 			getDiskMirror: () => this.diskMirror,
-			getBlobSync: () => this.blobSync,
+			getBlobSync: () => this.getBlobSync(),
 			getServerSupportsSnapshots: () => this.serverSupportsSnapshots,
 			log: (message) => this.log(message),
-			bindAllOpenEditors: () => this.bindAllOpenEditors(),
-			validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
+			onEditorsNeedReconcile: (reason) => this.editorWorkspace?.onReconciled(reason),
 		});
 		this.diagnosticsService = new DiagnosticsService({
 			app: this.app,
@@ -243,9 +247,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			getVaultSync: () => this.vaultSync,
 			getDiskMirror: () => this.diskMirror,
-			getBlobSync: () => this.blobSync,
+			getBlobSync: () => this.getBlobSync(),
 			getEventRing: () => this.eventRing,
-			getRecentServerTrace: () => this.recentServerTrace,
+			getRecentServerTrace: () => this.traceRuntime?.getRecentServerTrace() ?? [],
 			getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
 			getState: () => ({
 				reconciled: this.reconciliationController.getState().reconciled,
@@ -255,15 +259,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 				untrackedFileCount: this.reconciliationController.getState().untrackedFileCount,
-				openFileCount: this.openFilePaths.size,
+				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			}),
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
 			sha256Hex: (text) => this.sha256Hex(text),
 			log: (message) => this.log(message),
 		});
+		this.setupLinkController = new SetupLinkController({
+			app: this.app,
+			getSettings: () => this.settings,
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
+			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
+			hasSyncRuntime: () => this.vaultSync !== null,
+			initSync: () => {
+				void this.initSync();
+			},
+		});
 		this.registerObsidianProtocolHandler("yaos", (params) => {
-			void this.handleSetupLink(params);
+			void this.setupLinkController?.handleSetupLink(params);
 		});
 
 		let generatedVaultId = false;
@@ -280,17 +295,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}, "startup-generate-device-name");
 		}
 
-		this.setupTraceLogger();
-		this.blobDownloadGateLayoutReady = this.app.workspace.layoutReady;
-		this.app.workspace.onLayoutReady(() => {
-			const firstReady = !this.blobDownloadGateLayoutReady;
-			this.blobDownloadGateLayoutReady = true;
-			if (firstReady) {
-				this.trace("trace", "blob-download-layout-ready", {});
-				this.log("Blob download gate: workspace layout ready");
-			}
-			this.maybeOpenBlobDownloadGate("layout-ready");
+		this.setupTraceRuntime();
+		this.attachmentOrchestrator = new AttachmentOrchestrator({
+			app: this.app,
+			getVaultSync: () => this.vaultSync,
+			getRuntimeConfig: () => this.getRuntimeConfig(),
+			getServerSupportsAttachments: () => this.serverSupportsAttachments,
+			getTraceHttpContext: () => this.getTraceHttpContext(),
+			getBlobHashCache: () => this.blobHashCache,
+			getExcludePatterns: () => this.excludePatterns,
+			persistBlobQueue: (snapshot) => this.persistBlobQueueSnapshot(snapshot),
+			clearPersistedBlobQueue: () => this.clearSavedBlobQueue(),
+			trace: (source, msg, details) => this.trace(source, msg, details),
+			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+			refreshStatusBar: () => this.refreshStatusBar(),
+			log: (message) => this.log(message),
 		});
+		this.attachmentOrchestrator.hydrateSavedQueue(this.savedBlobQueue);
+		this.savedBlobQueue = null;
 		if (generatedVaultId) {
 			this.log(`Generated vault ID: ${this.settings.vaultId}`);
 		}
@@ -360,7 +382,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async initSync(): Promise<void> {
 		const initSyncStartedAt = Date.now();
-		this.blobDownloadGateStartupReady = false;
+		this.attachmentOrchestrator?.destroy();
 		this.trace("trace", "startup-init-sync-start", {
 			hostConfigured: !!this.settings.host,
 			tokenConfigured: !!this.settings.token,
@@ -412,7 +434,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.diskMirror.startMapObservers();
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
-			this.startBlobSyncEngine("startup", false);
+			this.attachmentOrchestrator?.start("startup", false);
 
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
@@ -447,21 +469,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
 				if (this.reconciliationController.isReconciled && this.editorBindings) {
-					const touched = this.editorBindings.auditBindings("status-tick");
+					const touched = this.editorWorkspace?.auditBindings("status-tick") ?? 0;
 					if (touched > 0) {
 						this.log(`Binding health audit (status-tick) — touched ${touched}`);
-						this.scheduleTraceStateSnapshot("binding-audit:status-tick");
 					}
 				}
 				// Periodically persist blob queue if transfers are active,
 				// or clear persisted queue if transfers completed
-				if (this.blobSync) {
-					if (this.blobSync.pendingUploads > 0 || this.blobSync.pendingDownloads > 0) {
-						void this.saveBlobQueue();
-					} else {
-						void this.clearSavedBlobQueue();
-					}
-				}
+				this.attachmentOrchestrator?.handleStatusTick();
 				const capabilityState = this.capabilityUpdateService?.capabilities ?? null;
 				const waitingForR2 =
 					!!this.settings.host &&
@@ -487,8 +502,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					isDebugEnabled: () => this.settings.debug,
 					runReconciliation: (mode) => this.runReconciliation(mode),
-					bindAllOpenEditors: () => this.bindAllOpenEditors(),
-					validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
@@ -500,28 +513,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 8. Rename batch callback → update editor bindings + disk mirror observers + disk index + blob hash cache
 			this.vaultSync.onRenameBatchFlushed((renames) => {
-				this.editorBindings?.updatePathsAfterRename(renames);
+				this.editorWorkspace?.onRenameBatchFlushed(renames);
 
 				// Move disk index entries
 				moveIndexEntries(this.diskIndex, renames);
 
 				// Move blob hash cache entries
 				moveCachedHashes(this.blobHashCache, renames);
-
-				// Move disk mirror observers and openFilePaths tracking
-				// for any paths that were open before the rename.
-				for (const [oldPath, newPath] of renames) {
-					if (this.activeMarkdownPath === oldPath) {
-						this.activeMarkdownPath = newPath;
-					}
-					if (this.openFilePaths.has(oldPath)) {
-						this.diskMirror?.notifyFileClosed(oldPath);
-						this.openFilePaths.delete(oldPath);
-						this.diskMirror?.notifyFileOpened(newPath);
-						this.openFilePaths.add(newPath);
-						this.log(`Rename batch: moved observer "${oldPath}" -> "${newPath}"`);
-					}
-				}
 			});
 
 			// -----------------------------------------------------------
@@ -555,8 +553,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// Still reconcile with whatever we have locally
 				const mode = this.vaultSync.getSafeReconcileMode();
 				await this.runReconciliation(mode);
-				this.bindAllOpenEditors();
-				this.validateAllOpenBindings("startup-auth-fallback");
 				return;
 			}
 
@@ -585,17 +581,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 			}
 
-			this.bindAllOpenEditors();
-			this.validateAllOpenBindings("startup");
-
 			this.refreshStatusBar();
 			this.trace("trace", "startup-init-sync-complete", {
 				durationMs: Date.now() - initSyncStartedAt,
 			});
 			this.log("Startup complete");
 			this.scheduleTraceStateSnapshot("startup-complete");
-			this.markBlobDownloadStartupReady("startup-complete");
-			void this.refreshServerTrace();
+			this.attachmentOrchestrator?.markStartupReady("startup-complete");
+			void this.traceRuntime?.refreshServerTrace();
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -618,115 +611,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	// -------------------------------------------------------------------
-	// Editor binding
-	// -------------------------------------------------------------------
-
-	private bindAllOpenEditors(): void {
-		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView) {
-				this.editorBindings?.bind(leaf.view, this.settings.deviceName);
-				if (leaf.view.file) {
-					this.trackOpenFile(leaf.view.file.path);
-				}
-			}
-		});
-		this.activeMarkdownPath = this.getActiveMarkdownPath();
-	}
-
-	private validateAllOpenBindings(reason: string): void {
-		let touched = 0;
-
-		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
-				return;
-			}
-
-			const binding = this.editorBindings?.getBindingDebugInfoForView(leaf.view) ?? null;
-			const health = this.editorBindings?.getBindingHealthForView(leaf.view) ?? null;
-
-			if (health?.bound && (health.healthy || health.settling)) {
-				return;
-			}
-
-			touched += 1;
-			if (!binding || !health?.bound) {
-				this.editorBindings?.bind(leaf.view, this.settings.deviceName);
-				return;
-			}
-
-			const repaired = this.editorBindings?.repair(
-				leaf.view,
-				this.settings.deviceName,
-				`validate:${reason}`,
-			) ?? false;
-			if (!repaired) {
-				this.editorBindings?.rebind(
-					leaf.view,
-					this.settings.deviceName,
-					`validate:${reason}`,
-				);
-			}
-		});
-
-		if (touched > 0) {
-			this.log(`Validated open bindings (${reason}) — touched ${touched}`);
-			this.scheduleTraceStateSnapshot(`validate-open-bindings:${reason}`);
-		}
-	}
-
-	/**
-	 * Track that a file is open. Notifies diskMirror to start observing.
-	 * Also cleans up observers for files that are no longer open in any leaf.
-	 */
-	private trackOpenFile(path: string): void {
-		// Notify disk mirror for the newly opened file
-		if (!this.openFilePaths.has(path)) {
-			this.diskMirror?.notifyFileOpened(path);
-			this.openFilePaths.add(path);
-		}
-
-		this.reconcileTrackedOpenFiles("track-open-file");
-		this.scheduleTraceStateSnapshot("track-open-file");
-	}
-
-	private reconcileTrackedOpenFiles(reason: string): void {
-		// Scan all leaves to find which files are actually still open
-		const currentlyOpen = new Set<string>();
-		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView && leaf.view.file) {
-				currentlyOpen.add(leaf.view.file.path);
-			}
-		});
-
-		// Close observers for files no longer open in any leaf
-		for (const tracked of this.openFilePaths) {
-			if (!currentlyOpen.has(tracked)) {
-				this.diskMirror?.notifyFileClosed(tracked);
-				this.openFilePaths.delete(tracked);
-				this.log(`${reason}: closed observer for "${tracked}"`);
-				this.reconciliationController.maybeImportDeferredClosedOnlyPath(tracked, reason);
-			}
-		}
-	}
-
-	private getActiveMarkdownPath(): string | null {
-		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		return activeView?.file?.path ?? null;
-	}
-
-	private updateActiveMarkdownPath(nextPath: string | null, reason: string): void {
-		const previousPath = this.activeMarkdownPath;
-		this.activeMarkdownPath = nextPath;
-
-		if (!previousPath || previousPath === nextPath) {
-			return;
-		}
-
-		this.editorBindings?.clearLocalCursor(reason);
-		void this.diskMirror?.flushOpenPath(previousPath, reason);
-	}
-
-	// -------------------------------------------------------------------
 	// Vault event handlers
 	// -------------------------------------------------------------------
 
@@ -735,54 +619,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
 				if (!this.reconciliationController.isReconciled) return;
-				this.editorBindings?.clearLocalCursor("layout-change");
-				this.reconcileTrackedOpenFiles("layout-change");
-				this.updateActiveMarkdownPath(
-					this.getActiveMarkdownPath(),
-					"layout-change-active-blur",
-				);
-				const touched = this.editorBindings?.auditBindings("layout-change") ?? 0;
-				if (touched > 0) {
-					this.log(`Binding health audit (layout-change) — touched ${touched}`);
-					this.scheduleTraceStateSnapshot("binding-audit:layout-change");
-				}
+				this.editorWorkspace?.onLayoutChange();
 			}),
 		);
 
 		this.registerEvent(
 			this.app.workspace.on("active-leaf-change", (leaf) => {
 				if (!this.reconciliationController.isReconciled) return;
-				const nextPath =
-					leaf?.view instanceof MarkdownView ? (leaf.view.file?.path ?? null) : null;
-				this.updateActiveMarkdownPath(nextPath, "active-leaf-change");
-				this.reconcileTrackedOpenFiles("active-leaf-change");
-				if (!leaf) return;
-				const view = leaf.view;
-				if (view instanceof MarkdownView) {
-					this.editorBindings?.bind(view, this.settings.deviceName);
-					if (view.file) {
-						this.trackOpenFile(view.file.path);
-					}
-				}
+				this.editorWorkspace?.onActiveLeafChange(leaf);
 			}),
 		);
 
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
 				if (!this.reconciliationController.isReconciled) return;
-				this.updateActiveMarkdownPath(
-					file?.path ?? null,
-					"file-open-active-change",
-				);
+				this.editorWorkspace?.onFileOpen(file?.path ?? null);
 				if (!file) return;
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (view && view.file?.path === file.path) {
-					this.editorBindings?.bind(view, this.settings.deviceName);
-					this.trackOpenFile(file.path);
-				}
 
 				// Prefetch embedded attachments for the opened note
-				if (file.path.endsWith(".md") && this.blobSync) {
+				if (file.path.endsWith(".md") && this.getBlobSync()) {
 					this.prefetchEmbeddedAttachments(file);
 				}
 			}),
@@ -795,8 +650,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				if (this.isMarkdownPathSyncable(file.path)) {
 					this.reconciliationController.markMarkdownDirty(file, "modify");
-				} else if (this.blobSync && this.isBlobPathSyncable(file.path) && !this.blobSync.isSuppressed(file.path)) {
-					this.blobSync.handleFileChange(file);
+				} else {
+					const blobSync = this.getBlobSync();
+					if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
+						blobSync.handleFileChange(file);
+					}
 				}
 			}),
 		);
@@ -829,19 +687,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this.log(`Suppressed delete event for "${file.path}"`);
 						return;
 					}
-					this.editorBindings?.unbindByPath(file.path);
-					this.diskMirror?.notifyFileClosed(file.path);
-					this.openFilePaths.delete(file.path);
+					this.editorWorkspace?.onMarkdownDeleted(file.path);
 
 					this.vaultSync?.handleDelete(
 						file.path,
 						this.settings.deviceName,
 					);
 					this.log(`Delete: "${file.path}"`);
-				} else if (this.blobSync && this.isBlobPathSyncable(file.path) && !this.blobSync.isSuppressed(file.path)) {
-					this.blobSync.handleFileDelete(file.path, this.settings.deviceName);
-					this.log(`Delete (blob): "${file.path}"`);
-				}
+					} else {
+						const blobSync = this.getBlobSync();
+						if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
+							blobSync.handleFileDelete(file.path, this.settings.deviceName);
+							this.log(`Delete (blob): "${file.path}"`);
+						}
+					}
 			}),
 		);
 
@@ -853,7 +712,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (this.isMarkdownPathSyncable(file.path)) {
 					this.reconciliationController.markMarkdownDirty(file, "create");
 				} else if (this.isBlobPathSyncable(file.path)) {
-					if (this.blobSync && !this.blobSync.isSuppressed(file.path)) {
+					const blobSync = this.getBlobSync();
+					if (blobSync && !blobSync.isSuppressed(file.path)) {
 						// For blob files, use the same stability check before uploading
 						if (this.pendingStabilityChecks.has(file.path)) return;
 						this.pendingStabilityChecks.add(file.path);
@@ -861,17 +721,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						void waitForDiskQuiet(this.app, file.path).then((stable) => {
 							this.pendingStabilityChecks.delete(file.path);
 							if (stable) {
-								this.blobSync?.handleFileChange(file);
+								this.getBlobSync()?.handleFileChange(file);
 							} else {
 								this.log(`Create (blob): "${file.path}" unstable after timeout, skipping`);
 							}
 						});
-					} else if (!this.serverSupportsAttachments && !this.shownAttachmentNudge) {
-						this.shownAttachmentNudge = true;
-						new Notice(
-							"YAOS: This file won't sync yet — attachment sync needs a Cloudflare R2 bucket. Open YAOS settings for a 1-minute setup guide.",
-							10000,
-						);
+					} else if (!this.serverSupportsAttachments) {
+						this.attachmentOrchestrator?.notifyUnsupportedAttachmentCreate();
 					}
 				}
 			}),
@@ -893,15 +749,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.editorBindings?.unbindAll();
 		this.diskMirror?.destroy();
 
-		// Persist blob queue before destroying (crash resilience)
-		if (this.blobSync) {
-			const snapshot = this.blobSync.exportQueue();
-			if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
-				// Fire-and-forget — teardown can't be async
-				void this.saveBlobQueue();
-			}
-		}
-		this.blobSync?.destroy();
+		this.attachmentOrchestrator?.destroy();
 
 		if (this.statusInterval) {
 			clearInterval(this.statusInterval);
@@ -916,11 +764,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.connectionController = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
-		this.blobSync = null;
-		this.shownAttachmentNudge = false;
 		this.awaitingFirstProviderSyncAfterStartup = false;
-		this.openFilePaths.clear();
-		this.activeMarkdownPath = null;
+		this.editorWorkspace?.reset();
 		this.idbDegradedHandled = false;
 
 		this.updateStatusBar("disconnected");
@@ -1016,7 +861,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * the next reconcile or CRDT observer to trigger the download.
 	 */
 	private prefetchEmbeddedAttachments(file: TFile): void {
-		if (!this.blobSync) return;
+		const blobSync = this.getBlobSync();
+		if (!blobSync) return;
 
 		const cache = this.app.metadataCache.getFileCache(file);
 		if (!cache?.embeds) return;
@@ -1063,7 +909,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		if (pathsToFetch.length > 0) {
-			const queued = this.blobSync.prioritizeDownloads(pathsToFetch);
+			const queued = blobSync.prioritizeDownloads(pathsToFetch);
 			if (queued > 0) {
 				this.log(`prefetch: queued ${queued} attachments for "${file.path}"`);
 			}
@@ -1303,112 +1149,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private updateStatusBar(state: SyncStatus): void {
 		if (!this.statusBarEl) return;
-		renderSyncStatus(this.statusBarEl, state, this.blobSync?.transferStatus);
+		renderSyncStatus(this.statusBarEl, state, this.getBlobSync()?.transferStatus);
 	}
 
-	private setupTraceLogger(): void {
-		if (!this.settings.debug) return;
-
-		this.traceLogger = new PersistentTraceLogger(this.app, {
-			enabled: this.settings.debug,
-			deviceName: this.settings.deviceName || "unknown-device",
-			vaultId: this.settings.vaultId || "unknown-vault",
+	private setupTraceRuntime(): void {
+		this.traceRuntime = new TraceRuntimeController({
+			app: this.app,
+			getSettings: () => this.settings,
+			buildSnapshot: (reason, recentServerTrace) =>
+				this.buildTraceStateSnapshot(reason, recentServerTrace),
+			isIndexedDbRelatedError: (err) => this.isIndexedDbRelatedError(err),
+			isObsidianFileMetadataRaceError: (err) => this.isObsidianFileMetadataRaceError(err),
+			handleIndexedDbDegraded: (source, err) => this.handleIndexedDbDegraded(source, err),
+			registerCleanup: (cleanup) => this.register(cleanup),
 		});
-		this.trace(
-			"trace",
-			"trace-session-start",
-			{
-				host: this.settings.host,
-				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
-			},
-		);
-
-		this.traceStateInterval = setInterval(() => {
-			this.scheduleTraceStateSnapshot("interval");
-		}, 5000);
-		this.traceServerInterval = setInterval(() => {
-			void this.refreshServerTrace();
-		}, 15000);
-
-		const errorHandler = (event: ErrorEvent) => {
-			if (this.isIndexedDbRelatedError(event.error ?? event.message)) {
-				this.trace("trace", "window-error-indexeddb", {
-					message: event.message,
-					filename: event.filename,
-					lineno: event.lineno,
-					colno: event.colno,
-				});
-				this.handleIndexedDbDegraded("window-error", event.error ?? event.message);
-				this.scheduleTraceStateSnapshot("window-error-indexeddb");
-				event.preventDefault();
-				return;
-			}
-			this.trace("trace", "window-error", {
-				message: event.message,
-				filename: event.filename,
-				lineno: event.lineno,
-				colno: event.colno,
-			});
-			this.traceLogger?.captureCrash("window-error", event.error ?? event.message, {
-				filename: event.filename,
-				lineno: event.lineno,
-				colno: event.colno,
-			});
-			this.scheduleTraceStateSnapshot("window-error");
-		};
-
-		const rejectionHandler = (event: PromiseRejectionEvent) => {
-			if (this.isIndexedDbRelatedError(event.reason)) {
-				this.trace("trace", "unhandled-rejection-indexeddb", {
-					reason: String(event.reason),
-				});
-				this.handleIndexedDbDegraded("unhandled-rejection", event.reason);
-				this.scheduleTraceStateSnapshot("unhandled-rejection-indexeddb");
-				event.preventDefault();
-				return;
-			}
-			if (this.isObsidianFileMetadataRaceError(event.reason)) {
-				const now = Date.now();
-				if (now - this.lastMetadataRaceRejectionAt >= 5000) {
-					this.lastMetadataRaceRejectionAt = now;
-					this.trace("trace", "unhandled-rejection-file-metadata-race", {
-						reason: String(event.reason),
-					});
-					this.scheduleTraceStateSnapshot("unhandled-rejection-file-metadata-race");
-				}
-				event.preventDefault();
-				return;
-			}
-			this.trace("trace", "unhandled-rejection", {
-				reason: String(event.reason),
-			});
-			this.traceLogger?.captureCrash("unhandled-rejection", event.reason);
-			this.scheduleTraceStateSnapshot("unhandled-rejection");
-		};
-
-		window.addEventListener("error", errorHandler);
-		window.addEventListener("unhandledrejection", rejectionHandler);
-		this.register(() => {
-			window.removeEventListener("error", errorHandler);
-			window.removeEventListener("unhandledrejection", rejectionHandler);
-		});
-
-		this.register(() => {
-			if (this.traceStateInterval) {
-				clearInterval(this.traceStateInterval);
-				this.traceStateInterval = null;
-			}
-			if (this.traceServerInterval) {
-				clearInterval(this.traceServerInterval);
-				this.traceServerInterval = null;
-			}
-		});
-		this.scheduleTraceStateSnapshot("plugin-load");
+		this.traceRuntime.start();
 	}
 
 	private getTraceHttpContext(): TraceHttpContext | undefined {
-		return this.traceLogger?.httpContext;
+		return this.traceRuntime?.httpContext;
 	}
 
 	private trace(
@@ -1416,73 +1175,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		msg: string,
 		details?: TraceEventDetails,
 	): void {
-		this.traceLogger?.record(source, msg, details);
+		this.traceRuntime?.record(source, msg, details);
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
-		if (!this.traceLogger?.isEnabled) return;
-		if (this.traceStateTimer) clearTimeout(this.traceStateTimer);
-		this.traceStateTimer = setTimeout(() => {
-			this.traceStateTimer = null;
-			void this.writeTraceStateSnapshot(reason);
-		}, 250);
+		this.traceRuntime?.scheduleSnapshot(reason);
 	}
 
-	private async writeTraceStateSnapshot(reason: string): Promise<void> {
-		if (!this.traceLogger?.isEnabled) return;
-		const snapshot = await this.buildTraceStateSnapshot(reason);
-		this.traceLogger.updateCurrentState(snapshot);
-	}
-
-	private async refreshServerTrace(): Promise<void> {
-		if (!this.traceLogger?.isEnabled) return;
-		if (!this.settings.host || !this.settings.token || !this.settings.vaultId) return;
-		if (this.traceServerInFlight) return;
-
-		this.traceServerInFlight = true;
-		try {
-			const host = this.settings.host.replace(/\/$/, "");
-			const roomId = this.settings.vaultId;
-			const url = appendTraceParams(
-				`${host}/vault/${encodeURIComponent(roomId)}/debug/recent`,
-				this.getTraceHttpContext(),
-			);
-			const res = await obsidianRequest({
-				url,
-				method: "GET",
-				headers: {
-					Authorization: `Bearer ${this.settings.token}`,
-				},
-			});
-			if (res.status !== 200) {
-				throw new Error(`server debug fetch failed (${res.status})`);
-			}
-
-			const payload = res.json as {
-				recent?: unknown[];
-				roomId?: unknown;
-			};
-			if (typeof payload.roomId === "string" && payload.roomId !== roomId) {
-				throw new Error(
-					`server debug fetch returned mismatched room (${payload.roomId})`,
-				);
-			}
-
-			this.recentServerTrace = Array.isArray(payload.recent)
-				? payload.recent.slice(-120)
-				: [];
-			this.scheduleTraceStateSnapshot("server-trace-refresh");
-			return;
-		} catch (err) {
-			this.trace("trace", "server-trace-fetch-failed", {
-				error: String(err),
-			});
-		} finally {
-			this.traceServerInFlight = false;
-		}
-	}
-
-	private async buildTraceStateSnapshot(reason: string): Promise<Record<string, unknown>> {
+	private async buildTraceStateSnapshot(
+		reason: string,
+		recentServerTrace: unknown[],
+	): Promise<Record<string, unknown>> {
 		return {
 			generatedAt: new Date().toISOString(),
 			reason,
@@ -1501,17 +1204,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				reconcilePending: this.reconciliationController.getState().reconcilePending,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
-				openFileCount: this.openFilePaths.size,
+				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			},
 			sync: this.vaultSync?.getDebugSnapshot() ?? null,
 			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
-			blobSync: this.blobSync?.getDebugSnapshot() ?? null,
+			blobSync: this.getBlobSync()?.getDebugSnapshot() ?? null,
 			openFiles: await this.collectOpenFileTraceState(),
 			recentEvents: {
 				plugin: this.eventRing.slice(-120),
 				sync: this.vaultSync?.getRecentEvents(120) ?? [],
 			},
-			serverTrace: this.recentServerTrace,
+			serverTrace: recentServerTrace,
 		};
 	}
 
@@ -1606,19 +1309,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
-		if (this.traceStateTimer) {
-			clearTimeout(this.traceStateTimer);
-			this.traceStateTimer = null;
-		}
-		if (this.traceStateInterval) {
-			clearInterval(this.traceStateInterval);
-			this.traceStateInterval = null;
-		}
-		if (this.traceServerInterval) {
-			clearInterval(this.traceServerInterval);
-			this.traceServerInterval = null;
-		}
-		void this.traceLogger?.shutdown();
+		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
 		this.teardownSync();
 	}
@@ -1737,97 +1428,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		].join("\n");
 	}
 
-	private createBlobSyncManager(): BlobSyncManager | null {
-		if (!this.vaultSync) return null;
-		if (!this.runtimeConfig.host || !this.runtimeConfig.token) return null;
-		return new BlobSyncManager(
-			this.app,
-			this.vaultSync,
-			{
-				host: this.runtimeConfig.host,
-				token: this.runtimeConfig.token,
-				vaultId: this.runtimeConfig.vaultId,
-				maxAttachmentSizeKB: this.runtimeConfig.maxAttachmentSizeKB,
-				attachmentConcurrency: this.runtimeConfig.attachmentConcurrency,
-				debug: this.runtimeConfig.debug,
-				trace: this.getTraceHttpContext(),
-			},
-			this.blobHashCache,
-			(source, msg, details) => this.trace(source, msg, details),
-		);
-	}
-
-	private startBlobSyncEngine(reason: string, runInitialReconcile: boolean): void {
-		if (this.blobSync) return;
-		if (!this.runtimeConfig.enableAttachmentSync || !this.serverSupportsAttachments) return;
-
-		const blobSync = this.createBlobSyncManager();
-		if (!blobSync) return;
-
-		this.blobSync = blobSync;
-		this.blobSync.startObservers();
-		this.log(`Attachment sync engine started (${reason})`);
-
-		// Restore persisted queue from previous session
-		if (this.savedBlobQueue) {
-			this.blobSync.importQueue(this.savedBlobQueue);
-			this.savedBlobQueue = null;
-		}
-
-		this.maybeOpenBlobDownloadGate(`engine-start:${reason}`);
-
-		if (runInitialReconcile) {
-			try {
-				const result = this.blobSync.reconcile("authoritative", this.excludePatterns);
-				this.log(
-					`Attachment reconcile (${reason}): queued ` +
-					`${result.uploadQueued} uploads, ${result.downloadQueued} downloads, ${result.skipped} skipped`,
-				);
-			} catch (err) {
-				this.log(`Attachment reconcile (${reason}) failed: ${formatUnknown(err)}`);
-			}
-		}
-	}
-
-	private async stopBlobSyncEngine(reason: string): Promise<void> {
-		if (!this.blobSync) return;
-		const snapshot = this.blobSync.exportQueue();
-		if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
-			await this.saveBlobQueue();
-		}
-		this.blobSync.destroy();
-		this.blobSync = null;
-		this.log(`Attachment sync engine stopped (${reason})`);
-	}
-
-	private maybeOpenBlobDownloadGate(reason: string): void {
-		if (!this.blobSync) return;
-		if (this.blobSync.isDownloadGateOpen) return;
-		if (!this.blobDownloadGateLayoutReady || !this.blobDownloadGateStartupReady) return;
-		this.trace("trace", "blob-download-gate-open", {
-			reason,
-			pendingDownloads: this.blobSync.pendingDownloads,
-		});
-		this.blobSync.openDownloadGate(reason);
-		this.scheduleTraceStateSnapshot(`blob-download-gate:${reason}`);
-	}
-
-	private markBlobDownloadStartupReady(reason: string): void {
-		if (this.blobDownloadGateStartupReady) return;
-		this.blobDownloadGateStartupReady = true;
-		this.trace("trace", "blob-download-startup-ready", { reason });
-		this.log(`Blob download gate: startup ready (${reason})`);
-		this.maybeOpenBlobDownloadGate(`startup-ready:${reason}`);
-	}
-
 	async refreshAttachmentSyncRuntime(reason = "settings-change"): Promise<void> {
-		if (!this.vaultSync) return;
-		if (this.runtimeConfig.enableAttachmentSync && this.serverSupportsAttachments) {
-			this.startBlobSyncEngine(reason, true);
-		} else {
-			await this.stopBlobSyncEngine(reason);
-		}
-		this.refreshStatusBar();
+		await this.attachmentOrchestrator?.refresh(reason);
 	}
 
 	private enforceCompatibilityGuard(reason: string): boolean {
@@ -1873,79 +1475,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.capabilityUpdateService?.syncUpdateMetadataToServer(reason);
 	}
 
-		private async confirmVaultIdSwitch(
-			currentVaultId: string,
-			incomingVaultId: string,
-			localMarkdownCount: number,
-		): Promise<boolean> {
-			return await new Promise((resolve) => {
-				new ConfirmModal(
-					this.app,
-					"Switch vault ID",
-					`This pairing link points to a different vault ID. ` +
-					`Current vault ID: ${currentVaultId}. Incoming vault ID: ${incomingVaultId}. ` +
-					`This vault currently has ${localMarkdownCount} local markdown files. ` +
-					`Switching rooms may pull a different remote state. Continue and switch to the incoming vault ID?`,
-				() => resolve(true),
-				"Switch vault ID",
-				"Keep current vault ID",
-				() => resolve(false),
-			).open();
-		});
-	}
-
-		private async handleSetupLink(params: Record<string, string>): Promise<void> {
-			const host = typeof params.host === "string" ? params.host.trim() : "";
-			const token = typeof params.token === "string" ? params.token.trim() : "";
-			const incomingVaultId = typeof params.vaultId === "string" ? params.vaultId.trim() : "";
-			if (!host || !token) {
-				new Notice("Setup link is missing a host or token.");
-				return;
-			}
-			if (!incomingVaultId) {
-				new Notice(
-					"Setup link is missing the vault ID. This may create a separate sync room on this device.",
-					8000,
-				);
-			}
-
-		const currentVaultId = this.settings.vaultId?.trim() ?? "";
-		if (incomingVaultId && currentVaultId && incomingVaultId !== currentVaultId) {
-			const localMarkdownCount = this.app.vault
-				.getMarkdownFiles()
-				.filter((file) => this.isMarkdownPathSyncable(file.path))
-				.length;
-			if (localMarkdownCount > 5) {
-				const confirmed = await this.confirmVaultIdSwitch(
-					currentVaultId,
-					incomingVaultId,
-					localMarkdownCount,
-					);
-					if (!confirmed) {
-						new Notice("Pairing cancelled. Vault ID unchanged.", 6000);
-						return;
-					}
-				}
-		}
-
-		await this.updateSettings((settings) => {
-			settings.host = host.replace(/\/$/, "");
-			settings.token = token;
-			if (incomingVaultId) {
-				settings.vaultId = incomingVaultId;
-			}
-		}, "setup-link");
-		await this.refreshServerCapabilities();
-			new Notice("Server linked. Starting sync...", 6000);
-
-		if (!this.vaultSync) {
-			void this.initSync();
-			return;
-		}
-
-			new Notice("Settings saved. Reload the plugin to reconnect with the new server.", 8000);
-		}
-
 		private showFatalSyncNotice(): void {
 			const code = this.vaultSync?.fatalAuthCode;
 			if (code === "unclaimed") {
@@ -1981,9 +1510,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.persistPluginState();
 	}
 
-	private async saveBlobQueue(): Promise<void> {
-		if (!this.blobSync) return;
-		const snapshot = this.blobSync.exportQueue();
+	private async persistBlobQueueSnapshot(snapshot: BlobQueueSnapshot): Promise<void> {
 		// Only write if there's actually something to persist
 		if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) return;
 		await this.persistPluginState((state) => {
@@ -2063,73 +1590,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			new Notice("Sync not initialized.");
 			return;
 		}
-
-			const fromVersion = this.vaultSync.storedSchemaVersion;
-			if (fromVersion !== null && fromVersion >= 2) {
-				new Notice("This vault is already on schema v2.");
-				return;
-			}
-
-		new ConfirmModal(
-			this.app,
-			"Migrate sync schema to v2",
-			"This will switch this vault to schema v2 and block older YAOS clients from syncing " +
-			"until they are upgraded. YAOS will export diagnostics before and after migration. Continue?",
-			async () => {
-				if (!this.vaultSync) return;
-
-					try {
-						new Notice("Exporting pre-migration diagnostics...", 7000);
-						await this.diagnosticsService?.exportDiagnostics();
-					} catch (err) {
-						this.log(`schema migration: preflight diagnostics export failed: ${String(err)}`);
-				}
-
-				const result = this.vaultSync.migrateSchemaToV2(this.settings.deviceName);
-				this.log(
-					`schema migration result: ${JSON.stringify(result)}`,
-				);
-				const loserCleanupCount = await this.cleanupMigrationLoserPaths(result.loserPaths);
-				if (loserCleanupCount > 0) {
-					this.log(`schema migration: removed ${loserCleanupCount} loser-path file(s) from disk`);
-				}
-
-				const mode = this.vaultSync.getSafeReconcileMode();
+		runSchemaMigrationToV2({
+			app: this.app,
+			vaultSync: this.vaultSync,
+			settings: this.settings,
+			diagnosticsService: this.diagnosticsService,
+			log: (msg) => this.log(msg),
+			runReconciliation: async () => {
+				const mode = this.vaultSync?.getSafeReconcileMode();
+				if (!mode) return;
 				await this.runReconciliation(mode);
-				this.bindAllOpenEditors();
-				this.validateAllOpenBindings("schema-migration");
-
-					try {
-						new Notice("Exporting post-migration diagnostics...", 7000);
-						await this.diagnosticsService?.exportDiagnostics();
-					} catch (err) {
-						this.log(`schema migration: postflight diagnostics export failed: ${String(err)}`);
-				}
-
-				new Notice(
-					`YAOS: schema v2 migration complete` +
-					(loserCleanupCount > 0 ? ` (${loserCleanupCount} local alias file(s) cleaned).` : ".") +
-					" Update YAOS on your other devices before reconnecting them.",
-					12000,
-				);
 			},
-		).open();
-	}
-
-	private async cleanupMigrationLoserPaths(paths: string[]): Promise<number> {
-		if (paths.length === 0) return 0;
-		let removed = 0;
-		for (const path of paths) {
-			const node = this.app.vault.getAbstractFileByPath(path);
-			if (!(node instanceof TFile)) continue;
-			try {
-				await this.app.fileManager.trashFile(node);
-				removed++;
-			} catch (err) {
-				this.log(`schema migration: failed to remove loser path "${path}": ${String(err)}`);
-			}
-		}
-		return removed;
+		});
 	}
 
 	private async runVfsTortureTest(): Promise<void> {
@@ -2137,206 +1609,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			new Notice("Sync not initialized");
 			return;
 		}
-
-		const startedAt = Date.now();
-		const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`;
-		const rootDir = normalizePath(`YAOS QA/vfs-torture-${runId}`);
-		const steps: Array<{
-			name: string;
-			status: "ok" | "error" | "skipped";
-			timestamp: string;
-			durationMs: number;
-			detail: string;
-		}> = [];
-
-		const ensureFolder = async (folderPath: string): Promise<void> => {
-			const normalized = normalizePath(folderPath);
-			if (!normalized) return;
-			const segments = normalized.split("/").filter(Boolean);
-			let current = "";
-			for (const segment of segments) {
-				current = current ? `${current}/${segment}` : segment;
-				if (!this.app.vault.getAbstractFileByPath(current)) {
-					await this.app.vault.createFolder(current);
-				}
-			}
-		};
-
-		const runStep = async (
-			name: string,
-			fn: () => Promise<string | void>,
-		): Promise<void> => {
-			const stepStartedAt = Date.now();
-			try {
-				const detail = (await fn()) ?? "";
-				steps.push({
-					name,
-					status: "ok",
-					timestamp: new Date().toISOString(),
-					durationMs: Date.now() - stepStartedAt,
-					detail,
-				});
-			} catch (err) {
-				const detail = err instanceof Error ? err.stack ?? err.message : String(err);
-				steps.push({
-					name,
-					status: "error",
-					timestamp: new Date().toISOString(),
-					durationMs: Date.now() - stepStartedAt,
-					detail,
-				});
-				this.log(`VFS torture step failed [${name}]: ${detail}`);
-			}
-		};
-
-			new Notice("Running filesystem torture test...");
-		this.log(`VFS torture: starting run ${runId} in "${rootDir}"`);
-
-		await runStep("Create sandbox folder structure", async () => {
-			await ensureFolder(rootDir);
-			await ensureFolder(`${rootDir}/rename-source/nested`);
-			return `Created sandbox at ${rootDir}`;
+		await runVfsTortureTest({
+			app: this.app,
+			vaultSync: this.vaultSync,
+			settings: this.settings,
+			reconciliationController: this.reconciliationController,
+			editorWorkspace: this.editorWorkspace,
+			diagnosticsService: this.diagnosticsService,
+			getBlobSync: () => this.getBlobSync(),
+			getTraceHttpContext: () => this.getTraceHttpContext(),
+			eventRing: this.eventRing,
+			log: (msg) => this.log(msg),
 		});
-
-		await runStep("Burst edit markdown file", async () => {
-			const burstPath = normalizePath(`${rootDir}/burst.md`);
-			const burstFile = await this.app.vault.create(
-				burstPath,
-				"# YAOS burst test\n\nStart of burst edits.",
-			);
-			for (let i = 1; i <= 10; i++) {
-				const current = await this.app.vault.read(burstFile);
-				await this.app.vault.modify(
-					burstFile,
-					`${current}\n- burst edit ${i} @ ${new Date().toISOString()}`,
-				);
-			}
-			return `Applied 10 rapid app-level writes to ${burstPath}`;
-		});
-
-		await runStep("Rapid create/rename/edit sequence", async () => {
-			const untitledPath = normalizePath(`${rootDir}/Untitled.md`);
-			const renamedPath = normalizePath(`${rootDir}/Meeting Notes.md`);
-			const untitledFile = await this.app.vault.create(
-				untitledPath,
-				"# Quick rename flow\n\nseed",
-			);
-			await this.app.vault.modify(untitledFile, "# Quick rename flow\n\nseed\nline 1");
-			await this.app.fileManager.renameFile(untitledFile, renamedPath);
-			const renamedFile = this.app.vault.getAbstractFileByPath(renamedPath);
-			if (!(renamedFile instanceof TFile)) {
-				throw new Error(`Expected renamed file at "${renamedPath}"`);
-			}
-			const current = await this.app.vault.read(renamedFile);
-			await this.app.vault.modify(renamedFile, `${current}\nline 2`);
-			return `Renamed ${untitledPath} -> ${renamedPath} and appended a post-rename edit`;
-		});
-
-		await runStep("Folder rename cascade with post-rename edit", async () => {
-			const sourceFolder = normalizePath(`${rootDir}/rename-source`);
-			const destinationFolder = normalizePath(`${rootDir}/rename-destination`);
-			const targetPath = normalizePath(`${sourceFolder}/nested/target.md`);
-			await this.app.vault.create(targetPath, "# Rename target\n\nbefore rename");
-
-			const sourceNode = this.app.vault.getAbstractFileByPath(sourceFolder);
-			if (!sourceNode) {
-				throw new Error(`Folder missing: ${sourceFolder}`);
-			}
-			await this.app.fileManager.renameFile(sourceNode, destinationFolder);
-
-			const movedTargetPath = normalizePath(`${destinationFolder}/nested/target.md`);
-			const movedTarget = this.app.vault.getAbstractFileByPath(movedTargetPath);
-			if (!(movedTarget instanceof TFile)) {
-				throw new Error(`Renamed target missing: ${movedTargetPath}`);
-			}
-			const current = await this.app.vault.read(movedTarget);
-			await this.app.vault.modify(movedTarget, `${current}\npost-rename line`);
-			return `Renamed folder ${sourceFolder} -> ${destinationFolder}`;
-		});
-
-		await runStep("Delete and recreate same path", async () => {
-			const tombstonePath = normalizePath(`${rootDir}/tombstone.md`);
-			const file = await this.app.vault.create(
-				tombstonePath,
-				"# Tombstone test\n\noriginal content",
-			);
-			await this.app.fileManager.trashFile(file);
-			await this.app.vault.create(
-				tombstonePath,
-				"# Tombstone test\n\nrecreated content",
-			);
-			return `Deleted and recreated ${tombstonePath}`;
-		});
-
-		await runStep("Create 3 MB binary attachment", async () => {
-			const blobPath = normalizePath(`${rootDir}/attachment-3mb.bin`);
-			const bytes = new Uint8Array(3 * 1024 * 1024);
-			for (let i = 0; i < bytes.length; i++) {
-				bytes[i] = i % 251;
-			}
-			await this.app.vault.createBinary(blobPath, bytes.buffer);
-			if (!this.settings.enableAttachmentSync) {
-				return `Created ${blobPath} (${bytes.length} bytes). Attachment sync is disabled in settings.`;
-			}
-			return `Created ${blobPath} (${bytes.length} bytes) for attachment sync path`;
-		});
-
-		const failures = steps.filter((step) => step.status === "error");
-		const report = {
-			generatedAt: new Date().toISOString(),
-			durationMs: Date.now() - startedAt,
-			runId,
-			rootDir,
-			trace: this.getTraceHttpContext() ?? null,
-			settings: {
-				host: this.settings.host,
-				vaultId: this.settings.vaultId,
-				deviceName: this.settings.deviceName,
-				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
-				debug: this.settings.debug,
-			},
-			syncState: {
-				connected: this.vaultSync.connected,
-				providerSynced: this.vaultSync.providerSynced,
-				localReady: this.vaultSync.localReady,
-				connectionGeneration: this.vaultSync.connectionGeneration,
-				reconciled: this.reconciliationController.getState().reconciled,
-				openFileCount: this.openFilePaths.size,
-				pathToIdCount: this.vaultSync.pathToId.size,
-				activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
-				pathToBlobCount: this.vaultSync.pathToBlob.size,
-				pendingUploads: this.blobSync?.pendingUploads ?? 0,
-				pendingDownloads: this.blobSync?.pendingDownloads ?? 0,
-			},
-			steps,
-			recentEvents: {
-				plugin: this.eventRing.slice(-120),
-				sync: this.vaultSync.getRecentEvents(120),
-			},
-		};
-
-		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir()
-			?? normalizePath(`${this.app.vault.configDir}/plugins/yaos/diagnostics`);
-		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const outPath = normalizePath(
-			`${diagDir}/vfs-torture-${stamp}-${this.settings.deviceName || "device"}.json`,
-		);
-		await this.app.vault.adapter.write(outPath, JSON.stringify(report, null, 2));
-
-		if (failures.length > 0) {
-			new Notice(
-				`YAOS VFS torture run finished with ${failures.length} failed step(s). Report: ${outPath}`,
-				12000,
-			);
-			this.log(
-				`VFS torture: completed with ${failures.length} failures. Report=${outPath}`,
-			);
-			return;
-		}
-
-		new Notice(`YAOS VFS torture run completed. Report: ${outPath}`, 10000);
-		this.log(`VFS torture: completed successfully. Report=${outPath}`);
 	}
 
 	private log(msg: string): void {
@@ -2390,75 +1674,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.log(`IndexedDB degraded (${source}): kind=${kind}`);
 		this.scheduleTraceStateSnapshot("idb-degraded");
 
-		if (this.blobSync) {
-			void this.stopBlobSyncEngine("idb-degraded");
-		}
+		void this.attachmentOrchestrator?.stop("idb-degraded");
 
 		const notice = kind === "quota_exceeded"
 			? "YAOS: Device storage is full. Sync durability is degraded and attachment transfers are paused. Free up storage, then restart Obsidian."
 			: "YAOS: IndexedDB persistence failed. Sync durability is degraded and attachment transfers are paused.";
 		new Notice(notice, 12000);
-	}
-}
-
-/**
- * Simple confirmation modal with a message and confirm/cancel buttons.
- */
-class ConfirmModal extends Modal {
-	private title: string;
-	private message: string;
-	private onConfirm: () => void | Promise<void>;
-	private confirmText: string;
-	private cancelText: string;
-	private onCancel?: () => void | Promise<void>;
-	private confirmed = false;
-
-	constructor(
-		app: import("obsidian").App,
-		title: string,
-		message: string,
-		onConfirm: () => void | Promise<void>,
-		confirmText = "Confirm",
-		cancelText = "Cancel",
-		onCancel?: () => void | Promise<void>,
-	) {
-		super(app);
-		this.title = title;
-		this.message = message;
-		this.onConfirm = onConfirm;
-		this.confirmText = confirmText;
-		this.cancelText = cancelText;
-		this.onCancel = onCancel;
-	}
-
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.empty();
-
-		contentEl.createEl("h3", { text: this.title });
-		contentEl.createEl("p", { text: this.message });
-
-		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
-
-		buttonRow
-			.createEl("button", { text: this.cancelText })
-			.addEventListener("click", () => this.close());
-
-		const confirmBtn = buttonRow.createEl("button", {
-			text: this.confirmText,
-			cls: "mod-warning",
-		});
-		confirmBtn.addEventListener("click", () => {
-			this.confirmed = true;
-			this.close();
-			void this.onConfirm();
-		});
-	}
-
-	onClose() {
-		this.contentEl.empty();
-		if (!this.confirmed && this.onCancel) {
-			void this.onCancel();
-		}
 	}
 }
