@@ -1,70 +1,13 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { PairDeviceModal } from "./settings/PairDeviceModal";
 import { RecoveryKitModal } from "./settings/RecoveryKitModal";
-import { randomBase64Url } from "./utils/base64url";
-
-/** Controls how external disk edits (git, other editors) are imported into CRDT. */
-export type ExternalEditPolicy = "always" | "closed-only" | "never";
-
-export interface VaultSyncSettings {
-	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
-	host: string;
-	/** Shared secret token for auth. */
-	token: string;
-	/** Unique vault identifier. Generated randomly if empty on first load. */
-	vaultId: string;
-	/** Human-readable device name shown in awareness/cursors. */
-	deviceName: string;
-	/** Enable verbose console.log output for debugging. */
-	debug: boolean;
-	/** Pause propagation of suspicious YAML frontmatter transitions. */
-	frontmatterGuardEnabled: boolean;
-	/** Comma-separated path prefixes to exclude from sync. */
-	excludePatterns: string;
-	/** Maximum file size in KB to sync via CRDT. Files larger are skipped. */
-	maxFileSizeKB: number;
-	/**
-	 * How to handle external disk modifications (git pull, other editors).
-	 *   "always"      — always import into CRDT (default, current behavior)
-	 *   "closed-only" — import only for files not open in an editor
-	 *   "never"       — never import (CRDT is sole source of truth)
-	 */
-	externalEditPolicy: ExternalEditPolicy;
-	/** Enable attachment (non-markdown) sync via R2 blob store. */
-	enableAttachmentSync: boolean;
-	/** True once the user has explicitly changed the attachment sync toggle. */
-	attachmentSyncExplicitlyConfigured: boolean;
-	/** Maximum attachment size in KB. Files larger are skipped. Default 10240 (10 MB). */
-	maxAttachmentSizeKB: number;
-	/** Number of parallel upload/download slots. */
-	attachmentConcurrency: number;
-	/** Show remote cursors and selections in the editor. */
-	showRemoteCursors: boolean;
-	/** Optional repo URL used to deep-link provider-native update pages. */
-	updateRepoUrl: string;
-	/** Optional default branch for provider-native update links. */
-	updateRepoBranch: string;
-}
-
-export const DEFAULT_SETTINGS: VaultSyncSettings = {
-	host: "",
-	token: "",
-	vaultId: "",
-	deviceName: "",
-	debug: false,
-	frontmatterGuardEnabled: true,
-	excludePatterns: "",
-	maxFileSizeKB: 2048,
-	externalEditPolicy: "always",
-	enableAttachmentSync: true,
-	attachmentSyncExplicitlyConfigured: false,
-	maxAttachmentSizeKB: 10240,
-	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
-	attachmentConcurrency: 1,
-	showRemoteCursors: true,
-	updateRepoUrl: "",
-	updateRepoBranch: "main",
-};
+import type { ExternalEditPolicy, VaultSyncSettings } from "./settings/settingsStore";
+export {
+	DEFAULT_SETTINGS,
+	generateVaultId,
+	type ExternalEditPolicy,
+	type VaultSyncSettings,
+} from "./settings/settingsStore";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -101,11 +44,6 @@ export interface VaultSyncSettingsHost {
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
-
-/** Generate a random vault ID (16 bytes, base64url). */
-export function generateVaultId(): string {
-	return randomBase64Url(16);
-}
 
 /** Returns true if the host URL is unencrypted and not localhost. */
 function isInsecureRemoteHost(host: string): boolean {

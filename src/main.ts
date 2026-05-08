@@ -5,6 +5,7 @@ import {
 	generateVaultId,
 	type VaultSyncSettings,
 } from "./settings";
+import { SettingsStore } from "./settings/settingsStore";
 import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
@@ -89,6 +90,10 @@ const BOUND_RECOVERY_LOCK_MS = 1500;
 
 export default class VaultCrdtSyncPlugin extends Plugin {
 	settings: VaultSyncSettings = DEFAULT_SETTINGS;
+	private readonly settingsStore = new SettingsStore<PersistedPluginState>({
+		loadData: () => this.loadData(),
+		saveData: (data) => this.saveData(data),
+	});
 
 	private vaultSync: VaultSync | null = null;
 	private connectionController: ConnectionController | null = null;
@@ -2418,21 +2423,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const data = (await this.loadData()) as PersistedPluginState | null;
-		this.persistedState = { ...(data ?? {}) };
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			data as Partial<VaultSyncSettings>,
-		);
-		let migratedSettings = false;
-		if (typeof data?.attachmentSyncExplicitlyConfigured !== "boolean") {
-			this.settings.attachmentSyncExplicitlyConfigured = data?.enableAttachmentSync === true;
-			if (data?.enableAttachmentSync !== true) {
-				this.settings.enableAttachmentSync = true;
-			}
-			migratedSettings = true;
-		}
+		const { settings, persistedState, migrated } = await this.settingsStore.load();
+		const data = persistedState;
+		this.persistedState = persistedState;
+		this.settings = settings;
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -2450,7 +2444,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migratedSettings) {
+		if (migrated) {
 			await this.persistPluginState();
 		}
 	}
@@ -2785,8 +2779,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private refreshPersistedState(): void {
 		const nextState: PersistedPluginState = {
-			...this.persistedState,
-			...this.settings,
+			...this.settingsStore.withSettings(this.persistedState, this.settings),
 			_diskIndex: this.diskIndex,
 			_blobHashCache: this.blobHashCache,
 		};
@@ -2818,7 +2811,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const write = async () => {
 			this.refreshPersistedState();
 			mutate?.(this.persistedState);
-			await this.saveData({ ...this.persistedState });
+			await this.settingsStore.save(this.persistedState);
 		};
 
 		this.persistWriteChain = this.persistWriteChain
