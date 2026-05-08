@@ -31,9 +31,6 @@ import {
 } from "./sync/frontmatterQuarantine";
 import {
 	type DiskIndex,
-	collectFileStats,
-	filterChangedFiles,
-	updateIndex,
 	moveIndexEntries,
 	waitForDiskQuiet,
 } from "./sync/diskIndex";
@@ -67,6 +64,9 @@ import {
 	buildRuntimeConfig,
 	type RuntimeConfig,
 } from "./runtime/runtimeConfig";
+import {
+	ReconciliationController,
+} from "./runtime/reconciliationController";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -85,8 +85,6 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 };
 
-/** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
-const RECONCILE_COOLDOWN_MS = 10_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
@@ -109,32 +107,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private blobSync: BlobSyncManager | null = null;
 	private snapshotService: SnapshotService | null = null;
 	private diagnosticsService: DiagnosticsService | null = null;
+	private reconciliationController!: ReconciliationController;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
-
-	/**
-	 * True after initial reconciliation is complete.
-	 * Vault events are ignored before this.
-	 */
-	private reconciled = false;
-
-	/** True while a reconciliation is running — prevents overlapping runs. */
-	private reconcileInFlight = false;
-
-	/** Set to true if a reconnect arrives while reconciliation is in-flight. */
-	private reconcilePending = false;
-
-	/**
-	 * Files on disk that weren't imported during conservative reconciliation.
-	 * Imported when the provider eventually syncs.
-	 */
-	private untrackedFiles: string[] = [];
-
-	/**
-	 * The connection generation at which we last reconciled.
-	 * Used to detect reconnects that need re-reconciliation.
-	 */
-	private lastReconciledGeneration = 0;
 
 	/** Track the set of currently observed file paths for disk mirror cleanup. */
 	private openFilePaths = new Set<string>();
@@ -170,24 +145,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private lastMarkdownDirtyAt = 0;
 	private boundRecoveryLocks = new Map<string, number>();
 
-	/** Last time a reconciliation completed (for cooldown). */
-	private lastReconcileTime = 0;
-
-	/** Timer for delayed reconcile after cooldown expires. */
-	private reconcileCooldownTimer: ReturnType<typeof setTimeout> | null = null;
-
 	/** In-memory ring of recent high-level plugin events. */
 	private eventRing: Array<{ ts: string; msg: string }> = [];
-	private lastReconcileStats: {
-		at: string;
-		mode: ReconcileMode;
-		plannedCreates: number;
-		plannedUpdates: number;
-		flushedCreates: number;
-		flushedUpdates: number;
-		safetyBrakeTriggered: boolean;
-		safetyBrakeReason: string | null;
-	} | null = null;
 
 	/** Persistent trace journal/state writer (active when debug is enabled). */
 	private traceLogger: PersistentTraceLogger | null = null;
@@ -213,6 +172,34 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private blobDownloadGateLayoutReady = false;
 	/** YAOS startup/reconciliation has completed enough to trust local attachment presence checks. */
 	private blobDownloadGateStartupReady = false;
+
+	private createReconciliationController(): ReconciliationController {
+		this.reconciliationController = new ReconciliationController({
+			app: this.app,
+			getSettings: () => this.settings,
+			getRuntimeConfig: () => this.runtimeConfig,
+			getVaultSync: () => this.vaultSync,
+			getDiskMirror: () => this.diskMirror,
+			getBlobSync: () => this.blobSync,
+			getDiskIndex: () => this.diskIndex,
+			setDiskIndex: (index) => {
+				this.diskIndex = index;
+			},
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
+			validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
+			bindAllOpenEditors: () => this.bindAllOpenEditors(),
+			getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
+			setAwaitingFirstProviderSyncAfterStartup: (value) => {
+				this.awaitingFirstProviderSyncAfterStartup = value;
+			},
+			saveDiskIndex: () => this.saveDiskIndex(),
+			refreshStatusBar: () => this.refreshStatusBar(),
+			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+			log: (message) => this.log(message),
+		});
+		return this.reconciliationController;
+	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
 		return isMarkdownSyncable(path, this.excludePatterns, this.runtimeConfig.vaultConfigDir);
@@ -246,6 +233,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
+		this.createReconciliationController();
 		this.snapshotService = new SnapshotService({
 			app: this.app,
 			getSettings: () => this.settings,
@@ -269,13 +257,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getRecentServerTrace: () => this.recentServerTrace,
 			getFrontmatterQuarantineEntries: () => this.frontmatterQuarantineEntries,
 			getState: () => ({
-				reconciled: this.reconciled,
-				reconcileInFlight: this.reconcileInFlight,
-				reconcilePending: this.reconcilePending,
-				lastReconcileStats: this.lastReconcileStats,
+				reconciled: this.reconciliationController.getState().reconciled,
+				reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
+				reconcilePending: this.reconciliationController.getState().reconcilePending,
+				lastReconcileStats: this.reconciliationController.getState().lastReconcileStats,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-				lastReconciledGeneration: this.lastReconciledGeneration,
-				untrackedFileCount: this.untrackedFiles.length,
+				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
+				untrackedFileCount: this.reconciliationController.getState().untrackedFileCount,
 				openFileCount: this.openFilePaths.size,
 			}),
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
@@ -438,18 +426,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
 				getVaultSync: () => this.vaultSync,
-				isReconciled: () => this.reconciled,
+				isReconciled: () => this.reconciliationController.isReconciled,
 				getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
 				setAwaitingFirstProviderSyncAfterStartup: (value) => {
 					this.awaitingFirstProviderSyncAfterStartup = value;
 				},
-				getLastReconciledGeneration: () => this.lastReconciledGeneration,
+				getLastReconciledGeneration: () => this.reconciliationController.lastGeneration,
 				setReconnectPending: () => {
-					this.reconcilePending = true;
+					this.reconciliationController.markPending();
 				},
-				isReconcileInFlight: () => this.reconcileInFlight,
+				isReconcileInFlight: () => this.reconciliationController.isReconcileInFlight,
 				runReconnectReconciliation: (generation) => {
-					void this.runReconnectReconciliation(generation);
+					void this.reconciliationController.runReconnectReconciliation(generation);
 				},
 				refreshServerCapabilities: (reason) => {
 					void this.refreshServerCapabilities(reason);
@@ -467,7 +455,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.connectionController.start();
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
-				if (this.reconciled && this.editorBindings) {
+				if (this.reconciliationController.isReconciled && this.editorBindings) {
 					const touched = this.editorBindings.auditBindings("status-tick");
 					if (touched > 0) {
 						this.log(`Binding health audit (status-tick) — touched ${touched}`);
@@ -495,7 +483,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (this.statusInterval) clearInterval(this.statusInterval);
 			});
 
-			// 6. Vault events (gated by this.reconciled)
+			// 6. Vault events (gated by reconciliation state)
 			this.registerVaultEvents();
 
 			// 7. Commands
@@ -505,7 +493,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getConnectionController: () => this.connectionController,
 					getDiagnosticsService: () => this.diagnosticsService,
 					getSnapshotService: () => this.snapshotService,
-					getUntrackedFileCount: () => this.untrackedFiles.length,
+					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					isDebugEnabled: () => this.settings.debug,
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					bindAllOpenEditors: () => this.bindAllOpenEditors(),
@@ -601,7 +589,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log(`Reconciliation mode: ${mode}`);
 
 			await this.runReconciliation(mode);
-			this.lastReconciledGeneration = this.vaultSync.connectionGeneration;
+			this.reconciliationController.lastGeneration = this.vaultSync.connectionGeneration;
 			if (providerSynced) {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 			}
@@ -630,317 +618,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
-	/**
-	 * Lightweight authoritative reconcile after a reconnection.
-	 * Fresh disk read to catch any drift during disconnect.
-	 */
-	private async runReconnectReconciliation(generation: number): Promise<void> {
-		if (!this.vaultSync) return;
-
-		this.log(`Running reconnect reconciliation (gen ${generation})`);
-		await this.refreshServerCapabilities("provider-sync");
-		this.validateAllOpenBindings(`reconnect-pre:${generation}`);
-
-		// Also import any untracked files from a previous conservative run
-		if (this.untrackedFiles.length > 0) {
-			await this.importUntrackedFiles();
-		}
-
-		await this.runReconciliation("authoritative");
-		this.lastReconciledGeneration = generation;
-		this.awaitingFirstProviderSyncAfterStartup = false;
-		this.bindAllOpenEditors();
-		this.validateAllOpenBindings(`reconnect-post:${generation}`);
-
-		// If another reconnect arrived during this reconcile, run again
-		if (this.reconcilePending) {
-			this.reconcilePending = false;
-			if (this.vaultSync.connectionGeneration > this.lastReconciledGeneration) {
-				void this.runReconnectReconciliation(this.vaultSync.connectionGeneration);
-			}
-		}
-	}
-
-	// -------------------------------------------------------------------
-	// Reconciliation
-	// -------------------------------------------------------------------
-
 	private async runReconciliation(mode: ReconcileMode): Promise<void> {
-		if (!this.vaultSync || !this.diskMirror) return;
-		if (this.reconcileInFlight) {
-			this.reconcilePending = true;
-			this.log("Reconciliation already in flight — queued");
-			return;
-		}
-
-		// Cooldown: prevent rapid successive reconciliations (flaky Wi-Fi)
-		const now = Date.now();
-		const elapsed = now - this.lastReconcileTime;
-		if (this.lastReconcileTime > 0 && elapsed < RECONCILE_COOLDOWN_MS) {
-			const delay = RECONCILE_COOLDOWN_MS - elapsed;
-			this.log(`Reconcile cooldown: ${delay}ms remaining, scheduling delayed run`);
-			this.reconcilePending = true;
-			if (!this.reconcileCooldownTimer) {
-				this.reconcileCooldownTimer = setTimeout(() => {
-					this.reconcileCooldownTimer = null;
-					if (this.reconcilePending) {
-						this.reconcilePending = false;
-						const m = this.vaultSync?.getSafeReconcileMode() ?? mode;
-						void this.runReconciliation(m);
-					}
-				}, delay);
-			}
-			return;
-		}
-
-		this.reconcileInFlight = true;
-
-		try {
-			const diskFiles = new Map<string, string>();
-			const diskPresentPaths = new Set<string>();
-			const allMdFiles = this.app.vault.getMarkdownFiles();
-			let excludedCount = 0;
-			let oversizedCount = 0;
-			let skippedByIndex = 0;
-
-			// Filter by exclude patterns first
-			const eligibleFiles: TFile[] = [];
-			for (const file of allMdFiles) {
-				if (!this.isMarkdownPathSyncable(file.path)) {
-					excludedCount++;
-					continue;
-				}
-				eligibleFiles.push(file);
-				diskPresentPaths.add(file.path);
-			}
-
-			// In conservative mode, use disk index optimization.
-			// In authoritative mode, read all files for correctness so we can
-			// detect and heal any disk<->CRDT drift after reconnect/startup.
-			let changed: TFile[] = [];
-			let unchanged: TFile[] = [];
-			let allStats: Map<string, { mtime: number; size: number }> = new Map();
-			if (mode === "authoritative") {
-				changed = eligibleFiles;
-				allStats = await collectFileStats(this.app, eligibleFiles);
-				skippedByIndex = 0;
-			} else {
-				const indexResult = await filterChangedFiles(
-					this.app,
-					eligibleFiles,
-					this.diskIndex,
-				);
-				changed = indexResult.changed;
-				unchanged = indexResult.unchanged;
-				allStats = indexResult.allStats;
-				skippedByIndex = unchanged.length;
-			}
-
-			// For unchanged files, we still need them in the diskFiles map
-			// so reconcileVault knows they exist on disk (for the "disk-only
-			// vs CRDT-only" comparison). But we use a sentinel instead of
-			// actual content to avoid reading them.
-			// We mark them with a special marker and handle them in reconcileVault
-			// by checking CRDT existence only (no content comparison needed).
-			for (const file of unchanged) {
-				// File exists on disk and hasn't changed — just mark presence
-				// Use empty string as placeholder; reconcileVault only needs
-				// to know the path exists for the "disk-only" check.
-				// Content comparison isn't needed because nothing changed.
-				const existingText = this.vaultSync.getTextForPath(file.path);
-				if (existingText) {
-					// Both exist and disk unchanged → skip read entirely
-					continue;
-				}
-				// Disk-only (not in CRDT) but unchanged → need to read for seeding
-				try {
-					const content = await this.app.vault.read(file);
-					if (this.maxFileSize > 0 && content.length > this.maxFileSize) {
-						oversizedCount++;
-						continue;
-					}
-					diskFiles.set(file.path, content);
-				} catch (err) {
-					console.error(
-						`[yaos] Failed to read "${file.path}":`,
-						err,
-					);
-				}
-			}
-
-			// Read changed files
-			for (const file of changed) {
-				try {
-					const content = await this.app.vault.read(file);
-					if (this.maxFileSize > 0 && content.length > this.maxFileSize) {
-						oversizedCount++;
-						this.log(`reconcile: skipping "${file.path}" (${Math.round(content.length / 1024)} KB exceeds limit)`);
-						continue;
-					}
-					diskFiles.set(file.path, content);
-				} catch (err) {
-					console.error(
-						`[yaos] Failed to read "${file.path}" during reconciliation:`,
-						err,
-					);
-				}
-			}
-
-			if (excludedCount > 0) {
-				this.log(`reconcile: excluded ${excludedCount} files by pattern`);
-			}
-			if (oversizedCount > 0) {
-				this.log(`reconcile: skipped ${oversizedCount} oversized files`);
-				new Notice(`YAOS: skipped ${oversizedCount} files exceeding ${this.settings.maxFileSizeKB} KB size limit.`);
-			}
-			if (skippedByIndex > 0) {
-				this.log(`reconcile: ${skippedByIndex} files unchanged (stat match), ${changed.length} changed`);
-			}
-
-				this.log(
-					`Reconciling [${mode}]: diskPresent=${diskPresentPaths.size}, ` +
-					`diskLoaded=${diskFiles.size} (${changed.length} read) vs ` +
-					`${this.vaultSync.getActiveMarkdownPaths().length} CRDT paths`,
-				);
-
-			const result = this.vaultSync.reconcileVault(
-				diskFiles,
-				diskPresentPaths,
-				mode,
-				this.settings.deviceName,
-			);
-
-				// Safety brake: evaluate only destructive disk operations.
-				// Creating missing files from CRDT is additive and should not be blocked.
-				let flushedCreates = 0;
-				let flushedUpdates = 0;
-				let safetyBrakeTriggered = false;
-				let safetyBrakeReason: string | null = null;
-
-				const localFileCount = diskPresentPaths.size;
-				const destructiveCount = result.updatedOnDisk.length;
-				const destructiveRatio = localFileCount > 0
-					? destructiveCount / localFileCount
-					: 0;
-				if (destructiveCount > 20 && destructiveRatio > 0.25) {
-					safetyBrakeTriggered = true;
-					safetyBrakeReason =
-						`refusing to overwrite ${destructiveCount} local files ` +
-						`(${Math.round(destructiveRatio * 100)}% of disk files)`;
-					this.log(`Reconcile safety brake: ${safetyBrakeReason}.`);
-					console.error(`[yaos] Reconcile safety brake: ${safetyBrakeReason}.`);
-					new Notice(
-						`YAOS: Reconcile safety brake — ${safetyBrakeReason}. ` +
-						`Additive creates will continue. Export diagnostics and inspect logs.`,
-					);
-				}
-
-				for (const path of result.createdOnDisk) {
-					await this.diskMirror.flushWrite(path);
-					flushedCreates++;
-				}
-				if (!safetyBrakeTriggered) {
-					for (const path of result.updatedOnDisk) {
-						await this.diskMirror.flushWrite(path);
-						flushedUpdates++;
-					}
-				}
-
-				this.lastReconcileStats = {
-					at: new Date().toISOString(),
-					mode,
-					plannedCreates: result.createdOnDisk.length,
-					plannedUpdates: result.updatedOnDisk.length,
-					flushedCreates,
-					flushedUpdates,
-					safetyBrakeTriggered,
-					safetyBrakeReason,
-				};
-
-			this.untrackedFiles = result.untracked;
-			this.reconciled = true;
-
-			// Update disk index with fresh stats
-			this.diskIndex = updateIndex(this.diskIndex, allStats);
-			void this.saveDiskIndex();
-
-			// Run integrity checks after reconciliation (orphan GC + duplicate detection)
-			const integrity = this.vaultSync.runIntegrityChecks();
-			if (integrity.duplicateIds > 0 || integrity.orphansCleaned > 0) {
-				this.log(
-					`Integrity: ${integrity.duplicateIds} duplicate IDs fixed, ` +
-					`${integrity.orphansCleaned} orphans cleaned`,
-				);
-			}
-
-				this.log(
-					`Reconciliation [${mode}] complete: ` +
-					`${result.seededToCrdt.length} seeded, ` +
-					`creates planned/flushed=${result.createdOnDisk.length}/${flushedCreates}, ` +
-					`updates planned/flushed=${result.updatedOnDisk.length}/${flushedUpdates}, ` +
-					`${result.untracked.length} untracked, ` +
-					`${result.skipped} tombstoned` +
-					(safetyBrakeTriggered ? ", safety-brake=on" : ", safety-brake=off"),
-				);
-
-			// Blob reconciliation (if enabled)
-			if (this.blobSync) {
-				const blobResult = this.blobSync.reconcile(
-					mode,
-					this.excludePatterns,
-				);
-				this.log(
-					`Blob reconciliation [${mode}]: ` +
-					`${blobResult.uploadQueued} uploads, ` +
-					`${blobResult.downloadQueued} downloads, ` +
-					`${blobResult.skipped} skipped`,
-				);
-			}
-		} finally {
-			this.reconcileInFlight = false;
-			this.lastReconcileTime = Date.now();
-			this.scheduleTraceStateSnapshot(`reconcile-${mode}`);
-		}
+		await this.reconciliationController.runReconciliation(mode);
 	}
 
 	private async importUntrackedFiles(): Promise<void> {
-		if (!this.vaultSync) return;
-
-		const toImport = [...this.untrackedFiles];
-		this.untrackedFiles = [];
-		let imported = 0;
-
-		for (const path of toImport) {
-			if (this.vaultSync.getTextForPath(path)) {
-				this.log(`importUntracked: "${path}" now in CRDT, skipping`);
-				continue;
-			}
-
-			const file = this.app.vault.getAbstractFileByPath(path);
-			if (!(file instanceof TFile)) continue;
-
-			try {
-				const content = await this.app.vault.read(file);
-				this.vaultSync.ensureFile(path, content, this.settings.deviceName);
-				imported++;
-			} catch (err) {
-				console.error(
-					`[yaos] importUntracked failed for "${path}":`,
-					err,
-				);
-			}
-		}
-
-		if (!this.vaultSync.isInitialized) {
-			this.vaultSync.markInitialized();
-		}
-
-		this.refreshStatusBar();
-		this.log(`Imported ${imported} previously untracked files`);
-
-		if (imported > 0) {
-			new Notice(`YAOS: imported ${imported} files after server sync.`);
-		}
+		await this.reconciliationController.importUntrackedFiles();
 	}
 
 	// -------------------------------------------------------------------
@@ -1036,7 +719,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private maybeImportDeferredClosedOnlyPath(path: string, reason: string): void {
-		if (!this.reconciled) return;
+		if (!this.reconciliationController.isReconciled) return;
 		if (this.settings.externalEditPolicy !== "closed-only") return;
 		if (!this.isMarkdownPathSyncable(path)) return;
 		if (this.closedOnlyDeferredImports.has(path)) return;
@@ -1087,7 +770,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Layout change: clean up observers for closed files
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				this.editorBindings?.clearLocalCursor("layout-change");
 				this.reconcileTrackedOpenFiles("layout-change");
 				this.updateActiveMarkdownPath(
@@ -1104,7 +787,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("active-leaf-change", (leaf) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				const nextPath =
 					leaf?.view instanceof MarkdownView ? (leaf.view.file?.path ?? null) : null;
 				this.updateActiveMarkdownPath(nextPath, "active-leaf-change");
@@ -1122,7 +805,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				this.updateActiveMarkdownPath(
 					file?.path ?? null,
 					"file-open-active-change",
@@ -1143,7 +826,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
@@ -1159,7 +842,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// since folder renames affect both types atomically.
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
 				// Rename is relevant if either the old or new path is syncable
 				const newSyncable = this.isMarkdownPathSyncable(file.path)
@@ -1174,7 +857,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
@@ -1200,7 +883,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
-				if (!this.reconciled) return;
+				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
@@ -1260,10 +943,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			clearInterval(this.statusInterval);
 			this.statusInterval = null;
 		}
-		if (this.reconcileCooldownTimer) {
-			clearTimeout(this.reconcileCooldownTimer);
-			this.reconcileCooldownTimer = null;
-		}
+		this.reconciliationController.reset();
 		if (this.markdownDrainTimer) {
 			clearTimeout(this.markdownDrainTimer);
 			this.markdownDrainTimer = null;
@@ -1278,11 +958,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.diskMirror = null;
 		this.blobSync = null;
 		this.shownAttachmentNudge = false;
-		this.reconciled = false;
-		this.reconcileInFlight = false;
-		this.reconcilePending = false;
-		this.untrackedFiles = [];
-		this.lastReconciledGeneration = 0;
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.openFilePaths.clear();
 		this.activeMarkdownPath = null;
@@ -2301,11 +1976,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				externalEditPolicy: this.settings.externalEditPolicy,
 			},
 			state: {
-				reconciled: this.reconciled,
-				reconcileInFlight: this.reconcileInFlight,
-				reconcilePending: this.reconcilePending,
+				reconciled: this.reconciliationController.getState().reconciled,
+				reconcileInFlight: this.reconciliationController.getState().reconcileInFlight,
+				reconcilePending: this.reconciliationController.getState().reconcilePending,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
-				lastReconciledGeneration: this.lastReconciledGeneration,
+				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 				openFileCount: this.openFilePaths.size,
 			},
 			sync: this.vaultSync?.getDebugSnapshot() ?? null,
@@ -3106,7 +2781,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				providerSynced: this.vaultSync.providerSynced,
 				localReady: this.vaultSync.localReady,
 				connectionGeneration: this.vaultSync.connectionGeneration,
-				reconciled: this.reconciled,
+				reconciled: this.reconciliationController.getState().reconciled,
 				openFileCount: this.openFilePaths.size,
 				pathToIdCount: this.vaultSync.pathToId.size,
 				activePathCount: this.vaultSync.getActiveMarkdownPaths().length,
