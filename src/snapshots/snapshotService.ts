@@ -25,8 +25,7 @@ interface SnapshotServiceDeps {
 	getBlobSync(): BlobSyncManager | null;
 	getServerSupportsSnapshots(): boolean;
 	log(message: string): void;
-	bindAllOpenEditors(): void;
-	validateAllOpenBindings(reason: string): void;
+	onEditorsNeedReconcile(reason: string): void;
 }
 
 export class SnapshotService {
@@ -217,8 +216,7 @@ export class SnapshotService {
 						}
 					}
 
-					this.deps.bindAllOpenEditors();
-					this.deps.validateAllOpenBindings("snapshot-restore");
+					this.deps.onEditorsNeedReconcile("snapshot-restore");
 
 					const parts: string[] = [];
 					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);

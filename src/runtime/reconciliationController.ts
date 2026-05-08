@@ -53,8 +53,8 @@ interface ReconciliationControllerDeps {
 		reason: string,
 	): boolean;
 	refreshServerCapabilities(reason: string): Promise<void>;
-	validateAllOpenBindings(reason: string): void;
-	bindAllOpenEditors(): void;
+	validateOpenEditorBindings(reason: string): void;
+	onReconciled(reason: string): void;
 	getAwaitingFirstProviderSyncAfterStartup(): boolean;
 	setAwaitingFirstProviderSyncAfterStartup(value: boolean): void;
 	saveDiskIndex(): Promise<void>;
@@ -159,7 +159,7 @@ export class ReconciliationController {
 
 		this.deps.log(`Running reconnect reconciliation (gen ${generation})`);
 		await this.deps.refreshServerCapabilities("provider-sync");
-		this.deps.validateAllOpenBindings(`reconnect-pre:${generation}`);
+		this.deps.validateOpenEditorBindings(`reconnect-pre:${generation}`);
 
 		if (this.untrackedFiles.length > 0) {
 			await this.importUntrackedFiles();
@@ -168,8 +168,7 @@ export class ReconciliationController {
 		await this.runReconciliation("authoritative");
 		this.lastReconciledGeneration = generation;
 		this.deps.setAwaitingFirstProviderSyncAfterStartup(false);
-		this.deps.bindAllOpenEditors();
-		this.deps.validateAllOpenBindings(`reconnect-post:${generation}`);
+		this.deps.onReconciled(`reconnect-post:${generation}`);
 
 		if (this.reconcilePending) {
 			this.reconcilePending = false;
@@ -386,6 +385,7 @@ export class ReconciliationController {
 					`${blobResult.skipped} skipped`,
 				);
 			}
+			this.deps.onReconciled(`reconcile-${mode}`);
 		} finally {
 			this.reconcileInFlight = false;
 			this.lastReconcileTime = Date.now();

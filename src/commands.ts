@@ -12,8 +12,6 @@ export interface CommandsRuntimeHost {
 	getUntrackedFileCount(): number;
 	isDebugEnabled(): boolean;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
-	bindAllOpenEditors(): void;
-	validateAllOpenBindings(reason: string): void;
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
@@ -43,10 +41,7 @@ export function registerCommands(
 			const vaultSync = host.getVaultSync();
 			if (!vaultSync) return;
 			const mode = vaultSync.getSafeReconcileMode();
-			void host.runReconciliation(mode).then(() => {
-				host.bindAllOpenEditors();
-				host.validateAllOpenBindings("manual-reconcile");
-			});
+			void host.runReconciliation(mode);
 		},
 	});
 
