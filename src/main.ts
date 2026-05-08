@@ -49,15 +49,8 @@ import {
 	moveCachedHashes,
 } from "./sync/blobHashCache";
 import {
-	requestDailySnapshot,
-	requestSnapshotNow,
-	listSnapshots as fetchSnapshotList,
-	downloadSnapshot,
-	diffSnapshot,
-	restoreFromSnapshot,
-	type SnapshotIndex,
-} from "./sync/snapshotClient";
-import { SnapshotDiffModal, SnapshotListModal } from "./snapshots/snapshotModals";
+	SnapshotService,
+} from "./snapshots/snapshotService";
 import {
 	appendTraceParams,
 	PersistentTraceLogger,
@@ -186,6 +179,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private blobSync: BlobSyncManager | null = null;
+	private snapshotService: SnapshotService | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -321,6 +315,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	async onload() {
 		const onloadStartedAt = Date.now();
 		await this.loadSettings();
+		this.snapshotService = new SnapshotService({
+			app: this.app,
+			getSettings: () => this.settings,
+			getTraceHttpContext: () => this.getTraceHttpContext(),
+			getVaultSync: () => this.vaultSync,
+			getDiskMirror: () => this.diskMirror,
+			getBlobSync: () => this.blobSync,
+			getServerSupportsSnapshots: () => this.serverSupportsSnapshots,
+			log: (message) => this.log(message),
+			bindAllOpenEditors: () => this.bindAllOpenEditors(),
+			validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
+		});
 		this.registerObsidianProtocolHandler("yaos", (params) => {
 			void this.handleSetupLink(params);
 		});
@@ -626,7 +632,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
 			if (providerSynced && this.serverSupportsSnapshots) {
-				void this.triggerDailySnapshot();
+				void this.snapshotService?.triggerDailySnapshot();
 			}
 		} catch (err) {
 			console.error("[yaos] Failed to initialize sync:", err);
@@ -1621,41 +1627,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "snapshot-now",
 			name: "Take snapshot now",
 			callback: async () => {
-				if (!this.vaultSync) {
-					new Notice("Sync not initialized");
-					return;
-					}
-					if (!this.serverSupportsSnapshots) {
-						new Notice("Snapshots are unavailable until object storage is configured on the server.");
-						return;
-					}
-				if (!this.vaultSync.connected) {
-					new Notice("Not connected to server — cannot create snapshot.");
-					return;
-				}
-
-				new Notice("Creating snapshot...");
-				try {
-					const result = await requestSnapshotNow(
-						this.settings,
-						this.settings.deviceName,
-						this.getTraceHttpContext(),
-					);
-					if (result.status === "created" && result.index) {
-						new Notice(
-							`Snapshot created: ${result.index.markdownFileCount} notes, ` +
-							`${result.index.blobFileCount} attachments ` +
-							`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)`,
-						);
-					} else if (result.status === "unavailable") {
-						new Notice(`Snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
-					} else {
-						new Notice("Snapshot created.");
-					}
-				} catch (err) {
-					console.error("[yaos] Snapshot failed:", err);
-					new Notice(`Snapshot failed: ${formatUnknown(err)}`);
-				}
+				await this.snapshotService?.takeSnapshotNow();
 			},
 		});
 
@@ -1663,19 +1635,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			id: "snapshot-list",
 			name: "Browse and restore snapshots",
 			callback: async () => {
-				if (!this.vaultSync) {
-					new Notice("Sync not initialized");
-					return;
-					}
-					if (!this.serverSupportsSnapshots) {
-						new Notice("Snapshots are unavailable until object storage is configured on the server.");
-						return;
-					}
-				if (!this.vaultSync.connected) {
-					new Notice("Not connected to server — cannot browse snapshots.");
-					return;
-				}
-				await this.showSnapshotList();
+				await this.snapshotService?.showSnapshotList();
 			},
 		});
 
@@ -3199,7 +3159,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				7000,
 			);
 			if (this.vaultSync?.connected && this.vaultSync.providerSynced && this.serverSupportsSnapshots) {
-				void this.triggerDailySnapshot();
+				void this.snapshotService?.triggerDailySnapshot();
 			}
 			} else if (lostR2) {
 				new Notice(
@@ -4231,176 +4191,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		new Notice(`YAOS VFS torture run completed. Report: ${outPath}`, 10000);
 		this.log(`VFS torture: completed successfully. Report=${outPath}`);
-	}
-
-	// -------------------------------------------------------------------
-	// Snapshot helpers
-	// -------------------------------------------------------------------
-
-	/**
-	 * Request the daily snapshot from the server.
-	 * Called after provider syncs during startup.
-	 * Silent noop if R2 isn't configured or snapshot already taken today.
-	 */
-	private async triggerDailySnapshot(): Promise<void> {
-		if (!this.serverSupportsSnapshots) {
-			return;
-		}
-
-		try {
-			const result = await requestDailySnapshot(
-				this.settings,
-				this.settings.deviceName,
-				this.getTraceHttpContext(),
-			);
-			if (result.status === "created") {
-				this.log(`Daily snapshot created: ${result.snapshotId}`);
-			} else if (result.status === "noop") {
-				this.log(`Daily snapshot: already taken today`);
-			} else {
-				this.log(`Daily snapshot: ${result.reason ?? "unavailable"}`);
-			}
-		} catch (err) {
-			// Don't spam the user — snapshot failure is non-critical
-			console.warn("[yaos] Daily snapshot failed:", err);
-		}
-	}
-
-	/**
-	 * Show a list of available snapshots and let the user pick one to diff/restore.
-	 */
-	private async showSnapshotList(): Promise<void> {
-			if (!this.serverSupportsSnapshots) {
-				new Notice("Snapshots are unavailable until object storage is configured on the server.");
-				return;
-			}
-
-		new Notice("Loading snapshots...");
-
-		try {
-			const snapshots = await fetchSnapshotList(
-				this.settings,
-				this.getTraceHttpContext(),
-			);
-
-			if (snapshots.length === 0) {
-				new Notice("No snapshots found. Take a snapshot first.");
-				return;
-			}
-
-			new SnapshotListModal(this.app, snapshots, async (selected) => {
-				await this.showSnapshotDiff(selected);
-			}).open();
-		} catch (err) {
-			console.error("[yaos] Failed to list snapshots:", err);
-			new Notice(`Failed to list snapshots: ${formatUnknown(err)}`);
-		}
-	}
-
-	/**
-	 * Download a snapshot, compute diff against current CRDT, and show the restore UI.
-	 */
-	private async showSnapshotDiff(snapshot: SnapshotIndex): Promise<void> {
-		if (!this.vaultSync) return;
-
-		new Notice("Downloading snapshot...");
-
-		try {
-			const snapshotDoc = await downloadSnapshot(
-				this.settings,
-				snapshot,
-				this.getTraceHttpContext(),
-			);
-			const diff = diffSnapshot(snapshotDoc, this.vaultSync.ydoc);
-
-			let destroyed = false;
-			const cleanup = () => {
-				if (!destroyed) {
-					destroyed = true;
-					snapshotDoc.destroy();
-				}
-			};
-
-			new SnapshotDiffModal(
-				this.app,
-				snapshot,
-				diff,
-				async (markdownPaths, blobPaths) => {
-					if (!this.vaultSync) return;
-
-					// --- Pre-restore backup ---
-					// Save current content of files we're about to overwrite
-					// so the user can recover if the restore goes wrong.
-					const backupDir = normalizePath(
-						`${this.app.vault.configDir}/plugins/yaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
-					);
-					let backedUp = 0;
-					for (const path of markdownPaths) {
-						try {
-							const file = this.app.vault.getAbstractFileByPath(path);
-							if (file instanceof TFile) {
-								const content = await this.app.vault.read(file);
-								const backupPath = `${backupDir}/${path}`;
-								// Ensure parent directories exist
-								const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
-								if (parentDir && !this.app.vault.getAbstractFileByPath(parentDir)) {
-									await this.app.vault.createFolder(parentDir);
-								}
-								await this.app.vault.create(backupPath, content);
-								backedUp++;
-							}
-						} catch (err) {
-							// Non-fatal: file might not exist on disk (undelete case)
-							this.log(`Backup skipped for "${path}": ${formatUnknown(err)}`);
-						}
-					}
-					if (backedUp > 0) {
-						this.log(`Pre-restore backup: ${backedUp} files saved to ${backupDir}`);
-					}
-
-					const result = restoreFromSnapshot(snapshotDoc, this.vaultSync.ydoc, {
-						markdownPaths,
-						blobPaths,
-						device: this.settings.deviceName,
-					});
-
-					// Flush restored files to disk
-					for (const path of markdownPaths) {
-						await this.diskMirror?.flushWrite(path, true);
-					}
-
-					// Kick blob downloads for restored blob references
-					if (blobPaths.length > 0 && this.blobSync) {
-						const queued = this.blobSync.prioritizeDownloads(blobPaths);
-						if (queued > 0) {
-							this.log(`Restore: queued ${queued} blob downloads`);
-						}
-					}
-
-					// Re-bind editors for restored files
-					this.bindAllOpenEditors();
-					this.validateAllOpenBindings("snapshot-restore");
-
-					const parts: string[] = [];
-					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
-					if (result.markdownUndeleted > 0) parts.push(`${result.markdownUndeleted} files undeleted`);
-					if (result.blobsRestored > 0) parts.push(`${result.blobsRestored} attachments restored`);
-					if (backedUp > 0) parts.push(`backup in ${backupDir}`);
-
-					const msg = parts.length > 0
-						? `Restore complete: ${parts.join(", ")}.`
-						: "No changes were applied.";
-					new Notice(msg, 8000);
-					this.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
-
-					cleanup();
-				},
-				cleanup,
-			).open();
-		} catch (err) {
-			console.error("[yaos] Snapshot diff failed:", err);
-			new Notice(`Failed to load snapshot: ${formatUnknown(err)}`);
-		}
 	}
 
 	private log(msg: string): void {
