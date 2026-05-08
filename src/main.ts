@@ -11,7 +11,6 @@ import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
 import { BlobSyncManager, type BlobQueueSnapshot } from "./sync/blobSync";
-import { parseExcludePatterns } from "./sync/exclude";
 import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
@@ -64,6 +63,10 @@ import {
 	ConnectionController,
 	type ConnectionState,
 } from "./runtime/connectionController";
+import {
+	buildRuntimeConfig,
+	type RuntimeConfig,
+} from "./runtime/runtimeConfig";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -94,6 +97,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		loadData: () => this.loadData(),
 		saveData: (data) => this.saveData(data),
 	});
+	private runtimeConfig: RuntimeConfig = buildRuntimeConfig(
+		DEFAULT_SETTINGS,
+		".obsidian",
+	);
 
 	private vaultSync: VaultSync | null = null;
 	private connectionController: ConnectionController | null = null;
@@ -208,11 +215,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private blobDownloadGateStartupReady = false;
 
 	private isMarkdownPathSyncable(path: string): boolean {
-		return isMarkdownSyncable(path, this.excludePatterns, this.app.vault.configDir);
+		return isMarkdownSyncable(path, this.excludePatterns, this.runtimeConfig.vaultConfigDir);
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
-		return isBlobSyncable(path, this.excludePatterns, this.app.vault.configDir);
+		return isBlobSyncable(path, this.excludePatterns, this.runtimeConfig.vaultConfigDir);
 	}
 
 	async onload() {
@@ -235,8 +242,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			setStatusError: () => this.updateStatusBar("error"),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
+			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
 		await this.loadSettings();
+		this.applyRuntimeSettings("load-settings");
 		this.snapshotService = new SnapshotService({
 			app: this.app,
 			getSettings: () => this.settings,
@@ -280,14 +289,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		let generatedVaultId = false;
 		if (!this.settings.vaultId) {
-			this.settings.vaultId = generateVaultId();
-			await this.saveSettings();
+			await this.updateSettings((settings) => {
+				settings.vaultId = generateVaultId();
+			}, "startup-generate-vault-id");
 			generatedVaultId = true;
 		}
 
 		if (!this.settings.deviceName) {
-			this.settings.deviceName = `device-${Date.now().toString(36)}`;
-			await this.saveSettings();
+			await this.updateSettings((settings) => {
+				settings.deviceName = `device-${Date.now().toString(36)}`;
+			}, "startup-generate-device-name");
 		}
 
 		this.setupTraceLogger();
@@ -347,10 +358,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		// Parse exclude patterns and file size limit from settings
-		this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
-		this.maxFileSize = this.settings.maxFileSizeKB * 1024;
-
-		this.applyCursorVisibility();
+		this.applyRuntimeSettings("onload-pre-sync");
 
 		// Warn about insecure connections to non-localhost hosts
 		if (this.settings.host) {
@@ -381,9 +389,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		try {
 			this.idbDegradedHandled = false;
-			this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
-			this.maxFileSize = this.settings.maxFileSizeKB * 1024;
-			this.applyCursorVisibility();
+			this.applyRuntimeSettings("init-sync");
 			if (this.enforceCompatibilityGuard("init-sync-preflight")) {
 				return;
 			}
@@ -2449,9 +2455,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
-	async saveSettings() {
+	async saveSettings(reason = "settings-save") {
 		await this.persistPluginState();
-		void this.syncUpdateMetadataToServer("settings-save");
+		this.applyRuntimeSettings(reason);
+		this.refreshStatusBar();
+		void this.syncUpdateMetadataToServer(reason);
+	}
+
+	async updateSettings(
+		mutator: (settings: VaultSyncSettings) => void,
+		reason = "settings-update",
+	): Promise<void> {
+		mutator(this.settings);
+		await this.saveSettings(reason);
+	}
+
+	private applyRuntimeSettings(reason: string): void {
+		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.excludePatterns = this.runtimeConfig.excludePatterns;
+		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
+		this.applyCursorVisibility();
+		this.trace("trace", "runtime-settings-applied", {
+			reason,
+			hostConfigured: !!this.runtimeConfig.host,
+			vaultIdConfigured: !!this.runtimeConfig.vaultId,
+			enableAttachmentSync: this.runtimeConfig.enableAttachmentSync,
+			externalEditPolicy: this.runtimeConfig.externalEditPolicy,
+			maxFileSizeKB: this.runtimeConfig.maxFileSizeKB,
+			excludePatternCount: this.runtimeConfig.excludePatterns.length,
+		});
 	}
 
 	get serverAuthMode(): ServerCapabilities["authMode"] | "unknown" {
@@ -2512,17 +2544,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private createBlobSyncManager(): BlobSyncManager | null {
 		if (!this.vaultSync) return null;
-		if (!this.settings.host || !this.settings.token) return null;
+		if (!this.runtimeConfig.host || !this.runtimeConfig.token) return null;
 		return new BlobSyncManager(
 			this.app,
 			this.vaultSync,
 			{
-				host: this.settings.host,
-				token: this.settings.token,
-				vaultId: this.settings.vaultId,
-				maxAttachmentSizeKB: this.settings.maxAttachmentSizeKB,
-				attachmentConcurrency: this.settings.attachmentConcurrency,
-				debug: this.settings.debug,
+				host: this.runtimeConfig.host,
+				token: this.runtimeConfig.token,
+				vaultId: this.runtimeConfig.vaultId,
+				maxAttachmentSizeKB: this.runtimeConfig.maxAttachmentSizeKB,
+				attachmentConcurrency: this.runtimeConfig.attachmentConcurrency,
+				debug: this.runtimeConfig.debug,
 				trace: this.getTraceHttpContext(),
 			},
 			this.blobHashCache,
@@ -2532,7 +2564,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private startBlobSyncEngine(reason: string, runInitialReconcile: boolean): void {
 		if (this.blobSync) return;
-		if (!this.settings.enableAttachmentSync || !this.serverSupportsAttachments) return;
+		if (!this.runtimeConfig.enableAttachmentSync || !this.serverSupportsAttachments) return;
 
 		const blobSync = this.createBlobSyncManager();
 		if (!blobSync) return;
@@ -2595,7 +2627,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async refreshAttachmentSyncRuntime(reason = "settings-change"): Promise<void> {
 		if (!this.vaultSync) return;
-		if (this.settings.enableAttachmentSync && this.serverSupportsAttachments) {
+		if (this.runtimeConfig.enableAttachmentSync && this.serverSupportsAttachments) {
 			this.startBlobSyncEngine(reason, true);
 		} else {
 			await this.stopBlobSyncEngine(reason);
@@ -2701,16 +2733,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 		}
 
-		this.settings.host = host.replace(/\/$/, "");
-		this.settings.token = token;
-		if (incomingVaultId) {
-			this.settings.vaultId = incomingVaultId;
-		}
+		await this.updateSettings((settings) => {
+			settings.host = host.replace(/\/$/, "");
+			settings.token = token;
+			if (incomingVaultId) {
+				settings.vaultId = incomingVaultId;
+			}
+		}, "setup-link");
 		await this.refreshServerCapabilities();
-			await this.saveSettings();
-			this.excludePatterns = parseExcludePatterns(this.settings.excludePatterns);
-			this.maxFileSize = this.settings.maxFileSizeKB * 1024;
-			this.applyCursorVisibility();
 			new Notice("Server linked. Starting sync...", 6000);
 
 		if (!this.vaultSync) {

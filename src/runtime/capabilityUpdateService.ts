@@ -136,6 +136,7 @@ interface CapabilityUpdateServiceDeps {
 	stopSyncRuntimeForCompatibility(): void;
 	setStatusError(): void;
 	scheduleTraceStateSnapshot(reason: string): void;
+	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason: string): Promise<void>;
 }
 
 export class CapabilityUpdateService {
@@ -557,22 +558,36 @@ export class CapabilityUpdateService {
 
 		const settings = this.deps.getSettings();
 		let changed = false;
-		if (!settings.updateRepoUrl.trim()) {
-			settings.updateRepoUrl = capabilities.updateRepoUrl;
+		const nextRepoUrl = !settings.updateRepoUrl.trim()
+			? capabilities.updateRepoUrl
+			: null;
+		if (nextRepoUrl) {
 			changed = true;
 		}
 		const localBranch = settings.updateRepoBranch.trim();
+		const nextBranch = (!localBranch || localBranch === "main")
+			&& capabilities.updateRepoBranch
+			&& capabilities.updateRepoBranch.trim()
+			&& capabilities.updateRepoBranch !== localBranch
+			? capabilities.updateRepoBranch
+			: null;
 		if ((!localBranch || localBranch === "main")
 			&& capabilities.updateRepoBranch
 			&& capabilities.updateRepoBranch.trim()
 			&& capabilities.updateRepoBranch !== localBranch) {
-			settings.updateRepoBranch = capabilities.updateRepoBranch;
 			changed = true;
 		}
 		if (!changed) return;
 
 		this.deps.log(`Hydrated update metadata from server (${reason})`);
-		await this.deps.persistPluginState();
+		await this.deps.updateSettings((nextSettings) => {
+			if (nextRepoUrl) {
+				nextSettings.updateRepoUrl = nextRepoUrl;
+			}
+			if (nextBranch) {
+				nextSettings.updateRepoBranch = nextBranch;
+			}
+		}, reason);
 	}
 
 	private async refreshUpdateManifestInner(reason: string, force: boolean): Promise<void> {

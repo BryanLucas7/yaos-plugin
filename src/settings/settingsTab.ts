@@ -25,11 +25,10 @@ export interface VaultSyncSettingsHost {
 	settings: VaultSyncSettings;
 	serverAuthMode: SettingsAuthMode;
 	serverSupportsAttachments: boolean;
-	saveSettings(): Promise<void>;
+	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason?: string): Promise<void>;
 	refreshServerCapabilities(reason?: string): Promise<void>;
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
-	applyCursorVisibility(): void;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
 	buildSetupDeepLink(): string | null;
@@ -266,8 +265,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder("My laptop")
 					.setValue(this.host.settings.deviceName)
 					.onChange(async (value) => {
-						this.host.settings.deviceName = value.trim();
-						await this.host.saveSettings();
+						await this.host.updateSettings((settings) => {
+							settings.deviceName = value.trim();
+						}, "settings:device-name");
 					}),
 			);
 
@@ -280,8 +280,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setPlaceholder("Example: templates/, daily-notes/")
 						.setValue(this.host.settings.excludePatterns)
 						.onChange(async (value) => {
-							this.host.settings.excludePatterns = value;
-						await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.excludePatterns = value;
+							}, "settings:exclude-patterns");
 					}),
 			);
 
@@ -295,8 +296,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						const n = parseInt(value, 10);
 						if (!isNaN(n) && n > 0) {
-							this.host.settings.maxFileSizeKB = n;
-							await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.maxFileSizeKB = n;
+							}, "settings:max-file-size");
 						}
 					}),
 			);
@@ -348,9 +350,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					toggle
 						.setValue(this.host.settings.enableAttachmentSync)
 						.onChange(async (value) => {
-							this.host.settings.enableAttachmentSync = value;
-							this.host.settings.attachmentSyncExplicitlyConfigured = true;
-							await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.enableAttachmentSync = value;
+								settings.attachmentSyncExplicitlyConfigured = true;
+							}, "settings:attachment-toggle");
 							await this.host.refreshAttachmentSyncRuntime("attachment-toggle");
 							this.display();
 						}),
@@ -368,8 +371,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.onChange(async (value) => {
 							const n = parseInt(value, 10);
 							if (!isNaN(n) && n > 0) {
-								this.host.settings.maxAttachmentSizeKB = n;
-								await this.host.saveSettings();
+								await this.host.updateSettings((settings) => {
+									settings.maxAttachmentSizeKB = n;
+								}, "settings:max-attachment-size");
 							}
 						}),
 				);
@@ -383,8 +387,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setValue(this.host.settings.attachmentConcurrency)
 						.setDynamicTooltip()
 						.onChange(async (value) => {
-							this.host.settings.attachmentConcurrency = value;
-							await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.attachmentConcurrency = value;
+							}, "settings:attachment-concurrency");
 						}),
 				);
 		}
@@ -397,9 +402,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				toggle
 					.setValue(this.host.settings.showRemoteCursors)
 					.onChange(async (value) => {
-						this.host.settings.showRemoteCursors = value;
-						await this.host.saveSettings();
-						this.host.applyCursorVisibility();
+						await this.host.updateSettings((settings) => {
+							settings.showRemoteCursors = value;
+						}, "settings:remote-cursors");
 					}),
 			);
 
@@ -420,8 +425,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							.setPlaceholder("Paste the server URL")
 							.setValue(this.host.settings.host)
 						.onChange(async (value) => {
-							this.host.settings.host = value.trim();
-						await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.host = value.trim();
+							}, "settings:host");
 						this.display();
 					}),
 			);
@@ -447,8 +453,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setPlaceholder("Paste your sync token")
 						.setValue(this.host.settings.token)
 						.onChange(async (value) => {
-							this.host.settings.token = value.trim();
-						await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.token = value.trim();
+							}, "settings:token");
 						this.display();
 					}),
 			);
@@ -464,8 +471,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setPlaceholder("Generated automatically")
 						.setValue(this.host.settings.vaultId)
 						.onChange(async (value) => {
-							this.host.settings.vaultId = value.trim();
-						await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.vaultId = value.trim();
+							}, "settings:vault-id");
 						this.display();
 					}),
 			);
@@ -478,8 +486,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setPlaceholder("Paste the generated GitHub or GitLab repo URL")
 						.setValue(this.host.settings.updateRepoUrl)
 						.onChange(async (value) => {
-							this.host.settings.updateRepoUrl = value.trim();
-							await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.updateRepoUrl = value.trim();
+							}, "settings:update-repo-url");
 							this.display();
 						}),
 				);
@@ -492,8 +501,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							.setPlaceholder("Default branch (for example, main)")
 							.setValue(this.host.settings.updateRepoBranch)
 						.onChange(async (value) => {
-							this.host.settings.updateRepoBranch = value.trim() || "main";
-							await this.host.saveSettings();
+							await this.host.updateSettings((settings) => {
+								settings.updateRepoBranch = value.trim() || "main";
+							}, "settings:update-repo-branch");
 						}),
 				);
 
@@ -507,8 +517,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.addOption("never", "Never import")
 					.setValue(this.host.settings.externalEditPolicy)
 					.onChange(async (value) => {
-						this.host.settings.externalEditPolicy = value as ExternalEditPolicy;
-						await this.host.saveSettings();
+						await this.host.updateSettings((settings) => {
+							settings.externalEditPolicy = value as ExternalEditPolicy;
+						}, "settings:external-edit-policy");
 					}),
 			);
 
@@ -519,8 +530,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				toggle
 					.setValue(this.host.settings.frontmatterGuardEnabled)
 					.onChange(async (value) => {
-						this.host.settings.frontmatterGuardEnabled = value;
-						await this.host.saveSettings();
+						await this.host.updateSettings((settings) => {
+							settings.frontmatterGuardEnabled = value;
+						}, "settings:frontmatter-guard");
 					}),
 			);
 
@@ -531,8 +543,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				toggle
 					.setValue(this.host.settings.debug)
 					.onChange(async (value) => {
-						this.host.settings.debug = value;
-						await this.host.saveSettings();
+						await this.host.updateSettings((settings) => {
+							settings.debug = value;
+						}, "settings:debug");
 					}),
 			);
 
