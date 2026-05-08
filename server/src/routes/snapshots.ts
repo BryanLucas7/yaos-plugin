@@ -38,7 +38,7 @@ export async function handleSnapshotRoute(
 			env,
 			vaultId,
 			body.device,
-			options.fetchVaultDocument,
+			(targetEnv, targetVaultId) => options.fetchVaultDocument(targetEnv, targetVaultId),
 		);
 		if (result.status === "unavailable") {
 			return json(result);
@@ -66,7 +66,7 @@ export async function handleSnapshotRoute(
 			},
 			body: JSON.stringify(body),
 		});
-		const result = await res.json() as SnapshotResult;
+		const result = await res.json();
 		await options.recordVaultTrace(env, vaultId, "snapshot-created", {
 			status: result.status,
 			snapshotId: result.snapshotId,
