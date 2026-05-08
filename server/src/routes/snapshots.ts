@@ -66,7 +66,7 @@ export async function handleSnapshotRoute(
 			},
 			body: JSON.stringify(body),
 		});
-		const result = await res.json();
+		const result: SnapshotResult = await res.json();
 		await options.recordVaultTrace(env, vaultId, "snapshot-created", {
 			status: result.status,
 			snapshotId: result.snapshotId,
