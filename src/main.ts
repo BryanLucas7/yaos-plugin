@@ -63,6 +63,7 @@ import {
 	ConnectionController,
 	type ConnectionState,
 } from "./runtime/connectionController";
+import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
 	renderSyncStatus,
@@ -488,7 +489,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 7. Commands
 			if (!this.commandsRegistered) {
-				this.registerCommands();
+				registerCommands(this, {
+					getVaultSync: () => this.vaultSync,
+					getConnectionController: () => this.connectionController,
+					getDiagnosticsService: () => this.diagnosticsService,
+					getSnapshotService: () => this.snapshotService,
+					getUntrackedFileCount: () => this.untrackedFiles.length,
+					isDebugEnabled: () => this.settings.debug,
+					runReconciliation: (mode) => this.runReconciliation(mode),
+					bindAllOpenEditors: () => this.bindAllOpenEditors(),
+					validateAllOpenBindings: (reason) => this.validateAllOpenBindings(reason),
+					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
+					runVfsTortureTest: () => this.runVfsTortureTest(),
+					importUntrackedFiles: () => this.importUntrackedFiles(),
+					resetLocalCache: () => this.resetLocalCache(),
+					nuclearReset: () => this.nuclearReset(),
+				});
 				this.commandsRegistered = true;
 			}
 
@@ -1265,223 +1281,83 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.updateStatusBar("disconnected");
 	}
 
-	// -------------------------------------------------------------------
-	// Commands
-	// -------------------------------------------------------------------
+	private resetLocalCache(): void {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
 
-	private registerCommands(): void {
-		this.addCommand({
-			id: "reconnect",
-			name: "Reconnect to sync server",
-			callback: () => {
-				if (this.vaultSync) {
-					this.connectionController?.reconnect("manual-command");
-					new Notice("Reconnecting...");
+		const vaultId = this.settings.vaultId;
+		new ConfirmModal(
+			this.app,
+			"Reset local cache",
+			"This will clear the local IndexedDB cache and re-sync from the server. " +
+			"Your disk files and server state are not affected. Continue?",
+			async () => {
+				this.log("Reset cache: starting");
+				new Notice("Clearing cache and syncing again...");
+
+				this.teardownSync();
+
+				try {
+					await VaultSync.deleteIdb(vaultId);
+					this.log("Reset cache: IDB deleted");
+				} catch (err) {
+					console.error("[yaos] Failed to delete IDB:", err);
 				}
-			},
-			});
 
-			this.addCommand({
-				id: "force-reconcile",
-				name: "Force reconcile vault with sync state",
-				callback: () => {
-					if (!this.vaultSync) return;
-					const mode = this.vaultSync.getSafeReconcileMode();
-				void this.runReconciliation(mode).then(() => {
-					this.bindAllOpenEditors();
-					this.validateAllOpenBindings("manual-reconcile");
-				});
+				this.log("Reset cache: reinitializing");
+				await this.initSync();
+				new Notice("Cache reset complete.");
 			},
-		});
+		).open();
+	}
 
-		this.addCommand({
-			id: "debug-status",
-			name: "Show sync debug info",
-			callback: () => {
-				const info = this.diagnosticsService?.buildDebugInfo() ?? "Sync not initialized";
-				new Notice(info, 10000);
-				console.debug("[yaos] Debug status:\n" + info);
-			},
-		});
+	private nuclearReset(): void {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
 
-		this.addCommand({
-			id: "copy-debug",
-			name: "Copy debug info to clipboard",
-			callback: () => {
-				const info = this.diagnosticsService?.buildDebugInfo() ?? "Sync not initialized";
-				navigator.clipboard.writeText(info).then(
-					() => new Notice("Debug info copied to clipboard."),
-					() => new Notice("Failed to copy to clipboard. Check console.", 5000),
+		const pathCount = this.vaultSync.getActiveMarkdownPaths().length;
+		new ConfirmModal(
+			this.app,
+			"Nuclear reset",
+			`This will wipe all CRDT state (${pathCount} files) on both this device and the server, ` +
+			`clear the local cache, then re-seed everything from your current disk files. ` +
+			`Other connected devices will also see the reset. This cannot be undone. Continue?`,
+			async () => {
+				this.log("Nuclear reset: starting");
+				new Notice("Nuclear reset in progress...");
+
+				// Clear CRDT maps before teardown so deletions propagate while connected.
+				const counts = this.vaultSync!.clearAllMaps();
+				this.log(
+					`Nuclear reset: cleared ${counts.pathCount} paths, ` +
+					`${counts.idCount} texts, ${counts.metaCount} meta, ` +
+					`${counts.blobCount} blob paths`,
 				);
-				console.debug("[yaos] Debug info:\n" + info);
-			},
-		});
 
-		this.addCommand({
-			id: "show-recent-events",
-			name: "Show recent sync events",
-			callback: () => {
-				const text = this.diagnosticsService?.buildRecentEventsText(80) ?? "No events recorded yet.";
-				new Notice("Recent sync events printed to console.", 5000);
-				console.debug("[yaos] Recent sync events:\n" + text);
-			},
-		});
-
-		this.addCommand({
-			id: "export-diagnostics",
-			name: "Export sync diagnostics",
-			callback: () => {
-				void this.diagnosticsService?.exportDiagnostics();
-			},
-		});
-
-		this.addCommand({
-			id: "migrate-schema-v2",
-			name: "Migrate sync schema to v2",
-			callback: () => {
-				this.runSchemaMigrationToV2();
-			},
-		});
-
-			this.addCommand({
-				id: "debug-vfs-torture-test",
-				name: "Run filesystem torture test (debug)",
-				checkCallback: (checking: boolean) => {
-					if (!this.settings.debug) return false;
-					if (!checking) {
-					void this.runVfsTortureTest();
-				}
-				return true;
-			},
-		});
-
-		this.addCommand({
-			id: "import-untracked",
-			name: "Import untracked files now",
-			callback: () => {
-				if (!this.vaultSync) {
-					new Notice("Sync not initialized");
-					return;
-				}
-				if (this.untrackedFiles.length === 0) {
-					new Notice("No untracked files to import.");
-					return;
-				}
-				const count = this.untrackedFiles.length;
-				void this.importUntrackedFiles().then(() => {
-					new Notice(`Imported ${count} untracked file(s).`);
-				});
-			},
-		});
-
-		this.addCommand({
-			id: "reset-cache",
-			name: "Reset local cache (re-sync from server)",
-			callback: () => {
-				if (!this.vaultSync) {
-					new Notice("Sync not initialized");
-					return;
-				}
+				await new Promise((r) => setTimeout(r, 500));
 
 				const vaultId = this.settings.vaultId;
-				new ConfirmModal(
-					this.app,
-					"Reset local cache",
-					"This will clear the local IndexedDB cache and re-sync from the server. " +
-					"Your disk files and server state are not affected. Continue?",
-						async () => {
-							this.log("Reset cache: starting");
-							new Notice("Clearing cache and syncing again...");
+				this.teardownSync();
 
-						this.teardownSync();
-
-						try {
-							await VaultSync.deleteIdb(vaultId);
-							this.log("Reset cache: IDB deleted");
-						} catch (err) {
-							console.error("[yaos] Failed to delete IDB:", err);
-						}
-
-							this.log("Reset cache: reinitializing");
-							await this.initSync();
-							new Notice("Cache reset complete.");
-						},
-					).open();
-				},
-		});
-
-		// --- Snapshot commands ---
-
-		this.addCommand({
-			id: "snapshot-now",
-			name: "Take snapshot now",
-			callback: async () => {
-				await this.snapshotService?.takeSnapshotNow();
-			},
-		});
-
-		this.addCommand({
-			id: "snapshot-list",
-			name: "Browse and restore snapshots",
-			callback: async () => {
-				await this.snapshotService?.showSnapshotList();
-			},
-		});
-
-		// --- Reset commands ---
-
-			this.addCommand({
-				id: "nuclear-reset",
-				name: "Nuclear reset (wipe sync state and reseed from disk)",
-				callback: () => {
-					if (!this.vaultSync) {
-						new Notice("Sync not initialized");
-					return;
+				try {
+					await VaultSync.deleteIdb(vaultId);
+					this.log("Nuclear reset: IDB deleted");
+				} catch (err) {
+					console.error("[yaos] Failed to delete IDB:", err);
 				}
 
-					const pathCount = this.vaultSync.getActiveMarkdownPaths().length;
-				new ConfirmModal(
-					this.app,
-					"Nuclear reset",
-					`This will wipe all CRDT state (${pathCount} files) on both this device and the server, ` +
-					`clear the local cache, then re-seed everything from your current disk files. ` +
-					`Other connected devices will also see the reset. This cannot be undone. Continue?`,
-						async () => {
-							this.log("Nuclear reset: starting");
-							new Notice("Nuclear reset in progress...");
-
-						// Clear CRDT maps BEFORE teardown so the deletions propagate
-						// to the server while the provider is still connected.
-						const counts = this.vaultSync!.clearAllMaps();
-						this.log(
-							`Nuclear reset: cleared ${counts.pathCount} paths, ` +
-							`${counts.idCount} texts, ${counts.metaCount} meta, ` +
-							`${counts.blobCount} blob paths`,
-						);
-
-						// Give the provider a moment to sync the deletions to server
-						await new Promise((r) => setTimeout(r, 500));
-
-						const vaultId = this.settings.vaultId;
-						this.teardownSync();
-
-						try {
-							await VaultSync.deleteIdb(vaultId);
-							this.log("Nuclear reset: IDB deleted");
-						} catch (err) {
-							console.error("[yaos] Failed to delete IDB:", err);
-						}
-
-						this.log("Nuclear reset: reinitializing (will re-seed from disk)");
-						await this.initSync();
-							new Notice(
-								`YAOS: nuclear reset complete. ` +
-								`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
-							);
-					},
-				).open();
+				this.log("Nuclear reset: reinitializing (will re-seed from disk)");
+				await this.initSync();
+				new Notice(
+					`YAOS: nuclear reset complete. ` +
+					`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
+				);
 			},
-		});
+		).open();
 	}
 
 	// -------------------------------------------------------------------
