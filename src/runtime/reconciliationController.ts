@@ -14,6 +14,11 @@ import type { EditorBindingManager } from "../sync/editorBinding";
 import { applyDiffToYText } from "../sync/diff";
 import { decideExternalEditImport } from "../sync/externalEditPolicy";
 import { yTextToString } from "../utils/format";
+import {
+	ORIGIN_DISK_SYNC,
+	ORIGIN_DISK_SYNC_RECOVER_BOUND,
+	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+} from "../sync/origins";
 
 export interface ReconciliationStats {
 	at: string;
@@ -610,7 +615,7 @@ export class ReconciliationController {
 				this.deps.log(
 					`syncFileFromDisk: applying diff to "${file.path}" (${crdtContent.length} -> ${content.length} chars)`,
 				);
-				applyDiffToYText(existingText, crdtContent, content, "disk-sync");
+				applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -746,7 +751,7 @@ export class ReconciliationController {
 					diskLength: content.length,
 					crdtLength: crdtContent?.length ?? null,
 				});
-				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-recover-bound");
+				applyDiffToYText(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_RECOVER_BOUND);
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -818,7 +823,7 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
-				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-open-idle-recover");
+				applyDiffToYText(existingText, crdtContent ?? "", content, ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER);
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,

@@ -2,8 +2,6 @@ import { type App, arrayBufferToHex, MarkdownView, TFile, normalizePath } from "
 import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
-import { ORIGIN_SEED } from "../types";
-import { ORIGIN_RESTORE } from "./snapshotClient";
 import type { TraceRecord } from "../debug/trace";
 import { formatUnknown, yTextToString } from "../utils/format";
 import {
@@ -11,6 +9,8 @@ import {
 	validateFrontmatterTransition,
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
+import { isLocalOrigin } from "./origins";
+export { isLocalOrigin };
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -27,30 +27,6 @@ const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
 const SUPPRESS_MS = 500;
 const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
-
-/** String origins that should NOT trigger a disk write. */
-const LOCAL_STRING_ORIGINS = new Set([
-	ORIGIN_SEED,
-	"disk-sync",
-	ORIGIN_RESTORE,
-]);
-
-/**
- * Determine whether a Yjs transaction origin is local (should NOT trigger
- * a disk write).
- *
- * The sync provider applies remote updates with `transactionOrigin = provider`.
- * y-codemirror applies local editor updates with `transactionOrigin = YSyncConfig`.
- *
- * We only treat provider-origin transactions as remote.
- */
-function isLocalOrigin(origin: unknown, provider: unknown): boolean {
-	if (origin === provider) return false; // remote update from server
-	if (typeof origin === "string") return LOCAL_STRING_ORIGINS.has(origin);
-	if (origin == null) return true; // local transact() without explicit origin
-	// Non-null object origins (e.g. y-codemirror's YSyncConfig) are local.
-	return true;
-}
 
 function describeOrigin(origin: unknown, provider: unknown): string {
 	if (origin === provider) return "provider-remote";
