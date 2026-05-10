@@ -16,7 +16,7 @@
 import { type App, TFile, normalizePath, requestUrl, arrayBufferToHex } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { isBlobSyncable, type BlobRef } from "../types";
-import { ORIGIN_SEED } from "../types";
+import { ORIGIN_SEED } from "./origins";
 import {
 	appendTraceParams,
 	type TraceHttpContext,
