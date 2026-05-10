@@ -115,6 +115,40 @@ export async function isAuthorized(
 	return false;
 }
 
+export type PreAuthRejectionReason = "unclaimed" | "server_misconfigured" | "unauthorized";
+
+/** Typed rejection result — carries both the HTTP response and the reason for logging. */
+export interface AuthRejection {
+	response: Response;
+	reason: PreAuthRejectionReason;
+}
+
+/**
+ * Returns a typed rejection (response + reason) if the request fails pre-auth,
+ * or null if the request is authorized and should proceed to the vault handler.
+ * Does NOT touch any Durable Object namespace — exported for runtime testing (FU-4).
+ *
+ * Callers log `rejection.reason` — no duplicated decision tree.
+ */
+export async function rejectUnauthorizedVaultRequest(
+	req: Request,
+	_env: unknown,
+	authState: AuthState,
+	_vaultId: string,
+): Promise<AuthRejection | null> {
+	const token = getHttpAuthToken(req);
+	if (!authState.claimed) {
+		return { response: json({ error: "unclaimed" }, 503), reason: "unclaimed" };
+	}
+	if (authState.mode === "env" && !authState.envToken) {
+		return { response: json({ error: "server_misconfigured" }, 503), reason: "server_misconfigured" };
+	}
+	if (!(await isAuthorized(authState, token))) {
+		return { response: json({ error: "unauthorized" }, 401), reason: "unauthorized" };
+	}
+	return null;
+}
+
 function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): string {
 	const params = new URLSearchParams({
 		action: "setup",
