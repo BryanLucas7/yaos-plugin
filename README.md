@@ -2,7 +2,7 @@
 
 **A zero-terminal, real-time sync engine for Obsidian, powered by your own Cloudflare Worker.**
 
-Your notes stay in sync instantly across devices, without conflicted copies, delayed file sync, or database-heavy self-hosting.
+Your notes sync live across devices, with CRDT merge semantics instead of conflicted-copy workflows, delayed file sync, or database-heavy self-hosting.
 
 <img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
 
@@ -22,7 +22,7 @@ Most ways to sync Obsidian pick a trade-off. YAOS picks none.
 | **Obsidian Sync** | Rare | Delayed | No | Yes | $96/yr |
 | **Git / LiveSync** | Manual | Varies | Yes | No | Yes |
 | **Relay / Screengarden** | No | Yes | No | Yes | Freemium |
-| **YAOS** | **None** | **Yes** | **Yes** | **Yes** | **$0** |
+| **YAOS** | **CRDT merge** | **Yes** | **Yes** | **Yes** | **$0** |
 
 YAOS uses [Yjs CRDTs](https://yjs.dev) to keep one live vault state moving across devices instead of asking them to take polite turns uploading files and hoping nothing collides.
 
@@ -50,6 +50,37 @@ From the claim page, open the setup link or scan the QR code. YAOS fills in the 
 
 That's it. Your vault is syncing.
 
+## Server receipt status
+
+YAOS now shows a small server receipt signal in the status bar. It answers one
+narrow question:
+
+> Has the server's in-memory Y.Doc received this device's latest local CRDT state?
+
+When it says **Receipt: received**, the server room has
+echoed a state vector that includes this device's latest local candidate. This is
+useful for poor connectivity and offline/reconnect workflows.
+
+It does **not** mean:
+
+- the update is durably written to the server journal or checkpoint
+- another device has already received or applied the update
+- every device is up to date
+- there are zero queued updates
+
+Other states are intentionally conservative:
+
+| Status | Meaning |
+|--------|---------|
+| **Receipt: waiting** | Local state exists that the server has not yet echoed back as received. If this stays stuck while online, reconnect and check diagnostics. |
+| **Receipt: not tracked** | No local receipt candidate has been observed in this session. |
+| **Receipt: offline, last echo ...** | You are offline now; YAOS only knows when the last fresh server receipt echo arrived. |
+| **Receipt: restart unchecked** | Local Yjs cache replay timed out, so YAOS did not trust persisted receipt state this session. |
+| **persistence degraded** | Current-session receipt tracking can still work, but restart continuity for receipt state may be unavailable. |
+
+This is a Level 3 server receipt: server Y.Doc memory only. It is not a Level 4
+durability guarantee.
+
 ## Attachments and snapshots
 
 Text sync works out of the box. To sync images, PDFs, and other attachments, add a Cloudflare R2 bucket — it takes about a minute.
@@ -58,7 +89,7 @@ Text sync works out of the box. To sync images, PDFs, and other attachments, add
   <img src="https://img.youtube.com/vi/Z7xCMEYfdFM/maxresdefault.jpg" width="480" alt="Watch the R2 setup video" />
 </a>
 
-R2 also enables daily automatic snapshots and on-demand point-in-time backups. You can browse snapshots, diff against current state, and selectively restore individual files. If you skip R2, text sync still works perfectly — you just won't have attachment sync or snapshots.
+R2 also enables daily automatic snapshots and on-demand point-in-time backups. You can browse snapshots, diff against current state, and selectively restore individual files. If you skip R2, text sync still works — you just won't have attachment sync or snapshots.
 
 ## Updating your server
 
@@ -141,6 +172,7 @@ Access via command palette (Ctrl/Cmd+P):
 | **Reconnect to sync server** | Force reconnect after network changes |
 | **Force reconcile** | Re-merge disk state with CRDT |
 | **Show sync debug info** | Connection state, file counts, queue status |
+| **Clear local server-receipt state** | Clear this device's local server receipt candidate and historical receipt timestamp |
 | **Take snapshot now** | Create an immediate backup to R2 |
 | **Browse and restore snapshots** | View snapshots, diff against current state, selective restore |
 | **Reset local cache** | Clear IndexedDB, re-sync from server |
@@ -159,6 +191,19 @@ Access via command palette (Ctrl/Cmd+P):
 **Files not syncing**: Check exclude patterns. Files over max size are skipped. Use debug logging to see what's happening, and then raise an issue on GitHub.
 
 **Conflicts after offline edits**: CRDTs merge automatically but the result depends on operation order. Review merged content if needed.
+
+**Server receipt is unknown or waiting**: Reconnect first. If local cache replay timed out, wait for the vault to finish loading and reconnect again. If you recently reset, reclaimed, or migrated the server, run **Clear local server-receipt state** from the command palette; Phase A receipt state cannot automatically detect every same-vault server reset.
+
+**Diagnostics**: Use **Show sync debug info** for local inspection. Safe diagnostics exports redact server URL, vault ID, device name, and vault paths; filename-inclusive diagnostics require explicit confirmation before writing.
+
+## Current limits
+
+YAOS currently syncs Markdown text through the CRDT engine and attachments through
+R2 when configured. It does not try to sync every `.obsidian` setting/plugin file.
+Empty folders are not synced in v0 because the CRDT tracks files and blob
+references, not folder-only objects. Avoid running another live file-sync engine
+such as iCloud, Dropbox, Syncthing, or Git auto-sync against the same vault at the
+same time unless you understand the interaction.
 
 ## License
 
