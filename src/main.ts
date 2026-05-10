@@ -70,6 +70,7 @@ import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
+	renderConnectionState,
 	renderSyncStatus,
 	type SyncStatus,
 } from "./status/statusBarController";
@@ -505,6 +506,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
+					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
 				});
@@ -530,6 +532,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Waiting for IndexedDB persistence...");
 			const localLoaded = await this.vaultSync.waitForLocalPersistence();
 			this.log(`IndexedDB: ${localLoaded ? "loaded" : "timed out"}`);
+			await this.vaultSync.initializeServerAckTracking(this.settings, this.manifest.version, {
+				localYjsPersistenceLoaded: localLoaded,
+			});
 
 			// Schema version check — refuse to run if a newer plugin wrote this data
 			const schemaError = this.vaultSync.checkSchemaVersion();
@@ -608,6 +613,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async importUntrackedFiles(): Promise<void> {
 		await this.reconciliationController.importUntrackedFiles();
+	}
+
+	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
+		if (!this.vaultSync) return;
+		const result = await this.vaultSync.clearLocalServerReceiptState();
+		this.log(`Cleared local server-receipt state: ${result}`);
+		this.scheduleTraceStateSnapshot("clear-local-server-receipt-state");
+		this.refreshStatusBar();
+		return result;
 	}
 
 	// -------------------------------------------------------------------
@@ -1147,9 +1161,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 	}
 
-	private updateStatusBar(state: SyncStatus): void {
+	private updateStatusBar(_coarseState: SyncStatus): void {
 		if (!this.statusBarEl) return;
-		renderSyncStatus(this.statusBarEl, state, this.getBlobSync()?.transferStatus);
+		const connectionState = this.connectionController?.getState();
+		const transferStatus = this.getBlobSync()?.transferStatus;
+		const vaultSync = this.vaultSync;
+		const serverReceipt = vaultSync ? {
+			serverAppliedLocalState: vaultSync.serverAppliedLocalState,
+			lastServerReceiptEchoAt: vaultSync.lastServerReceiptEchoAt,
+			lastKnownServerReceiptEchoAt: vaultSync.lastKnownServerReceiptEchoAt,
+			candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
+			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
+		} : null;
+		if (connectionState) {
+			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt);
+		} else {
+			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus);
+		}
 	}
 
 	private setupTraceRuntime(): void {

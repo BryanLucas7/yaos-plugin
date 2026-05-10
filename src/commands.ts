@@ -15,6 +15,7 @@ export interface CommandsRuntimeHost {
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
+	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
 }
@@ -80,9 +81,17 @@ export function registerCommands(
 
 	registrar.addCommand({
 		id: "export-diagnostics",
-		name: "Export sync diagnostics",
+		name: "Export sync diagnostics (safe)",
 		callback: () => {
 			void host.getDiagnosticsService()?.exportDiagnostics();
+		},
+	});
+
+	registrar.addCommand({
+		id: "export-diagnostics-with-filenames",
+		name: "Export sync diagnostics with filenames",
+		callback: () => {
+			void host.getDiagnosticsService()?.exportDiagnosticsWithFilenames();
 		},
 	});
 
@@ -122,6 +131,29 @@ export function registerCommands(
 			void host.importUntrackedFiles().then(() => {
 				new Notice(`Imported ${count} untracked file(s).`);
 			});
+		},
+	});
+
+	registrar.addCommand({
+		id: "clear-local-server-receipt-state",
+		name: "Clear local server-receipt state",
+		callback: () => {
+			const vaultSync = host.getVaultSync();
+			if (!vaultSync) {
+				new Notice("Sync not initialized");
+				return;
+			}
+			void host.clearLocalServerReceiptState().then(
+				(result) => new Notice(
+					result === "cleared_persistent"
+						? "Local server-receipt state cleared."
+						: result === "cleared_memory_only"
+							? "Local server-receipt state cleared for this session. Persistent receipt store is unavailable."
+							: "Failed to clear local server-receipt state. Check console.",
+					result === "cleared_persistent" ? 4000 : 7000,
+				),
+				() => new Notice("Failed to clear local server-receipt state. Check console.", 5000),
+			);
 		},
 	});
 
