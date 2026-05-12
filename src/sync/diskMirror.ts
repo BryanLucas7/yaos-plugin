@@ -575,6 +575,17 @@ export class DiskMirror {
 			wasSuppressed,
 			hasBaselineText: options.baselineText !== undefined && options.baselineText !== null,
 		});
+		// Flight: remote delete observed — emit before we know the outcome
+		this._flightEventHandler?.({
+			priority: "critical",
+			kind: "delete.remote.observed",
+			severity: "info",
+			scope: "file",
+			source: "diskMirror",
+			layer: "disk",
+			path: normalized,
+			data: { wasOpen, hasBaselineText: options.baselineText !== null && options.baselineText !== undefined },
+		});
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
 				try {
@@ -669,18 +680,38 @@ export class DiskMirror {
 							this.onPreservedUnresolvedChanged?.();
 						}
 						this.suppressDelete(path);
-						const deleteMode = await this.deleteLocalReplica(file);
-						this.trace?.("disk", "remote-delete-applied", {
-							path,
-							deleteMode,
-							reason: "remote-delete",
-						});
-						this.log(`handleRemoteDelete: deleted "${path}" from disk`);
+					const deleteMode = await this.deleteLocalReplica(file);
+					this.trace?.("disk", "remote-delete-applied", {
+						path,
+						deleteMode,
+						reason: "remote-delete",
+					});
+					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
+					this._flightEventHandler?.({
+						priority: "critical",
+						kind: "delete.disk.applied",
+						severity: "info",
+						scope: "file",
+						source: "diskMirror",
+						layer: "disk",
+						path: normalized,
+						data: { deleteMode, reason: "tombstone-applied" },
+					});
 					} else if (decision.kind === "preserve-revive") {
 						// Clear any prior unresolved marker — we now have a baseline.
 						if (this.preservedUnresolved.resolve(normalized)) {
 							this.onPreservedUnresolvedChanged?.();
 						}
+						this._flightEventHandler?.({
+							priority: "critical",
+							kind: "delete.preserved",
+							severity: "warn",
+							scope: "file",
+							source: "diskMirror",
+							layer: "disk",
+							path: normalized,
+							data: { reason: "local-dirty-wins-over-remote-delete", preserveKind: "preserve-revive" },
+						});
 						// Known dirty: local file intentionally differs from baseline.
 						// Revive tombstone so the file re-enters sync. This is the
 						// explicit policy: local dirty work wins over remote delete.
@@ -713,11 +744,24 @@ export class DiskMirror {
 							});
 						}
 					}
-					// kind === "preserve-unresolved": file stays on disk, tombstone
-					// remains in CRDT. The file is NOT auto-revived by later
-					// reconcile/import passes; explicit user action or a future
-					// remote event is required to resolve the limbo state.
-					if (decision.kind === "preserve-unresolved") {
+				// kind === "preserve-unresolved": file stays on disk, tombstone
+				// remains in CRDT. The file is NOT auto-revived by later
+				// reconcile/import passes; explicit user action or a future
+				// remote event is required to resolve the limbo state.
+				if (decision.kind === "preserve-unresolved") {
+					this._flightEventHandler?.({
+						priority: "critical",
+						kind: "delete.preserved",
+						severity: "warn",
+						scope: "file",
+						source: "diskMirror",
+						layer: "disk",
+						path: normalized,
+						data: {
+							reason: unresolvedReason ?? "preserve-unresolved",
+							preserveKind: "preserve-unresolved",
+						},
+					});
 						this.unobserveText(normalized);
 						this.openPaths.delete(normalized);
 						this.pendingOpenWrites.delete(normalized);
@@ -1112,6 +1156,16 @@ export class DiskMirror {
 				observedKind: "write",
 				reason: "kind-mismatch",
 			});
+			this._flightEventHandler?.({
+				priority: "critical",
+				kind: "disk.event.not_suppressed",
+				severity: "warn",
+				scope: "file",
+				source: "diskMirror",
+				layer: "disk",
+				path,
+				data: { event, reason: "kind-mismatch", expectedKind: entry.kind },
+			});
 			return false;
 		}
 
@@ -1132,6 +1186,21 @@ export class DiskMirror {
 				expectedBytes: entry.expectedBytes,
 				observedBytes: file.stat.size,
 				reason: "size-mismatch",
+			});
+			this._flightEventHandler?.({
+				priority: "critical",
+				kind: "disk.event.not_suppressed",
+				severity: "warn",
+				scope: "file",
+				source: "diskMirror",
+				layer: "disk",
+				path,
+				data: {
+					event,
+					reason: "size-mismatch",
+					expectedBytes: entry.expectedBytes,
+					observedBytes: file.stat.size,
+				},
 			});
 			return false;
 		}
@@ -1176,6 +1245,21 @@ export class DiskMirror {
 			expectedBytes: entry.expectedBytes,
 			expectedHashPrefix: hashPrefix(entry.expectedHash),
 			reason: "fingerprint-mismatch",
+		});
+		this._flightEventHandler?.({
+			priority: "critical",
+			kind: "disk.event.not_suppressed",
+			severity: "warn",
+			scope: "file",
+			source: "diskMirror",
+			layer: "disk",
+			path,
+			data: {
+				event,
+				reason: "fingerprint-mismatch",
+				expectedBytes: entry.expectedBytes,
+				expectedHashPrefix: hashPrefix(entry.expectedHash),
+			},
 		});
 		return false;
 	}
