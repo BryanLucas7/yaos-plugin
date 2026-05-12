@@ -17,6 +17,8 @@ import {
 	type SvEchoCounters,
 } from "./svEchoMessage";
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
+import { FLIGHT_KIND } from "../debug/flightEvents";
+import type { FlightPathEventInput } from "../debug/flightEvents";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -185,17 +187,23 @@ export class VaultSync {
 	private readonly debug: boolean;
 	private _eventRing: Array<{ ts: string; msg: string }> = [];
 	private readonly trace?: TraceRecord;
+	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
+	private readonly onFlightPathEvent?: (event: FlightPathEventInput) => void;
 
 	constructor(
 		settings: VaultSyncSettings,
 		options?: {
 			traceContext?: TraceHttpContext;
 			trace?: TraceRecord;
+			onFlightEvent?: (event: Record<string, unknown>) => void;
+			onFlightPathEvent?: (event: FlightPathEventInput) => void;
 		},
 	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
 		this.trace = options?.trace;
+		this.onFlightEvent = options?.onFlightEvent;
+		this.onFlightPathEvent = options?.onFlightPathEvent;
 
 		this.ydoc = new Y.Doc();
 		this.pathToId = this.ydoc.getMap<string>("pathToId");
@@ -268,7 +276,7 @@ export class VaultSync {
 			this.provider,
 			this.persistence,
 		);
-		this.serverAckTracker = new ServerAckTracker(this.trace);
+		this.serverAckTracker = new ServerAckTracker(this.trace, this.onFlightEvent);
 
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
@@ -968,11 +976,12 @@ export class VaultSync {
 		path: string,
 		currentContent: string,
 		device?: string,
-		options?: { reviveTombstone?: boolean; reviveReason?: string },
+		options?: { reviveTombstone?: boolean; reviveReason?: string; opId?: string },
 	): Y.Text | null {
 		path = this.normPath(path);
 		const reviveTombstone = options?.reviveTombstone === true;
 		const reviveReason = options?.reviveReason ?? "unknown";
+		const opId = options?.opId;
 
 		const existingId = this.getFileId(path);
 		if (!existingId) {
@@ -1013,16 +1022,27 @@ export class VaultSync {
 						this.meta.delete(tombstoneId);
 					}
 				}, ORIGIN_SEED);
-				this._pathIndexesDirty = true;
-				this.trace?.("sync", "ensureFile-tombstone-revived", {
-					path,
-					tombstoneIds,
-					device: device ?? null,
-					reason: reviveReason,
-				});
-				this.log(
-					`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
-				);
+			this._pathIndexesDirty = true;
+			this.trace?.("sync", "ensureFile-tombstone-revived", {
+				path,
+				tombstoneIds,
+				device: device ?? null,
+				reason: reviveReason,
+			});
+			this.onFlightPathEvent?.({
+				priority: "critical",
+				kind: FLIGHT_KIND.crdtFileRevived,
+				severity: "info",
+				scope: "file",
+				source: "vaultSync",
+				layer: "crdt",
+				path,
+				opId,
+				data: { reason: reviveReason },
+			});
+			this.log(
+				`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
+			);
 			} else {
 				this.trace?.("sync", "ensureFile-tombstone-blocked", {
 					path,
@@ -1049,6 +1069,17 @@ export class VaultSync {
 		this._pathIndexesDirty = true;
 		this.log(`ensureFile: created "${path}" (id=${fileId})`);
 		this._textToFileId.set(ytext, fileId);
+		this.onFlightPathEvent?.({
+			priority: "important",
+			kind: FLIGHT_KIND.crdtFileCreated,
+			severity: "info",
+			scope: "file",
+			source: "vaultSync",
+			layer: "crdt",
+			path,
+			fileId,
+			opId,
+		});
 		return ytext;
 	}
 
@@ -1359,7 +1390,7 @@ export class VaultSync {
 		return tombstonedIds;
 	}
 
-	handleDelete(path: string, device?: string): void {
+	handleDelete(path: string, device?: string, opId?: string): void {
 		path = this.normPath(path);
 
 		// Check pending rename batch for races:
@@ -1418,6 +1449,17 @@ export class VaultSync {
 			resolvedPath,
 			fileId,
 			device: device ?? null,
+		});
+		this.onFlightPathEvent?.({
+			priority: "critical",
+			kind: FLIGHT_KIND.crdtFileTombstoned,
+			severity: "info",
+			scope: "file",
+			source: "vaultSync",
+			layer: "crdt",
+			path: resolvedPath,
+			fileId,
+			opId,
 		});
 
 		this.log(`handleDelete: "${resolvedPath}" marked deleted (id=${fileId})`);

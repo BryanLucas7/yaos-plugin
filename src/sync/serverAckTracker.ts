@@ -40,11 +40,29 @@ export class ServerAckTracker {
 	private _candidatePersistenceHealthy = true;
 	private _candidatePersistenceFailureCount = 0;
 
+	private _lastCandidateId: string | null = null;
+	private _lastCandidateSvHash: string | null = null;
+	private _lastCausedByOpId: string | null = null;
+
 	private _encodeStateVector: (() => Uint8Array) | null = null;
 	private _store: CandidateStore | null = null;
 	private _scope: (ScopeKey & ScopeMetadata) | null = null;
+	private _onFlight?: (event: Record<string, unknown>) => void;
 
-	constructor(private readonly trace?: TraceRecord) {}
+	constructor(
+		private readonly trace?: TraceRecord,
+		onFlight?: (event: Record<string, unknown>) => void,
+	) {
+		this._onFlight = onFlight;
+	}
+
+	/**
+	 * Record the opId of the most recent CRDT mutation that will trigger a candidate capture.
+	 * Called by the reconciliation controller after syncFileFromDisk completes.
+	 */
+	setActiveOpId(opId: string | undefined): void {
+		this._lastCausedByOpId = opId ?? null;
+	}
 
 	/**
 	 * Attach to a Y.Doc update event stream. Must be called before onStartup.
@@ -71,6 +89,22 @@ export class ServerAckTracker {
 					candidateBytes: this._lastUnconfirmedCandidateSv.byteLength,
 					candidateCapturedAt: this._candidateCapturedAt,
 					originType: typeof origin,
+				});
+				this._lastCandidateId = `cand-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+				this._lastCandidateSvHash = this._computeSvHash(this._lastUnconfirmedCandidateSv);
+				this._onFlight?.({
+					priority: "critical",
+					kind: "server.receipt.candidate_captured",
+					severity: "info",
+					scope: "connection",
+					source: "serverAckTracker",
+					layer: "server",
+					candidateId: this._lastCandidateId,
+					svHash: this._lastCandidateSvHash,
+					data: {
+						candidateBytes: this._lastUnconfirmedCandidateSv.byteLength,
+						causedByOpId: this._lastCausedByOpId,
+					},
 				});
 				this._persistAsync();
 			}
@@ -140,6 +174,24 @@ export class ServerAckTracker {
 			serverAppliedLocalState: this._serverAppliedLocalState,
 			lastServerReceiptEchoAt: this._lastServerReceiptEchoAt,
 		});
+		const echoSvHash = this._computeSvHash(serverSv);
+		this._onFlight?.({
+			priority: "critical",
+			kind: confirmed ? "server.receipt.confirmed" : "server.sv_echo.seen",
+			severity: "info",
+			scope: "connection",
+			source: "serverAckTracker",
+			layer: "server",
+			candidateId: this._lastCandidateId ?? undefined,
+			svHash: confirmed ? echoSvHash : this._lastCandidateSvHash ?? undefined,
+			data: {
+				serverSvBytes: serverSv.byteLength,
+				confirmed,
+				hasCandidate: this._lastUnconfirmedCandidateSv !== null,
+				echoSvHash,
+				candidateSvHash: this._lastCandidateSvHash,
+			},
+		});
 		this._persistAsync();
 	}
 
@@ -186,6 +238,17 @@ export class ServerAckTracker {
 	}
 
 	// ── Private ──────────────────────────────────────────────────────────────
+
+	private _computeSvHash(sv: Uint8Array): string {
+		// Simple FNV-1a hash of the SV bytes, formatted as 8 hex chars.
+		// NOT cryptographic — just a short fingerprint for correlation.
+		let h = 0x811c9dc5;
+		for (let i = 0; i < sv.byteLength; i++) {
+			h ^= sv[i]!;
+			h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+		}
+		return h.toString(16).padStart(8, "0");
+	}
 
 	private _validateCandidateAgainstDoc(): void {
 		if (!this._lastUnconfirmedCandidateSv || !this._encodeStateVector) return;

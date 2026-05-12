@@ -101,6 +101,8 @@ export class DiskMirror {
 
 	private mapObserverCleanups: (() => void)[] = [];
 
+	private _flightEventHandler: ((event: Record<string, unknown>) => void) | null = null;
+
 	private readonly debug: boolean;
 
 	constructor(
@@ -127,6 +129,10 @@ export class DiskMirror {
 			initialPreservedUnresolved.filter((entry) => entry.kind === "markdown"),
 		);
 		this.preservedUnresolvedPaths = this.preservedUnresolved.paths;
+	}
+
+	setFlightEventHandler(handler: (event: Record<string, unknown>) => void): void {
+		this._flightEventHandler = handler;
 	}
 
 	// -------------------------------------------------------------------
@@ -475,6 +481,16 @@ export class DiskMirror {
 				await this.suppressWrite(path, content);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+				this._flightEventHandler?.({
+					priority: "important",
+					kind: "disk.write.ok",
+					severity: "info",
+					scope: "file",
+					source: "diskMirror",
+					layer: "disk",
+					path: normalized,
+					data: { contentLength: content.length, isCreate: false },
+				});
 			} else {
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
 					return;
@@ -492,9 +508,29 @@ export class DiskMirror {
 				this.log(
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
+				this._flightEventHandler?.({
+					priority: "important",
+					kind: "disk.write.ok",
+					severity: "info",
+					scope: "file",
+					source: "diskMirror",
+					layer: "disk",
+					path: normalized,
+					data: { contentLength: content.length, isCreate: true },
+				});
 			}
 		} catch (err) {
 			console.error(`[yaos] flushWrite failed for "${path}":`, err);
+			this._flightEventHandler?.({
+				priority: "critical",
+				kind: "disk.write.failed",
+				severity: "error",
+				scope: "file",
+				source: "diskMirror",
+				layer: "disk",
+				path: normalized,
+				data: { error: err instanceof Error ? err.message : String(err) },
+			});
 		}
 	}
 
