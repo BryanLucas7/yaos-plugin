@@ -11,6 +11,8 @@ import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type { EditorBindingManager } from "../sync/editorBinding";
+import { FLIGHT_KIND } from "../debug/flightEvents";
+import type { FlightEventInput, FlightPathEventInput } from "../debug/flightEvents";
 import {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
@@ -70,6 +72,8 @@ interface ReconciliationControllerDeps {
 	refreshServerCapabilities(reason: string): Promise<void>;
 	validateOpenEditorBindings(reason: string): void;
 	onReconciled(reason: string): void;
+	recordFlightEvent?(event: FlightEventInput): void;
+	recordFlightPathEvent?(event: FlightPathEventInput): void;
 	getAwaitingFirstProviderSyncAfterStartup(): boolean;
 	setAwaitingFirstProviderSyncAfterStartup(value: boolean): void;
 	saveDiskIndex(): Promise<void>;
@@ -169,7 +173,7 @@ export class ReconciliationController {
 	private lastReconcileTime = 0;
 	private reconcileCooldownTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastReconcileStats: ReconciliationStats | null = null;
-	private dirtyMarkdownPaths = new Map<string, "create" | "modify">();
+	private dirtyMarkdownPaths = new Map<string, { reason: "create" | "modify"; primaryOpId?: string; coalescedOpIds: string[] }>();
 	private closedOnlyDeferredImports = new Set<string>();
 	private markdownDrainPromise: Promise<void> | null = null;
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -323,6 +327,20 @@ export class ReconciliationController {
 		this.reconcileInFlight = true;
 
 		try {
+			this.deps.recordFlightEvent?.({
+				priority: "important",
+				kind: "reconcile.start",
+				severity: "info",
+				scope: "vault",
+				source: "reconciliationController",
+				layer: "reconcile",
+				data: {
+					mode,
+					crdtPathCount: vaultSync.getActiveMarkdownPaths().length,
+					connected: vaultSync.connected,
+					providerSynced: vaultSync.providerSynced,
+				},
+			});
 			const runtimeConfig = this.deps.getRuntimeConfig();
 			const diskFiles = new Map<string, string>();
 			const diskPresentPaths = new Set<string>();
@@ -481,6 +499,22 @@ export class ReconciliationController {
 							diskHash: contentFingerprint(diskContent),
 							crdtHash: contentFingerprint(crdtContent),
 						});
+						this.deps.recordFlightPathEvent?.({
+							priority: decision.kind === "preserve-conflict" ? "critical" : "important",
+							kind: FLIGHT_KIND.reconcileFileDecision,
+							severity: "info",
+							scope: "file",
+							source: "reconciliationController",
+							layer: "reconcile",
+							path,
+							data: {
+								decision: decision.kind,
+								reason: "reason" in decision ? decision.reason : null,
+								winner: "winner" in decision ? decision.winner : null,
+								diskLength: diskContent.length,
+								crdtLength: crdtContent.length,
+							},
+						});
 						if (decision.kind === "preserve-conflict") {
 							try {
 								const conflictPath = await this.createMarkdownConflictArtifact(
@@ -597,6 +631,27 @@ export class ReconciliationController {
 				(safetyBrakeTriggered ? ", safety-brake=on" : ", safety-brake=off"),
 			);
 
+			this.deps.recordFlightEvent?.({
+				priority: safetyBrakeTriggered ? "critical" : "important",
+				kind: safetyBrakeTriggered ? "reconcile.safety_brake.triggered" : "reconcile.complete",
+				severity: safetyBrakeTriggered ? "warn" : "info",
+				scope: "vault",
+				source: "reconciliationController",
+				layer: "reconcile",
+				data: {
+					mode,
+					seededToCrdt: result.seededToCrdt.length,
+					createdOnDisk: result.createdOnDisk.length,
+					updatedOnDisk: result.updatedOnDisk.length,
+					flushedCreates,
+					flushedUpdates,
+					untracked: result.untracked.length,
+					tombstonedSkipped: result.skipped,
+					safetyBrakeTriggered,
+					safetyBrakeReason,
+				},
+			});
+
 			const blobSync = this.deps.getBlobSync();
 			if (blobSync) {
 				const blobResult = blobSync.reconcile(
@@ -684,10 +739,27 @@ export class ReconciliationController {
 		}
 	}
 
-	markMarkdownDirty(file: TFile, reason: "create" | "modify"): void {
+	markMarkdownDirty(file: TFile, reason: "create" | "modify", opId?: string): void {
 		const previous = this.dirtyMarkdownPaths.get(file.path);
-		if (previous !== "create") {
-			this.dirtyMarkdownPaths.set(file.path, reason);
+		if (!previous) {
+			this.dirtyMarkdownPaths.set(file.path, {
+				reason,
+				primaryOpId: opId,
+				coalescedOpIds: opId ? [opId] : [],
+			});
+		} else {
+			// Keep "create" if either is "create" (higher priority)
+			const mergedReason = previous.reason === "create" || reason === "create" ? "create" : "modify";
+			// Append new opId to coalesced list
+			const coalescedOpIds = [...previous.coalescedOpIds];
+			if (opId && !coalescedOpIds.includes(opId)) {
+				coalescedOpIds.push(opId);
+			}
+			this.dirtyMarkdownPaths.set(file.path, {
+				reason: mergedReason,
+				primaryOpId: previous.primaryOpId ?? opId,
+				coalescedOpIds,
+			});
 		}
 		this.lastMarkdownDirtyAt = Date.now();
 		this.scheduleMarkdownDrain();
@@ -708,7 +780,8 @@ export class ReconciliationController {
 			reason,
 		});
 
-		void this.processDirtyMarkdownPath(path, "modify")
+		const deferredOpId = `op-deferred-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		void this.processDirtyMarkdownPath(path, "modify", deferredOpId)
 			.catch((err) => {
 				console.error(`[yaos] closed-only deferred import failed for "${path}" (${reason}):`, err);
 			})
@@ -753,14 +826,16 @@ export class ReconciliationController {
 		const batch = Array.from(this.dirtyMarkdownPaths.entries());
 		this.dirtyMarkdownPaths.clear();
 
-		for (const [path, reason] of batch) {
-			await this.processDirtyMarkdownPath(path, reason);
+		for (const [path, { reason, primaryOpId, coalescedOpIds }] of batch) {
+			await this.processDirtyMarkdownPath(path, reason, primaryOpId, coalescedOpIds);
 		}
 	}
 
 	private async processDirtyMarkdownPath(
 		path: string,
 		reason: "create" | "modify",
+		opId?: string,
+		coalescedOpIds?: string[],
 	): Promise<void> {
 		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
 		if (!(abstractFile instanceof TFile)) {
@@ -787,12 +862,14 @@ export class ReconciliationController {
 			}
 		}
 
-		await this.syncFileFromDisk(abstractFile, reason);
+		await this.syncFileFromDisk(abstractFile, reason, opId, coalescedOpIds);
 	}
 
 	private async syncFileFromDisk(
 		file: TFile,
 		sourceReason: "create" | "modify" = "modify",
+		opId?: string,
+		coalescedOpIds?: string[],
 	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		const editorBindings = this.deps.getEditorBindings();
@@ -872,6 +949,28 @@ export class ReconciliationController {
 					`syncFileFromDisk: applying diff to "${file.path}" (${crdtContent.length} -> ${content.length} chars)`,
 				);
 				applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
+				// Emit crdt.file.updated with the same opId that triggered this disk→CRDT write.
+				const fileId = vaultSync.getFileIdForText(existingText) ?? undefined;
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.crdtFileUpdated,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "crdt",
+					path: file.path,
+					opId,
+					fileId,
+					data: {
+						originKind: "disk-sync",
+						...(coalescedOpIds && coalescedOpIds.length > 1 ? { coalescedOpIds } : {}),
+					},
+				});
+				// Record active opId for server receipt causal linkage
+				const vaultSyncRef = this.deps.getVaultSync();
+				if (vaultSyncRef) {
+					vaultSyncRef.serverAckTracker.setActiveOpId(opId);
+				}
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -882,15 +981,23 @@ export class ReconciliationController {
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
-				vaultSync.ensureFile(
+				const ensureResult = vaultSync.ensureFile(
 					file.path,
 					content,
 					this.deps.getSettings().deviceName,
 					{
 						reviveTombstone: sourceReason === "create",
 						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+						opId,
 					},
 				);
+				// Record active opId for server receipt causal linkage
+				if (ensureResult) {
+					const vaultSyncRef2 = this.deps.getVaultSync();
+					if (vaultSyncRef2) {
+						vaultSyncRef2.serverAckTracker.setActiveOpId(opId);
+					}
+				}
 			}
 
 			await this.updateDiskIndexForPath(file.path);
@@ -1034,6 +1141,23 @@ export class ReconciliationController {
 					content.length,
 					recoveryResult,
 				);
+				this.deps.recordFlightPathEvent?.({
+					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
+					kind: FLIGHT_KIND.recoveryApplyDone,
+					severity: recoveryResult.finalMatchesExpected ? "info" : "warn",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-local-only-divergence",
+						origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						expectedLength: content.length,
+						actualLength: recoveryResult.finalLength,
+						matchesExpected: recoveryResult.finalMatchesExpected,
+						forceReplaceApplied: recoveryResult.forceReplaceApplied,
+					},
+				});
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -1147,6 +1271,23 @@ export class ReconciliationController {
 					content.length,
 					recoveryResult,
 				);
+				this.deps.recordFlightPathEvent?.({
+					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
+					kind: FLIGHT_KIND.recoveryApplyDone,
+					severity: recoveryResult.finalMatchesExpected ? "info" : "warn",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-open-idle-disk-recovery",
+						origin: ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+						expectedLength: content.length,
+						actualLength: recoveryResult.finalLength,
+						matchesExpected: recoveryResult.finalMatchesExpected,
+						forceReplaceApplied: recoveryResult.forceReplaceApplied,
+					},
+				});
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -1370,6 +1511,19 @@ export class ReconciliationController {
 			`syncFileFromDisk: quarantined repeated recovery for "${path}" ` +
 			`(${reason}, ${count} attempts)`,
 		);
+		this.deps.recordFlightPathEvent?.({
+			priority: "critical",
+			kind: FLIGHT_KIND.recoveryLoopDetected,
+			severity: "warn",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				repeatCount: count,
+				reason,
+			},
+		});
 		this.deps.scheduleTraceStateSnapshot("recovery-quarantined");
 		return true;
 	}
