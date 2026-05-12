@@ -37,12 +37,47 @@ assert.deepEqual(
 	{
 		kind: "preserve-conflict",
 		reason: "missing-baseline",
-		winner: "disk",
-		preserveCrdt: true,
+		winner: "crdt",
+		preserveDisk: true,
 	},
-	"missing baseline preserves conflict",
+	"missing baseline preserves disk as conflict and keeps CRDT canonical",
 );
 
+console.log("\n--- Test 2: stale disk with newer remote does not demote CRDT ---");
+
+{
+	const staleDisk = "old local disk";
+	const newerRemoteCrdt = "newer remote server state";
+	let canonicalCrdt = newerRemoteCrdt;
+	let canonicalDisk = staleDisk;
+	const conflictArtifacts: Array<{ side: "disk" | "crdt"; content: string }> = [];
+
+	const decision = decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "stale-disk-hash",
+		crdtHash: "newer-remote-hash",
+	});
+
+	if (decision.kind === "preserve-conflict") {
+		const preservedContent = decision.preserveDisk ? canonicalDisk : canonicalCrdt;
+		const preservedSide = decision.preserveDisk ? "disk" : "crdt";
+		conflictArtifacts.push({ side: preservedSide, content: preservedContent });
+		if (decision.winner === "disk") {
+			canonicalCrdt = canonicalDisk;
+		} else {
+			canonicalDisk = canonicalCrdt;
+		}
+	}
+
+	assert.equal(canonicalCrdt, newerRemoteCrdt, "canonical CRDT remains the newer remote version");
+	assert.equal(canonicalDisk, newerRemoteCrdt, "canonical disk is updated from CRDT");
+	assert.deepEqual(
+		conflictArtifacts,
+		[{ side: "disk", content: staleDisk }],
+		"stale disk is preserved as the conflict artifact",
+	);
+}
+
 console.log("\n──────────────────────────────────────────────────");
-console.log("Results: 5 passed, 0 failed");
+console.log("Results: 8 passed, 0 failed");
 console.log("──────────────────────────────────────────────────");
