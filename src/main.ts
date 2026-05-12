@@ -68,6 +68,9 @@ import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
+import { FlightTraceController } from "./debug/flightTraceController";
+import { FLIGHT_KIND } from "./debug/flightEvents";
+import type { FlightMode } from "./debug/flightEvents";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -76,6 +79,7 @@ import {
 	type SyncStatus,
 } from "./status/statusBarController";
 import { formatUnknown, yTextToString } from "./utils/format";
+import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runVfsTortureTest } from "./dev/vfsTortureTest";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
@@ -109,6 +113,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
+	private flightTrace: FlightTraceController | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -176,6 +181,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
+			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
+			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 		});
 		return this.reconciliationController;
 	}
@@ -302,6 +309,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		this.setupTraceRuntime();
+		this.setupFlightTrace();
 		this.attachmentOrchestrator = new AttachmentOrchestrator({
 			app: this.app,
 			getVaultSync: () => this.vaultSync,
@@ -407,6 +415,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.vaultSync = new VaultSync(this.settings, {
 				traceContext: this.getTraceHttpContext(),
 				trace: (source, msg, details) => this.trace(source, msg, details),
+				onFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
+				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 			});
 
 			// 2. EditorBindingManager
@@ -443,6 +453,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.startMapObservers();
+			this.diskMirror.setFlightEventHandler((event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput));
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
 			this.attachmentOrchestrator?.start("startup", false);
@@ -477,6 +488,46 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				registerCleanup: (cleanup) => this.register(cleanup),
 			});
 			this.connectionController.start();
+
+			// Wire provider flight events
+			this.vaultSync.provider.on("status", (event: { status: string }) => {
+				if (event.status === "connected") {
+					this.recordFlightEvent({
+						priority: "important",
+						kind: "provider.connected",
+						severity: "info",
+						scope: "connection",
+						source: "connectionController",
+						layer: "provider",
+						connectionGeneration: this.vaultSync?.connectionGeneration,
+						data: { wsStatus: event.status },
+					});
+				} else if (event.status === "disconnected") {
+					this.recordFlightEvent({
+						priority: "important",
+						kind: "provider.disconnected",
+						severity: "info",
+						scope: "connection",
+						source: "connectionController",
+						layer: "provider",
+						connectionGeneration: this.vaultSync?.connectionGeneration,
+						data: { wsStatus: event.status },
+					});
+				}
+			});
+			this.vaultSync.provider.on("sync", (synced: boolean) => {
+				if (synced) {
+					this.recordFlightEvent({
+						priority: "important",
+						kind: "provider.sync.complete",
+						severity: "info",
+						scope: "connection",
+						source: "connectionController",
+						layer: "provider",
+						connectionGeneration: this.vaultSync?.connectionGeneration,
+					});
+				}
+			});
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
 				if (this.reconciliationController.isReconciled && this.editorBindings) {
@@ -520,6 +571,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
+				startQaFlightTrace: (mode?: string) => this.startQaFlightTrace(mode),
+				stopQaFlightTrace: () => this.stopQaFlightTrace(),
+				exportSafeFlightTrace: () => this.exportSafeFlightTrace(),
+				exportFullFlightTrace: () => this.exportFullFlightTrace(),
+				showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
+				clearFlightLogs: () => this.clearFlightLogs(),
 				});
 				this.commandsRegistered = true;
 			}
@@ -639,6 +696,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	// Vault event handlers
 	// -------------------------------------------------------------------
 
+	private newOpId(): string {
+		return `op-${randomBase64Url(10)}`;
+	}
+
 	private registerVaultEvents(): void {
 		// Layout change: clean up observers for closed files
 		this.registerEvent(
@@ -674,7 +735,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
-					this.reconciliationController.markMarkdownDirty(file, "modify");
+					const opId = this.newOpId();
+					this.recordFlightPathEvent({
+						priority: "important",
+						kind: FLIGHT_KIND.diskModifyObserved,
+						severity: "info",
+						scope: "file",
+						source: "vaultEvents",
+						layer: "disk",
+						opId,
+						path: file.path,
+						data: { size: file.stat?.size ?? null },
+					});
+					this.reconciliationController.markMarkdownDirty(file, "modify", opId);
 				} else {
 					const blobSync = this.getBlobSync();
 					if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
@@ -708,15 +781,39 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
+					const opId = this.newOpId();
 					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
 						this.log(`Suppressed delete event for "${file.path}"`);
+						this.recordFlightPathEvent({
+							priority: "important",
+							kind: FLIGHT_KIND.diskEventSuppressed,
+							severity: "debug",
+							scope: "file",
+							source: "vaultEvents",
+							layer: "policy",
+							opId,
+							path: file.path,
+							reason: "suppressed-remote-writeback",
+							decision: "suppress",
+						});
 						return;
 					}
+					this.recordFlightPathEvent({
+						priority: "critical",
+						kind: FLIGHT_KIND.diskDeleteObserved,
+						severity: "info",
+						scope: "file",
+						source: "vaultEvents",
+						layer: "disk",
+						opId,
+						path: file.path,
+					});
 					this.editorWorkspace?.onMarkdownDeleted(file.path);
 
 					this.vaultSync?.handleDelete(
 						file.path,
 						this.settings.deviceName,
+						opId,
 					);
 					this.log(`Delete: "${file.path}"`);
 					} else {
@@ -735,7 +832,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
-					this.reconciliationController.markMarkdownDirty(file, "create");
+					const createOpId = this.newOpId();
+					this.recordFlightPathEvent({
+						priority: "important",
+						kind: FLIGHT_KIND.diskCreateObserved,
+						severity: "info",
+						scope: "file",
+						source: "vaultEvents",
+						layer: "disk",
+						opId: createOpId,
+						path: file.path,
+						data: { size: file.stat?.size ?? null },
+					});
+					this.reconciliationController.markMarkdownDirty(file, "create", createOpId);
 				} else if (this.isBlobPathSyncable(file.path)) {
 					const blobSync = this.getBlobSync();
 					if (blobSync && !blobSync.isSuppressed(file.path)) {
@@ -1224,6 +1333,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.traceRuntime.start();
 	}
 
+	private setupFlightTrace(): void {
+		this.flightTrace = new FlightTraceController({
+			app: this.app,
+			getSettings: () => this.settings,
+			getPluginVersion: () => this.manifest.version,
+			getDocSchemaVersion: () => this.vaultSync?.storedSchemaVersion ?? null,
+			buildCheckpoint: () => this.buildFlightCheckpoint(),
+			registerCleanup: (cleanup) => this.register(cleanup),
+			log: (message) => this.log(message),
+		});
+		void this.refreshFlightTraceState("startup");
+	}
+
 	private getTraceHttpContext(): TraceHttpContext | undefined {
 		return this.traceRuntime?.httpContext;
 	}
@@ -1234,6 +1356,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		details?: TraceEventDetails,
 	): void {
 		this.traceRuntime?.record(source, msg, details);
+	}
+
+	private recordFlightEvent(event: import("./debug/flightEvents").FlightEventInput): void {
+		this.flightTrace?.record(event);
+	}
+
+	private recordFlightPathEvent(event: import("./debug/flightEvents").FlightPathEventInput): void {
+		void this.flightTrace?.recordPath(event);
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
@@ -1274,6 +1404,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			serverTrace: recentServerTrace,
 		};
+	}
+
+	private async buildFlightCheckpoint(): Promise<Record<string, unknown>> {
+		const vaultSync = this.vaultSync;
+		const blobSync = this.getBlobSync();
+		return {
+			connected: vaultSync?.connected ?? false,
+			providerSynced: vaultSync?.providerSynced ?? false,
+			serverReceipt: vaultSync?.serverAppliedLocalState ?? null,
+			diskFileCount: this.app.vault.getMarkdownFiles().length,
+			crdtPathCount: vaultSync?.getActiveMarkdownPaths().length ?? 0,
+			missingOnDisk: 0,
+			missingInCrdt: 0,
+			hashMismatches: 0,
+			pendingBlobUploads: blobSync?.pendingUploads ?? 0,
+			pendingBlobDownloads: blobSync?.pendingDownloads ?? 0,
+			reconcileInFlight: this.reconciliationController?.isReconcileInFlight ?? false,
+			safetyBrakeActive: this.reconciliationController?.getState().lastReconcileStats?.safetyBrakeTriggered ?? false,
+		};
+	}
+
+	private async refreshFlightTraceState(reason: string): Promise<void> {
+		if (!this.flightTrace) return;
+		await this.flightTrace.refreshFromSettings(reason);
 	}
 
 	private async collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>> {
@@ -1367,6 +1521,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
+		void this.flightTrace?.stop();
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
 		void this.teardownSync();
@@ -1432,6 +1587,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
 		this.applyCursorVisibility();
+		void this.refreshFlightTraceState(reason);
 		this.trace("trace", "runtime-settings-applied", {
 			reason,
 			hostConfigured: !!this.runtimeConfig.host,
@@ -1725,6 +1881,128 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			eventRing: this.eventRing,
 			log: (msg) => this.log(msg),
+		});
+	}
+
+	private async startQaFlightTrace(mode?: string): Promise<void> {
+		const resolved = (mode ?? this.settings.qaTraceMode) as FlightMode;
+		await this.flightTrace?.start(resolved, this.settings.qaTraceSecret || null, {
+			manualStart: true,
+		});
+		new Notice(`QA flight trace started (mode: ${resolved}).`, 4000);
+	}
+
+	private async stopQaFlightTrace(): Promise<void> {
+		await this.flightTrace?.stop();
+		new Notice("QA flight trace stopped.", 4000);
+	}
+
+	private async exportSafeFlightTrace(): Promise<void> {
+		await this.exportFlightTrace("safe");
+	}
+
+	private async exportFullFlightTrace(): Promise<void> {
+		await new Promise<void>((resolve) => {
+			new ConfirmModal(
+				this.app,
+				"Export flight trace with filenames?",
+				"This export includes vault file names. It never includes note contents or sync tokens. Review before sharing.",
+				async () => {
+					try {
+						await this.exportFlightTrace("full");
+					} catch (err) {
+						this.log(`flight trace export failed: ${String(err)}`);
+						new Notice("Flight trace export failed. Check console.", 10000);
+					} finally {
+						resolve();
+					}
+				},
+				"Export with filenames",
+				"Cancel",
+				() => resolve(),
+			).open();
+		});
+	}
+
+	private async exportFlightTrace(requestedPrivacy: "safe" | "full"): Promise<void> {
+		const controller = this.flightTrace;
+		if (!controller?.isEnabled) {
+			new Notice("QA flight trace is not active. Start it first.", 6000);
+			return;
+		}
+		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
+		if (!diagDir) {
+			new Notice("Diagnostics directory unavailable.", 6000);
+			return;
+		}
+		new Notice("Exporting QA flight trace…");
+		const result = await controller.exportTrace({ requestedPrivacy, diagDir });
+		if (!result.ok) {
+			switch (result.reason) {
+				case "trace-not-active":
+					new Notice("QA flight trace is not active.", 6000);
+					break;
+				case "trace-unsafe-for-safe-export": {
+					const mode = controller.currentRecorder?.mode ?? "unknown";
+					new Notice(
+						`This trace was recorded in "${mode}" mode and includes filenames. ` +
+						`Export with filenames instead, or start a new safe trace.`,
+						10000,
+					);
+					break;
+				}
+				case "trace-not-exportable":
+					new Notice(
+						"Local-private traces cannot be exported. Start a new trace in safe or qa-safe mode.",
+						10000,
+					);
+					break;
+				case "flush-failed":
+					new Notice("Failed to flush trace buffer before export. Check console.", 10000);
+					break;
+				default:
+					new Notice("Flight trace export failed. Check console.", 10000);
+					break;
+			}
+			this.log(`flight trace export failed: ${result.reason}`);
+			return;
+		}
+		const outName = result.path.split("/").pop() ?? result.path;
+		new Notice(`Flight trace exported: ${outName}`, 8000);
+		this.log(`Flight trace exported (${requestedPrivacy}) to: ${result.path}`);
+	}
+
+	private async clearFlightLogs(): Promise<void> {
+		await this.flightTrace?.clearLogs();
+	}
+
+	private showTimelineForCurrentFile(): void {
+		const controller = this.flightTrace;
+		if (!controller?.isEnabled) {
+			new Notice("QA flight trace is not active.", 5000);
+			return;
+		}
+		const file = this.app.workspace.getActiveFile();
+		if (!file) {
+			new Notice("No active file.", 4000);
+			return;
+		}
+		void controller.getPathId(file.path).then(({ pathId }) => {
+			const recorder = controller.currentRecorder;
+			if (!recorder) {
+				new Notice("Recorder not available.", 4000);
+				return;
+			}
+			const events = recorder.getRecentEventsForPath(pathId, 100);
+			if (events.length === 0) {
+				new Notice(`No flight trace events for this file yet (${pathId}).`, 6000);
+				console.debug(`[yaos] No flight events for pathId=${pathId} (${file.path})`);
+				return;
+			}
+			const lines = events.map((e) => `${new Date(e.ts).toISOString()} [${e.severity}] ${e.kind}${e.reason ? ` reason=${e.reason}` : ""}${e.decision ? ` decision=${e.decision}` : ""}`);
+			const summary = lines.join("\n");
+			new Notice(`Timeline for ${file.path} (${events.length} events) printed to console.`, 6000);
+			console.debug(`[yaos] Flight timeline for ${file.path} (pathId=${pathId}):\n${summary}`);
 		});
 	}
 

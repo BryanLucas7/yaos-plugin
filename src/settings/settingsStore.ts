@@ -49,6 +49,12 @@ export interface VaultSyncSettings {
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
+	/** Enable QA flight recorder tracing. */
+	qaTraceEnabled: boolean;
+	/** QA trace mode: safe/qa-safe/full/local-private. */
+	qaTraceMode: "safe" | "qa-safe" | "full" | "local-private";
+	/** Optional shared secret for QA-safe multi-device trace. */
+	qaTraceSecret?: string;
 	/** Optional repo URL used to deep-link provider-native update pages. */
 	updateRepoUrl: string;
 	/** Optional default branch for provider-native update links. */
@@ -71,6 +77,9 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
 	showRemoteCursors: true,
+	qaTraceEnabled: false,
+	qaTraceMode: "safe",
+	qaTraceSecret: "",
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
 };

@@ -12,6 +12,12 @@ export interface CommandsRuntimeHost {
 	getFilesNeedingAttentionText(): string;
 	getUntrackedFileCount(): number;
 	isDebugEnabled(): boolean;
+	startQaFlightTrace(mode?: string): Promise<void>;
+	stopQaFlightTrace(): Promise<void>;
+	exportSafeFlightTrace(): Promise<void>;
+	exportFullFlightTrace(): Promise<void>;
+	showTimelineForCurrentFile(): void;
+	clearFlightLogs(): Promise<void>;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
@@ -33,6 +39,56 @@ export function registerCommands(
 				host.getConnectionController()?.reconnect("manual-command");
 				new Notice("Reconnecting...");
 			}
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-start",
+		name: "Start QA flight trace",
+		callback: () => {
+			void host.startQaFlightTrace();
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-stop",
+		name: "Stop QA flight trace",
+		callback: () => {
+			void host.stopQaFlightTrace();
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-export-safe",
+		name: "Export safe QA flight trace",
+		callback: () => {
+			void host.exportSafeFlightTrace();
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-export-full",
+		name: "Export QA flight trace with filenames",
+		callback: () => {
+			void host.exportFullFlightTrace();
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-timeline-current-file",
+		name: "Show timeline for current file",
+		callback: () => {
+			host.showTimelineForCurrentFile();
+		},
+	});
+
+	registrar.addCommand({
+		id: "qa-flight-trace-clear-logs",
+		name: "Clear flight logs",
+		callback: () => {
+			void host.clearFlightLogs().then(() => {
+				new Notice("Flight logs cleared.", 4000);
+			});
 		},
 	});
 
