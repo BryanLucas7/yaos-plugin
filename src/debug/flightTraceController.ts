@@ -67,7 +67,7 @@ export class FlightTraceController {
 	};
 
 	/** Pending recordPath() promises — flush() drains these before reading. */
-	private pendingPathPromises: Promise<void>[] = [];
+	private pendingPathPromises = new Set<Promise<void>>();
 
 	constructor(private readonly deps: FlightTraceDeps) {}
 
@@ -199,13 +199,8 @@ export class FlightTraceController {
 	 */
 	recordPath(event: FlightPathEventInput): Promise<void> {
 		const p = this.resolveAndRecord(event);
-		this.pendingPathPromises.push(p);
-		// Prune resolved promises periodically to bound memory.
-		if (this.pendingPathPromises.length > 200) {
-			this.pendingPathPromises = this.pendingPathPromises.filter(
-				(pp) => !isResolved(pp),
-			);
-		}
+		this.pendingPathPromises.add(p);
+		void p.finally(() => this.pendingPathPromises.delete(p));
 		return p;
 	}
 
@@ -219,9 +214,9 @@ export class FlightTraceController {
 	 * Must be called before reading the session file for export.
 	 */
 	async flush(): Promise<void> {
-		if (this.pendingPathPromises.length > 0) {
-			await Promise.allSettled(this.pendingPathPromises);
-			this.pendingPathPromises = [];
+		if (this.pendingPathPromises.size > 0) {
+			await Promise.allSettled([...this.pendingPathPromises]);
+			this.pendingPathPromises.clear();
 		}
 		await this.recorder?.flushNow();
 		// Drain the write chain too.
@@ -269,15 +264,14 @@ export class FlightTraceController {
 		if (!recorder.exportable) {
 			return { ok: false, reason: "trace-not-exportable" };
 		}
-		if (options.requestedPrivacy === "safe" && !recorder.safeToShare) {
-			return { ok: false, reason: "trace-unsafe-for-safe-export" };
-		}
-
 		// Flush before reading.
 		try {
 			await this.flush();
 		} catch {
 			return { ok: false, reason: "flush-failed" };
+		}
+		if (options.requestedPrivacy === "safe" && !recorder.safeToShare) {
+			return { ok: false, reason: "trace-unsafe-for-safe-export" };
 		}
 
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -455,16 +449,3 @@ async function deleteDirectoryRecursive(app: App, dir: string): Promise<void> {
 	} catch { /* skip */ }
 }
 
-/**
- * Synchronously check whether a promise has already settled.
- * Uses a lightweight race with an immediately-resolved promise.
- * Returns false if the promise is still pending (the race resolves to "pending").
- */
-function isResolved(p: Promise<void>): boolean {
-	let settled = false;
-	// eslint-disable-next-line @typescript-eslint/no-floating-promises
-	Promise.race([p, Promise.resolve("pending")]).then((v) => {
-		if (v !== "pending") settled = true;
-	});
-	return settled;
-}

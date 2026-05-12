@@ -1,5 +1,5 @@
 export const FLIGHT_EVENT_SCHEMA_VERSION = 1;
-export const FLIGHT_TAXONOMY_VERSION = 2; // bumped: renamed disk event kinds + new Phase A events
+export const FLIGHT_TAXONOMY_VERSION = 3; // bumped: recovery/tombstone events + reconcile.file.decision coverage
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -92,13 +92,21 @@ export const FLIGHT_KIND = {
 	reconcileWritebackSkipped: "reconcile.writeback.skipped",
 	reconcileComplete: "reconcile.complete",
 
-	// Recovery (Phase B — stubs included for type completeness)
+	// Recovery — all now emitted from reconciliationController
 	recoveryDecision: "recovery.decision",
 	recoveryApplyStart: "recovery.apply.start",
 	recoveryApplyDone: "recovery.apply.done",
 	recoveryPostconditionFailed: "recovery.postcondition.failed",
 	recoveryLoopDetected: "recovery.loop.detected",
 	recoveryQuarantined: "recovery.quarantined",
+
+	// Tombstone / remote delete lifecycle
+	/** Emitted by diskMirror: CRDT remote delete observed, deciding action. */
+	deleteRemoteObserved: "delete.remote.observed",
+	/** Emitted by diskMirror: disk file removed because tombstone applied. */
+	deleteDiskApplied: "delete.disk.applied",
+	/** Emitted by diskMirror: file preserved instead of deleted (dirty local copy). */
+	deletePreserved: "delete.preserved",
 } as const;
 
 export type FlightKind = typeof FLIGHT_KIND[keyof typeof FLIGHT_KIND];
