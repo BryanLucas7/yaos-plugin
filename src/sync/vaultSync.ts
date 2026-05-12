@@ -923,12 +923,15 @@ export class VaultSync {
 			}
 		}
 
+		const tombstonedPaths: string[] = [];
+
 		// Disk files not in CRDT
 		for (const path of diskPresentPaths) {
 			if (crdtPaths.has(path)) continue;
 
 			if (this._deletedPathIndex.has(path)) {
 				this.log(`reconcile: "${path}" was tombstoned, skipping`);
+				tombstonedPaths.push(path);
 				skipped++;
 				continue;
 			}
@@ -961,7 +964,7 @@ export class VaultSync {
 			`${skipped} tombstoned`,
 		);
 
-		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, skipped };
+		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, tombstonedPaths, skipped };
 	}
 
 	// -------------------------------------------------------------------
@@ -1492,6 +1495,8 @@ export class VaultSync {
 	get serverAppliedLocalState(): boolean | null { return this.serverAckTracker.serverAppliedLocalState; }
 	get lastServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastServerReceiptEchoAt; }
 	get lastKnownServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastKnownServerReceiptEchoAt; }
+	get serverReceiptCandidateId(): string | null { return this.serverAckTracker.lastCandidateId; }
+	get lastConfirmedReceiptCandidateId(): string | null { return this.serverAckTracker.lastConfirmedCandidateId; }
 	get candidatePersistenceHealthy(): boolean | null {
 		if (!this._serverAckScope && !this._serverAckPersistenceUnavailable) return null;
 		if (this._serverAckPersistenceUnavailable) return false;
@@ -1784,5 +1789,7 @@ export interface ReconcileResult {
 	updatedOnDisk: string[];
 	seededToCrdt: string[];
 	untracked: string[];
+	/** Disk paths that were tombstoned in CRDT and skipped. */
+	tombstonedPaths: string[];
 	skipped: number;
 }
