@@ -114,6 +114,10 @@ function contentFingerprint(text: string): string {
 	return h.toString(16).padStart(8, "0") + ":" + text.length;
 }
 
+function recoverySignature(reason: string, previousContent: string, nextContent: string): string {
+	return `${reason}\x00${contentFingerprint(previousContent)}\x00${contentFingerprint(nextContent)}`;
+}
+
 function tracePathList(prefix: string, paths: string[]): Record<string, unknown> {
 	return {
 		[`${prefix}PathCount`]: paths.length,
@@ -124,6 +128,7 @@ function tracePathList(prefix: string, paths: string[]): Record<string, unknown>
 
 function traceRecoveryPostcondition(
 	trace: ReconciliationControllerDeps["trace"],
+	recordFlightPathEvent: ReconciliationControllerDeps["recordFlightPathEvent"],
 	path: string,
 	reason: string,
 	origin: string,
@@ -160,6 +165,23 @@ function traceRecoveryPostcondition(
 			origin,
 			expectedLength,
 			actualLength: result.finalLength,
+		});
+		// Also emit via typed FlightSink so the analyzer can detect it
+		recordFlightPathEvent?.({
+			priority: "critical",
+			kind: FLIGHT_KIND.recoveryPostconditionFailed,
+			severity: "error",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason,
+				origin,
+				expectedLength,
+				actualLength: result.finalLength,
+				forceReplaceApplied: result.forceReplaceApplied,
+			},
 		});
 	}
 }
@@ -475,9 +497,72 @@ export class ReconciliationController {
 				});
 			}
 
+			// Emit reconcile.file.decision for ALL outcomes so the analyzer sees every path.
 			for (const path of result.createdOnDisk) {
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.reconcileFileDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "write-crdt-to-disk",
+						reason: "crdt-file-missing-on-disk",
+						conflictRisk: "none",
+					},
+				});
 				await diskMirror.flushWrite(path);
 				flushedCreates++;
+			}
+			for (const path of result.seededToCrdt) {
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.reconcileFileDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "seed-disk-to-crdt",
+						reason: "disk-file-not-in-crdt",
+						conflictRisk: "none",
+					},
+				});
+			}
+			for (const path of result.tombstonedPaths ?? []) {
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.reconcileFileDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "skip-tombstoned",
+						reason: "path-tombstoned-in-crdt",
+						conflictRisk: "none",
+					},
+				});
+			}
+			for (const path of result.untracked) {
+				this.deps.recordFlightPathEvent?.({
+					priority: "verbose",
+					kind: FLIGHT_KIND.reconcileFileDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "skip-untracked",
+						reason: "conservative-mode-no-auto-seed",
+						conflictRisk: "none",
+					},
+				});
 			}
 			if (!safetyBrakeTriggered) {
 				const updatesToFlush: string[] = [];
@@ -499,40 +584,59 @@ export class ReconciliationController {
 							diskHash: contentFingerprint(diskContent),
 							crdtHash: contentFingerprint(crdtContent),
 						});
-						this.deps.recordFlightPathEvent?.({
-							priority: decision.kind === "preserve-conflict" ? "critical" : "important",
-							kind: FLIGHT_KIND.reconcileFileDecision,
-							severity: "info",
-							scope: "file",
-							source: "reconciliationController",
-							layer: "reconcile",
-							path,
-							data: {
-								decision: decision.kind,
-								reason: "reason" in decision ? decision.reason : null,
-								winner: "winner" in decision ? decision.winner : null,
-								diskLength: diskContent.length,
-								crdtLength: crdtContent.length,
-							},
-						});
+					this.deps.recordFlightPathEvent?.({
+						priority: decision.kind === "preserve-conflict" ? "critical" : "important",
+						kind: FLIGHT_KIND.reconcileFileDecision,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "reconcile",
+						path,
+						data: {
+							decision: decision.kind,
+							reason: "reason" in decision ? decision.reason : null,
+							winner: "winner" in decision ? decision.winner : null,
+							diskLength: diskContent.length,
+							crdtLength: crdtContent.length,
+							diskHash: contentFingerprint(diskContent),
+							crdtHash: contentFingerprint(crdtContent),
+							// diskChangedSinceBaseline: always unknown here (baseline=null)
+							diskChangedSinceBaseline: null,
+							conflictRisk:
+								decision.kind === "preserve-conflict"
+									? "reason" in decision && decision.reason === "both-changed"
+										? "high"
+										: "ambiguous"
+									: "none",
+						},
+					});
 						if (decision.kind === "preserve-conflict") {
 							try {
+								const preservedContent = decision.preserveDisk ? diskContent : crdtContent;
+								const preservedSide = decision.preserveDisk ? "disk" : "crdt";
 								const conflictPath = await this.createMarkdownConflictArtifact(
 									path,
-									crdtContent,
+									preservedContent,
 									`closed-file-${decision.reason}`,
-									"crdt",
+									preservedSide,
 								);
-								forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+								if (decision.winner === "disk") {
+									forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+								} else {
+									updatesToFlush.push(path);
+								}
 								this.deps.trace("conflict", "closed-file-conflict-preserved", {
 									path,
 									conflictPath,
 									reason: decision.reason,
 									winner: decision.winner,
+									preservedSide,
 									diskLength: diskContent.length,
 									crdtLength: crdtContent.length,
 								});
-								flushedUpdates++;
+								if (decision.winner === "disk") {
+									flushedUpdates++;
+								}
 								continue;
 							} catch (err) {
 								diskMirror.recordPreservedUnresolved(
@@ -948,7 +1052,9 @@ export class ReconciliationController {
 				this.deps.log(
 					`syncFileFromDisk: applying diff to "${file.path}" (${crdtContent.length} -> ${content.length} chars)`,
 				);
-				applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
+				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
+					applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
+				});
 				// Emit crdt.file.updated with the same opId that triggered this disk→CRDT write.
 				const fileId = vaultSync.getFileIdForText(existingText) ?? undefined;
 				this.deps.recordFlightPathEvent?.({
@@ -966,11 +1072,6 @@ export class ReconciliationController {
 						...(coalescedOpIds && coalescedOpIds.length > 1 ? { coalescedOpIds } : {}),
 					},
 				});
-				// Record active opId for server receipt causal linkage
-				const vaultSyncRef = this.deps.getVaultSync();
-				if (vaultSyncRef) {
-					vaultSyncRef.serverAckTracker.setActiveOpId(opId);
-				}
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -981,23 +1082,18 @@ export class ReconciliationController {
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
-				const ensureResult = vaultSync.ensureFile(
-					file.path,
-					content,
-					this.deps.getSettings().deviceName,
-					{
-						reviveTombstone: sourceReason === "create",
-						reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
-						opId,
-					},
-				);
-				// Record active opId for server receipt causal linkage
-				if (ensureResult) {
-					const vaultSyncRef2 = this.deps.getVaultSync();
-					if (vaultSyncRef2) {
-						vaultSyncRef2.serverAckTracker.setActiveOpId(opId);
-					}
-				}
+				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
+					vaultSync.ensureFile(
+						file.path,
+						content,
+						this.deps.getSettings().deviceName,
+						{
+							reviveTombstone: sourceReason === "create",
+							reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+							opId,
+						},
+					);
+				});
 			}
 
 			await this.updateDiskIndexForPath(file.path);
@@ -1119,6 +1215,23 @@ export class ReconciliationController {
 					diskLength: content.length,
 					crdtLength: crdtContent?.length ?? null,
 				});
+				// recovery.decision: emit before quarantine check so even quarantined cases are visible
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-local-only-divergence",
+						signature: recoverySignature("bound-file-local-only-divergence", crdtContent ?? "", content),
+						action: "apply-diff",
+						diskLength: content.length,
+						crdtLength: crdtContent?.length ?? null,
+					},
+				});
 				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-local-only-divergence",
@@ -1127,20 +1240,37 @@ export class ReconciliationController {
 				)) {
 					return true;
 				}
+				// recovery.apply.start: before the actual diff application
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryApplyStart,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-local-only-divergence",
+						origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						diskLength: content.length,
+						crdtLength: crdtContent?.length ?? null,
+					},
+				});
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
 					content,
 					ORIGIN_DISK_SYNC_RECOVER_BOUND,
 				);
-				traceRecoveryPostcondition(
-					this.deps.trace,
-					file.path,
-					"bound-file-local-only-divergence",
-					ORIGIN_DISK_SYNC_RECOVER_BOUND,
-					content.length,
-					recoveryResult,
-				);
+			traceRecoveryPostcondition(
+				this.deps.trace,
+				this.deps.recordFlightPathEvent,
+				file.path,
+				"bound-file-local-only-divergence",
+				ORIGIN_DISK_SYNC_RECOVER_BOUND,
+				content.length,
+				recoveryResult,
+			);
 				this.deps.recordFlightPathEvent?.({
 					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
 					kind: FLIGHT_KIND.recoveryApplyDone,
@@ -1172,6 +1302,21 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound, missing CRDT text: seeding ${content.length} chars)`,
 				);
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-local-only-seed",
+						signature: recoverySignature("bound-file-local-only-seed", "", content),
+						action: "seed-crdt-from-disk",
+						diskLength: content.length,
+					},
+				});
 				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-local-only-seed",
@@ -1180,6 +1325,16 @@ export class ReconciliationController {
 				)) {
 					return true;
 				}
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryApplyStart,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: { reason: "bound-file-local-only-seed", action: "seed-crdt-from-disk", diskLength: content.length },
+				});
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -1249,6 +1404,22 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
 				);
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-open-idle-disk-recovery",
+						signature: recoverySignature("bound-file-open-idle-disk-recovery", crdtContent ?? "", content),
+						action: "apply-diff",
+						diskLength: content.length,
+						crdtLength: crdtContent?.length ?? null,
+					},
+				});
 				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-open-idle-disk-recovery",
@@ -1257,20 +1428,36 @@ export class ReconciliationController {
 				)) {
 					return true;
 				}
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryApplyStart,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-open-idle-disk-recovery",
+						origin: ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+						diskLength: content.length,
+						crdtLength: crdtContent?.length ?? null,
+					},
+				});
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
 					content,
 					ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 				);
-				traceRecoveryPostcondition(
-					this.deps.trace,
-					file.path,
-					"bound-file-open-idle-disk-recovery",
-					ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-					content.length,
-					recoveryResult,
-				);
+			traceRecoveryPostcondition(
+				this.deps.trace,
+				this.deps.recordFlightPathEvent,
+				file.path,
+				"bound-file-open-idle-disk-recovery",
+				ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+				content.length,
+				recoveryResult,
+			);
 				this.deps.recordFlightPathEvent?.({
 					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
 					kind: FLIGHT_KIND.recoveryApplyDone,
@@ -1302,6 +1489,21 @@ export class ReconciliationController {
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
 				);
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: FLIGHT_KIND.recoveryDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "bound-file-open-idle-seed",
+						signature: recoverySignature("bound-file-open-idle-seed", "", content),
+						action: "seed-crdt-from-disk",
+						diskLength: content.length,
+					},
+				});
 				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-open-idle-seed",
@@ -1472,7 +1674,7 @@ export class ReconciliationController {
 		previousContent: string,
 		nextContent: string,
 	): boolean {
-		const fingerprint = `${reason}\x00${contentFingerprint(previousContent)}\x00${contentFingerprint(nextContent)}`;
+		const fingerprint = recoverySignature(reason, previousContent, nextContent);
 		const now = Date.now();
 		const previous = this.recoveryFingerprints.get(path);
 		// Same fingerprint within the TTL window → increment.
@@ -1502,6 +1704,7 @@ export class ReconciliationController {
 			path,
 			reason,
 			repeatCount: count,
+			signature: fingerprint,
 			previousLength: previousContent.length,
 			nextLength: nextContent.length,
 			previousHashPrefix: contentFingerprint(previousContent),
@@ -1513,6 +1716,22 @@ export class ReconciliationController {
 		);
 		this.deps.recordFlightPathEvent?.({
 			priority: "critical",
+			kind: FLIGHT_KIND.recoveryQuarantined,
+			severity: "warn",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				repeatCount: count,
+				signature: fingerprint,
+				reason,
+				previousLength: previousContent.length,
+				nextLength: nextContent.length,
+			},
+		});
+		this.deps.recordFlightPathEvent?.({
+			priority: "critical",
 			kind: FLIGHT_KIND.recoveryLoopDetected,
 			severity: "warn",
 			scope: "file",
@@ -1521,6 +1740,7 @@ export class ReconciliationController {
 			path,
 			data: {
 				repeatCount: count,
+				signature: fingerprint,
 				reason,
 			},
 		});
