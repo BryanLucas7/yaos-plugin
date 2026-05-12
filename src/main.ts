@@ -83,6 +83,7 @@ import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runVfsTortureTest } from "./dev/vfsTortureTest";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
+import { buildQaDebugApi } from "./qaDebugApi";
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -392,7 +393,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			} catch { /* invalid URL, will fail at connect */ }
 		}
 
-		void this.initSync();
+		void this.initSync().then(() => this.mountQaDebugApi());
 		finishOnload("sync-started");
 	}
 
@@ -2004,6 +2005,49 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			new Notice(`Timeline for ${file.path} (${events.length} events) printed to console.`, 6000);
 			console.debug(`[yaos] Flight timeline for ${file.path} (pathId=${pathId}):\n${summary}`);
 		});
+	}
+
+	// -------------------------------------------------------------------
+	// QA debug API surface
+	// -------------------------------------------------------------------
+
+	private mountQaDebugApi(): void {
+		if (!this.settings.qaDebugMode) return;
+		const api = buildQaDebugApi({
+			app: this.app,
+			getVaultSync: () => this.vaultSync,
+			getReconciliationController: () => this.reconciliationController,
+			getConnectionController: () => this.connectionController,
+			getFlightTraceController: () => this.flightTrace,
+			getDiagnosticsDir: () => this.diagnosticsService?.ensureDiagnosticsDir(),
+			sha256Hex: (text) => this.sha256Hex(text),
+			startQaFlightTrace: (mode) => this.startQaFlightTrace(mode),
+			stopQaFlightTrace: () => this.stopQaFlightTrace(),
+			exportFlightTrace: (privacy) => this.exportFlightTraceForApi(privacy),
+			runReconciliation: () => this.runReconciliation(this.vaultSync?.getSafeReconcileMode() ?? "conservative"),
+			disconnectProvider: (reason) => {
+				this.log(`QA: disconnectProvider(${reason ?? ""})`);
+				this.vaultSync?.provider.disconnect();
+			},
+			connectProvider: (reason) => {
+				this.log(`QA: connectProvider(${reason ?? ""})`);
+				void this.vaultSync?.provider.connect().catch((e) =>
+					this.log(`QA connectProvider error: ${String(e)}`),
+				);
+			},
+		});
+		(window as unknown as Record<string, unknown>).__YAOS_DEBUG__ = api;
+		this.log("QA debug API mounted at window.__YAOS_DEBUG__");
+		new Notice("YAOS: QA debug mode active. window.__YAOS_DEBUG__ is available.", 6000);
+	}
+
+	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {
+		const controller = this.flightTrace;
+		if (!controller?.isEnabled) return null;
+		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
+		if (!diagDir) return null;
+		const result = await controller.exportTrace({ requestedPrivacy: privacy, diagDir });
+		return result.ok ? result.path : null;
 	}
 
 	private log(msg: string): void {

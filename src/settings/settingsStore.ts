@@ -59,6 +59,8 @@ export interface VaultSyncSettings {
 	updateRepoUrl: string;
 	/** Optional default branch for provider-native update links. */
 	updateRepoBranch: string;
+	/** Expose window.__YAOS_DEBUG__ programmatic control surface for QA. Never ship enabled. */
+	qaDebugMode: boolean;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -82,6 +84,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	qaTraceSecret: "",
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
+	qaDebugMode: false,
 };
 
 export interface SettingsPersistence {
