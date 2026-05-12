@@ -5,8 +5,9 @@ export type ClosedFileConflictDecision =
 	| {
 		kind: "preserve-conflict";
 		reason: "both-changed" | "missing-baseline";
-		winner: "disk";
-		preserveCrdt: true;
+		winner: "disk" | "crdt";
+		preserveCrdt?: true;
+		preserveDisk?: true;
 	};
 
 export interface ClosedFileConflictInput {
@@ -24,8 +25,8 @@ export function decideClosedFileConflict(
 		return {
 			kind: "preserve-conflict",
 			reason: "missing-baseline",
-			winner: "disk",
-			preserveCrdt: true,
+			winner: "crdt",
+			preserveDisk: true,
 		};
 	}
 	if (diskHash === baselineHash && crdtHash !== baselineHash) {
