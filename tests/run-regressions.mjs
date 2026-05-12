@@ -79,6 +79,9 @@ const suites = [
 	[JITI, "tests/server-ack-tracker.ts"],
 	[JITI, "tests/indexed-db-candidate-store.ts"],
 	[JITI, "tests/tombstone-revive.ts"],
+	[JITI, "tests/flight-recorder.ts"],
+	[JITI, "tests/flight-trace-privacy.ts"],
+	[JITI, "tests/flight-lifecycle-local-disk-to-server-receipt.ts"],
 ];
 
 let totalPassed = 0;
