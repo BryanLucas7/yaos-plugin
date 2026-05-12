@@ -749,6 +749,33 @@ console.log("\n--- Test 24: clearLocalReceiptState resets failure count ---");
 	assert(tracker.candidatePersistenceFailureCount === 0, "clear resets failure count to 0");
 }
 
+// ── Test 25: active op id is captured during the Y.Doc update ─────────────────
+
+console.log("\n--- Test 25: withActiveOpId attributes candidate capture to the active op ---");
+{
+	const doc = makeDoc(125);
+	const provider = {};
+	const flightEvents: Record<string, unknown>[] = [];
+	const tracker = new ServerAckTracker(undefined, (event) => {
+		flightEvents.push(event);
+	});
+	attachTracker(tracker, doc, provider, null);
+	await tracker.onStartup(new InMemoryCandidateStore(), BASE_SCOPE);
+
+	tracker.withActiveOpId("op-active-125", () => {
+		doc.getText("t").insert(0, "attributed edit");
+	});
+
+	const candidate = flightEvents.find((event) => event.kind === "server.receipt.candidate_captured");
+	const data = candidate?.data as Record<string, unknown> | undefined;
+	assert(data?.causedByOpId === "op-active-125", "candidate capture includes active op id");
+
+	doc.getText("t").insert(0, " unattributed");
+	const candidates = flightEvents.filter((event) => event.kind === "server.receipt.candidate_captured");
+	const latestData = candidates.at(-1)?.data as Record<string, unknown> | undefined;
+	assert(latestData?.causedByOpId === null, "active op id is restored after scoped mutation");
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 console.log(`\n${"─".repeat(55)}`);

@@ -41,6 +41,7 @@ export class ServerAckTracker {
 	private _candidatePersistenceFailureCount = 0;
 
 	private _lastCandidateId: string | null = null;
+	private _lastConfirmedCandidateId: string | null = null;
 	private _lastCandidateSvHash: string | null = null;
 	private _lastCausedByOpId: string | null = null;
 
@@ -57,11 +58,21 @@ export class ServerAckTracker {
 	}
 
 	/**
-	 * Record the opId of the most recent CRDT mutation that will trigger a candidate capture.
-	 * Called by the reconciliation controller after syncFileFromDisk completes.
+	 * Record the opId of the CRDT mutation that will trigger a candidate capture.
+	 * Prefer withActiveOpId() so Y.Doc update observers see the op during the transaction.
 	 */
 	setActiveOpId(opId: string | undefined): void {
 		this._lastCausedByOpId = opId ?? null;
+	}
+
+	withActiveOpId<T>(opId: string | undefined, work: () => T): T {
+		const previous = this._lastCausedByOpId;
+		this._lastCausedByOpId = opId ?? null;
+		try {
+			return work();
+		} finally {
+			this._lastCausedByOpId = previous;
+		}
 	}
 
 	/**
@@ -164,6 +175,7 @@ export class ServerAckTracker {
 			this._serverAppliedLocalState = confirmed;
 			if (confirmed) {
 				this._lastKnownServerReceiptEchoAt = this._lastServerReceiptEchoAt;
+				this._lastConfirmedCandidateId = this._lastCandidateId;
 			}
 		}
 		this.trace?.("receipt", "receipt-server-echo", {
@@ -207,6 +219,8 @@ export class ServerAckTracker {
 		);
 	}
 	get candidateCapturedAt(): number | null { return this._candidateCapturedAt; }
+	get lastCandidateId(): string | null { return this._lastCandidateId; }
+	get lastConfirmedCandidateId(): string | null { return this._lastConfirmedCandidateId; }
 
 	getState(): ServerAckState {
 		return {
