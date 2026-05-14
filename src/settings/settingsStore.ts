@@ -64,7 +64,7 @@ export interface VaultSyncSettings {
 	configProfileMobilePluginIds: string[];
 	/** True after YAOS has made its one-time platform-specific profile mode choice. */
 	configProfileAutoModeInitialized: boolean;
-	/** Automatically apply the first staged PC profile package on a new subscriber. */
+	/** Automatically apply the first staged PC profile package on a new subscriber. Disabled by default for mobile safety. */
 	configProfileInitialAutoApply: boolean;
 	/** Require a command/button after the first profile package has been applied. */
 	configProfileManualApplyAfterInitial: boolean;
@@ -109,7 +109,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	configProfileAllowlistPreset: "mobile",
 	configProfileMobilePluginIds: [...DEFAULT_MOBILE_PROFILE_PLUGIN_IDS],
 	configProfileAutoModeInitialized: false,
-	configProfileInitialAutoApply: true,
+	configProfileInitialAutoApply: false,
 	configProfileManualApplyAfterInitial: true,
 	configProfileLastSeenGeneration: "",
 	configProfileLastAppliedGeneration: "",

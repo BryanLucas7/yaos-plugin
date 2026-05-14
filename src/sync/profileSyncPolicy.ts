@@ -76,12 +76,8 @@ export function isConfigProfilePathSyncable(
 	configDir: string,
 	policy?: ConfigProfileSyncPolicy,
 ): boolean {
-	if (!policy?.enabled) return false;
-	if (policy.mode === "off") return false;
-	if (policy.preset !== "mobile") return false;
-	if (!isMobileConfigProfileAllowlisted(path, configDir)) return false;
-	if (policy.direction === "download") {
-		return policy.mode === "publish" || policy.mode === "subscribe";
-	}
-	return policy.mode === "publish";
+	void path;
+	void configDir;
+	void policy;
+	return false;
 }

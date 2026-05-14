@@ -1609,6 +1609,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.persistedState = persistedState;
 		this.settings = settings;
 		const autoModeApplied = this.applyInitialMobileProfileMode();
+		const mobileSafetyApplied = this.applyMobileProfileSafetyDefaults();
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -1639,7 +1640,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated || autoModeApplied) {
+		if (migrated || autoModeApplied || mobileSafetyApplied) {
 			await this.persistPluginState();
 		}
 	}
@@ -1649,9 +1650,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
 		this.settings.configProfileSyncEnabled = true;
 		this.settings.configProfileMode = "subscribe";
-		this.settings.configProfileInitialAutoApply = true;
+		this.settings.configProfileInitialAutoApply = false;
 		this.settings.configProfileManualApplyAfterInitial = true;
 		this.settings.configProfileAutoModeInitialized = true;
+		return true;
+	}
+
+	private applyMobileProfileSafetyDefaults(): boolean {
+		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
+		if (!this.settings.configProfileInitialAutoApply) return false;
+		this.settings.configProfileInitialAutoApply = false;
 		return true;
 	}
 

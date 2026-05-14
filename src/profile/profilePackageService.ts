@@ -334,18 +334,18 @@ export class ProfilePackageService {
 		if (!ref || !settings.configProfileSyncEnabled || settings.configProfileMode !== "subscribe") return;
 		if (ref.generation === settings.configProfileLastAppliedGeneration) return;
 		try {
-			await this.ensureStaged(ref);
 			await this.deps.updateSettings((next) => {
 				next.configProfileLastSeenGeneration = ref.generation;
 			}, `profile-package-stage:${reason}`);
 			if (settings.configProfileInitialAutoApply && !settings.configProfileLastAppliedGeneration) {
+				await this.ensureStaged(ref);
 				await this.applyLatestPackage(false);
 				return;
 			}
-			new Notice("YAOS: new PC profile package staged. Use 'Apply latest PC profile package' when ready.", 9000);
+			new Notice("YAOS: new PC profile package is available. Use 'Apply latest PC profile package' when ready.", 9000);
 		} catch (err) {
-			console.error("[yaos] Profile package staging failed:", err);
-			new Notice(`YAOS: profile package staging failed: ${formatUnknown(err)}`, 9000);
+			console.error("[yaos] Profile package update handling failed:", err);
+			new Notice(`YAOS: profile package update handling failed: ${formatUnknown(err)}`, 9000);
 		}
 	}
 

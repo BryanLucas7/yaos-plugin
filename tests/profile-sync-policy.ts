@@ -45,18 +45,18 @@ console.log("\n--- Test 1: profile sync stays off by default ---");
 	assert(!isBlobSyncable(".obsidian/workspace-mobile.json", [], configDir, off), ".obsidian is blocked when profile sync is off");
 }
 
-console.log("\n--- Test 2: publish mode can upload mobile profile files ---");
+console.log("\n--- Test 2: normal live sync blocks Obsidian config files even in publish mode ---");
 {
-	assert(isBlobSyncable(".obsidian/appearance.json", [], configDir, publish), "appearance.json is uploadable in publish mode");
-	assert(isBlobSyncable(".obsidian/graph.json", [], configDir, publish), "graph.json is uploadable in publish mode");
-	assert(isBlobSyncable(".obsidian/snippets/mobile.css", [], configDir, publish), "snippets are uploadable in publish mode");
-	assert(isBlobSyncable(".obsidian/themes/FastPpuccin/theme.css", [], configDir, publish), "themes are uploadable in publish mode");
+	assert(!isBlobSyncable(".obsidian/appearance.json", [], configDir, publish), "appearance.json is blocked in normal live sync");
+	assert(!isBlobSyncable(".obsidian/graph.json", [], configDir, publish), "graph.json is blocked in normal live sync");
+	assert(!isBlobSyncable(".obsidian/snippets/mobile.css", [], configDir, publish), "snippets are blocked in normal live sync");
+	assert(!isBlobSyncable(".obsidian/themes/FastPpuccin/theme.css", [], configDir, publish), "themes are blocked in normal live sync");
 }
 
-console.log("\n--- Test 3: subscribe mode downloads but does not upload profile files ---");
+console.log("\n--- Test 3: subscribe mode blocks profile files in both directions ---");
 {
 	assert(!isBlobSyncable(".obsidian/appearance.json", [], configDir, subscribeUpload), "subscribe mode blocks profile uploads");
-	assert(isBlobSyncable(".obsidian/appearance.json", [], configDir, subscribeDownload), "subscribe mode allows profile downloads");
+	assert(!isBlobSyncable(".obsidian/appearance.json", [], configDir, subscribeDownload), "subscribe mode blocks profile downloads");
 }
 
 console.log("\n--- Test 4: live plugin, workspace, activation, and backup paths are always blocked ---");

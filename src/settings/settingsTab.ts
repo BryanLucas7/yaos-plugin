@@ -371,7 +371,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(containerEl)
 				.setName("Sync Obsidian profile")
-				.setDesc("Publish a versioned mobile profile package from the PC and stage/apply it on mobile. YAOS connection data and YAOS plugin files are never included.")
+				.setDesc("Publish a versioned mobile profile package from the PC and apply it manually on mobile. YAOS connection data and YAOS plugin files are never included.")
 				.addToggle((toggle) =>
 					toggle
 						.setValue(this.host.settings.configProfileSyncEnabled)
@@ -391,7 +391,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				const profileSummary = this.host.getProfilePackageSummary();
 				new Setting(containerEl)
 					.setName("Obsidian profile mode")
-					.setDesc("Use Publish on the source computer and Subscribe on mobile devices. The normal live sync still blocks plugin files.")
+					.setDesc("Use Publish on the source computer and Subscribe on mobile devices. The normal live sync blocks Obsidian config files; profile changes move only through packages.")
 					.addDropdown((dropdown) =>
 						dropdown
 							.addOption("publish", "Publish from this device")
@@ -407,7 +407,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 				new Setting(containerEl)
 					.setName("Initial auto-apply")
-					.setDesc("On a new subscriber, apply the first validated PC profile package once. Future packages still require the apply command/button.")
+					.setDesc("Experimental desktop/testing option. Mobile safety disables this so profile packages are applied only by command/button.")
 					.addToggle((toggle) =>
 						toggle
 							.setValue(this.host.settings.configProfileInitialAutoApply)
@@ -420,7 +420,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 				new Setting(containerEl)
 					.setName("Manual apply after initial")
-					.setDesc("After the first applied package, new PC profile packages are staged only until you apply them.")
+					.setDesc("New PC profile packages wait until you apply them.")
 					.addToggle((toggle) =>
 						toggle
 							.setValue(this.host.settings.configProfileManualApplyAfterInitial)
@@ -444,7 +444,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					"Package size",
 					profileSummary.latestSize == null ? "Unknown" : `${Math.ceil(profileSummary.latestSize / 1024)} KB`,
 				);
-				addCardRow(profileCard, "Staged", profileSummary.stagedGeneration ?? "None");
+				addCardRow(profileCard, "Seen", profileSummary.stagedGeneration ?? "None");
 				addCardRow(profileCard, "Applied", profileSummary.lastAppliedGeneration || "Never");
 				addCardRow(profileCard, "Backup", profileSummary.lastBackupGeneration || "None");
 				const profileActions = profileCard.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });

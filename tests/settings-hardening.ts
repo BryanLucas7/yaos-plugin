@@ -81,7 +81,7 @@ console.log("\n--- Test 6: profile sync defaults preserve original behavior ---"
 	assert(settings.configProfileAutoModeInitialized === false, "profile platform auto-mode starts uninitialized");
 	assert(settings.configProfileMobilePluginIds.includes("dataview"), "recommended mobile plugin allowlist is seeded");
 	assert(!settings.configProfileMobilePluginIds.includes("agent-client"), "blocked plugins are not in the default mobile allowlist");
-	assert(settings.configProfileInitialAutoApply === true, "initial profile auto-apply is enabled by default");
+	assert(settings.configProfileInitialAutoApply === false, "initial profile auto-apply is disabled by default");
 	assert(settings.configProfileManualApplyAfterInitial === true, "future profile packages require manual apply by default");
 	assert(settings.configProfileLastSeenGeneration === "", "last seen profile generation starts empty");
 	assert(settings.configProfileLastAppliedGeneration === "", "last applied profile generation starts empty");
