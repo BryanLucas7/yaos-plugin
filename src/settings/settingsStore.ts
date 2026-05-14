@@ -56,6 +56,16 @@ export interface VaultSyncSettings {
 	configProfileMode: ConfigProfileMode;
 	/** Active allowlist preset for profile sync. */
 	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
+	/** Automatically apply the first staged PC profile package on a new subscriber. */
+	configProfileInitialAutoApply: boolean;
+	/** Require a command/button after the first profile package has been applied. */
+	configProfileManualApplyAfterInitial: boolean;
+	/** Latest profile package generation seen by this device. */
+	configProfileLastSeenGeneration: string;
+	/** Latest profile package generation applied to this device. */
+	configProfileLastAppliedGeneration: string;
+	/** Latest local backup generation created before applying a profile package. */
+	configProfileLastBackupGeneration: string;
 	/** Enable QA flight recorder tracing. */
 	qaTraceEnabled: boolean;
 	/** QA trace mode: safe/qa-safe/full/local-private. */
@@ -89,6 +99,11 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	configProfileSyncEnabled: false,
 	configProfileMode: "off",
 	configProfileAllowlistPreset: "mobile",
+	configProfileInitialAutoApply: true,
+	configProfileManualApplyAfterInitial: true,
+	configProfileLastSeenGeneration: "",
+	configProfileLastAppliedGeneration: "",
+	configProfileLastBackupGeneration: "",
 	qaTraceEnabled: false,
 	qaTraceMode: "safe",
 	qaTraceSecret: "",
@@ -159,6 +174,26 @@ export function readVaultSyncSettings(
 	}
 	if (typeof settings.configProfileSyncEnabled !== "boolean") {
 		settings.configProfileSyncEnabled = DEFAULT_SETTINGS.configProfileSyncEnabled;
+		migrated = true;
+	}
+	if (typeof settings.configProfileInitialAutoApply !== "boolean") {
+		settings.configProfileInitialAutoApply = DEFAULT_SETTINGS.configProfileInitialAutoApply;
+		migrated = true;
+	}
+	if (typeof settings.configProfileManualApplyAfterInitial !== "boolean") {
+		settings.configProfileManualApplyAfterInitial = DEFAULT_SETTINGS.configProfileManualApplyAfterInitial;
+		migrated = true;
+	}
+	if (typeof settings.configProfileLastSeenGeneration !== "string") {
+		settings.configProfileLastSeenGeneration = DEFAULT_SETTINGS.configProfileLastSeenGeneration;
+		migrated = true;
+	}
+	if (typeof settings.configProfileLastAppliedGeneration !== "string") {
+		settings.configProfileLastAppliedGeneration = DEFAULT_SETTINGS.configProfileLastAppliedGeneration;
+		migrated = true;
+	}
+	if (typeof settings.configProfileLastBackupGeneration !== "string") {
+		settings.configProfileLastBackupGeneration = DEFAULT_SETTINGS.configProfileLastBackupGeneration;
 		migrated = true;
 	}
 	return { settings, migrated };

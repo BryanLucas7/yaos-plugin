@@ -62,6 +62,7 @@ const suites = [
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/settings-hardening.ts"],
 	[JITI, "tests/profile-sync-policy.ts"],
+	[JITI, "tests/profile-package.ts"],
 	[JITI, "tests/v2-offline-rename-regressions.mjs"],
 	[JITI, "tests/sync-facts.ts"],
 	[JITI, "tests/offline-handoff.ts"],

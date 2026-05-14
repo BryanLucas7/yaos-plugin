@@ -7,6 +7,7 @@ import {
 	type VaultSyncSettings,
 } from "./settingsStore";
 import { randomBase64Url } from "../utils/base64url";
+import type { ProfilePackageSummary } from "../profile/profilePackageService";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -37,6 +38,10 @@ export interface VaultSyncSettingsHost {
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
+	getProfilePackageSummary(): ProfilePackageSummary;
+	publishObsidianProfilePackageNow(): Promise<void>;
+	applyLatestObsidianProfilePackage(): Promise<void>;
+	restorePreviousObsidianProfilePackage(): Promise<void>;
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;
 	buildRecoveryKitText(): string | null;
@@ -295,7 +300,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(containerEl)
 				.setName("Sync Obsidian profile")
-				.setDesc("Sync a conservative mobile allowlist from the Obsidian config folder. Live plugin files, plugin settings, workspaces, BRAT config, YAOS tokens, logs, and backups are never synced.")
+				.setDesc("Publish a versioned mobile profile package from the PC and stage/apply it on mobile. YAOS connection data and YAOS plugin files are never included.")
 				.addToggle((toggle) =>
 					toggle
 						.setValue(this.host.settings.configProfileSyncEnabled)
@@ -312,9 +317,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				);
 
 			if (this.host.settings.configProfileSyncEnabled) {
+				const profileSummary = this.host.getProfilePackageSummary();
 				new Setting(containerEl)
 					.setName("Obsidian profile mode")
-					.setDesc("Use Publish on the source computer and Subscribe on mobile devices.")
+					.setDesc("Use Publish on the source computer and Subscribe on mobile devices. The normal live sync still blocks plugin files.")
 					.addDropdown((dropdown) =>
 						dropdown
 							.addOption("publish", "Publish from this device")
@@ -327,6 +333,63 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 								}, "settings:config-profile-mode");
 							}),
 					);
+
+				new Setting(containerEl)
+					.setName("Initial auto-apply")
+					.setDesc("On a new subscriber, apply the first validated PC profile package once. Future packages still require the apply command/button.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileInitialAutoApply)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileInitialAutoApply = value;
+								}, "settings:profile-initial-auto-apply");
+							}),
+					);
+
+				new Setting(containerEl)
+					.setName("Manual apply after initial")
+					.setDesc("After the first applied package, new PC profile packages are staged only until you apply them.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileManualApplyAfterInitial)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileManualApplyAfterInitial = value;
+								}, "settings:profile-manual-after-initial");
+							}),
+					);
+
+				const profileCard = containerEl.createDiv({ cls: "yaos-settings-status-card" });
+				addCardRow(profileCard, "Latest package", profileSummary.latestGeneration ?? "None seen");
+				addCardRow(profileCard, "Latest package time", profileSummary.latestCreatedAt ?? "Unknown");
+				addCardRow(
+					profileCard,
+					"Package files",
+					profileSummary.latestFileCount == null ? "Unknown" : String(profileSummary.latestFileCount),
+				);
+				addCardRow(
+					profileCard,
+					"Package size",
+					profileSummary.latestSize == null ? "Unknown" : `${Math.ceil(profileSummary.latestSize / 1024)} KB`,
+				);
+				addCardRow(profileCard, "Staged", profileSummary.stagedGeneration ?? "None");
+				addCardRow(profileCard, "Applied", profileSummary.lastAppliedGeneration || "Never");
+				addCardRow(profileCard, "Backup", profileSummary.lastBackupGeneration || "None");
+				const profileActions = profileCard.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
+				if (this.host.settings.configProfileMode === "publish") {
+					profileActions.createEl("button", { text: "Publish package now" }).addEventListener("click", () => {
+						void this.host.publishObsidianProfilePackageNow().then(() => this.display());
+					});
+				}
+				if (this.host.settings.configProfileMode === "subscribe") {
+					profileActions.createEl("button", { text: "Apply latest package" }).addEventListener("click", () => {
+						void this.host.applyLatestObsidianProfilePackage().then(() => this.display());
+					});
+					profileActions.createEl("button", { text: "Restore backup" }).addEventListener("click", () => {
+						void this.host.restorePreviousObsidianProfilePackage().then(() => this.display());
+					});
+				}
 			}
 
 			new Setting(containerEl)

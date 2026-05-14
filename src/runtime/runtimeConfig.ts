@@ -21,6 +21,11 @@ export interface RuntimeConfig {
 	configProfileSyncEnabled: boolean;
 	configProfileMode: ConfigProfileMode;
 	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
+	configProfileInitialAutoApply: boolean;
+	configProfileManualApplyAfterInitial: boolean;
+	configProfileLastSeenGeneration: string;
+	configProfileLastAppliedGeneration: string;
+	configProfileLastBackupGeneration: string;
 	updateRepoUrl: string;
 	updateRepoBranch: string;
 	vaultConfigDir: string;
@@ -49,6 +54,11 @@ export function buildRuntimeConfig(
 		configProfileSyncEnabled: settings.configProfileSyncEnabled,
 		configProfileMode: settings.configProfileMode,
 		configProfileAllowlistPreset: settings.configProfileAllowlistPreset,
+		configProfileInitialAutoApply: settings.configProfileInitialAutoApply,
+		configProfileManualApplyAfterInitial: settings.configProfileManualApplyAfterInitial,
+		configProfileLastSeenGeneration: settings.configProfileLastSeenGeneration,
+		configProfileLastAppliedGeneration: settings.configProfileLastAppliedGeneration,
+		configProfileLastBackupGeneration: settings.configProfileLastBackupGeneration,
 		updateRepoUrl: settings.updateRepoUrl.trim(),
 		updateRepoBranch: settings.updateRepoBranch.trim() || "main",
 		vaultConfigDir,

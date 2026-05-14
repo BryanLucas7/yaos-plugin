@@ -78,6 +78,11 @@ console.log("\n--- Test 6: profile sync defaults preserve original behavior ---"
 	assert(settings.configProfileSyncEnabled === false, "profile sync is disabled by default");
 	assert(settings.configProfileMode === "off", "profile sync mode defaults to off");
 	assert(settings.configProfileAllowlistPreset === "mobile", "mobile preset is the default allowlist");
+	assert(settings.configProfileInitialAutoApply === true, "initial profile auto-apply is enabled by default");
+	assert(settings.configProfileManualApplyAfterInitial === true, "future profile packages require manual apply by default");
+	assert(settings.configProfileLastSeenGeneration === "", "last seen profile generation starts empty");
+	assert(settings.configProfileLastAppliedGeneration === "", "last applied profile generation starts empty");
+	assert(settings.configProfileLastBackupGeneration === "", "last backup profile generation starts empty");
 }
 
 console.log("\n──────────────────────────────────────────────────");

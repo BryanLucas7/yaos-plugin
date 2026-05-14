@@ -66,6 +66,7 @@ import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
+import { ProfilePackageService } from "./profile/profilePackageService";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
@@ -109,6 +110,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
+	private profilePackageService: ProfilePackageService | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
 	private diagnosticsService: DiagnosticsService | null = null;
@@ -471,6 +473,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
 			this.attachmentOrchestrator?.start("startup", false);
+			this.profilePackageService?.destroy();
+			this.profilePackageService = new ProfilePackageService({
+				app: this.app,
+				getSettings: () => this.settings,
+				updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
+				getVaultSync: () => this.vaultSync,
+				getTraceHttpContext: () => this.getTraceHttpContext(),
+				log: (message) => this.log(message),
+			});
 
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
@@ -582,6 +593,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
+					publishObsidianProfilePackageNow: () => this.publishObsidianProfilePackageNow(),
+					applyLatestObsidianProfilePackage: () => this.applyLatestObsidianProfilePackage(),
+					restorePreviousObsidianProfilePackage: () => this.restorePreviousObsidianProfilePackage(),
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
@@ -675,6 +689,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Startup complete");
 			this.scheduleTraceStateSnapshot("startup-complete");
 			this.attachmentOrchestrator?.markStartupReady("startup-complete");
+			this.profilePackageService?.start();
 			void this.traceRuntime?.refreshServerTrace();
 
 			// Trigger daily snapshot (noop if already taken today).
@@ -695,6 +710,33 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async importUntrackedFiles(): Promise<void> {
 		await this.reconciliationController.importUntrackedFiles();
+	}
+
+	async publishObsidianProfilePackageNow(): Promise<void> {
+		await this.profilePackageService?.publishNow();
+	}
+
+	async applyLatestObsidianProfilePackage(): Promise<void> {
+		await this.profilePackageService?.applyLatestPackage(true);
+	}
+
+	async restorePreviousObsidianProfilePackage(): Promise<void> {
+		await this.profilePackageService?.restorePreviousBackup();
+	}
+
+	getProfilePackageSummary() {
+		return this.profilePackageService?.getSummary() ?? {
+			enabled: this.settings.configProfileSyncEnabled,
+			mode: this.settings.configProfileMode,
+			lastSeenGeneration: this.settings.configProfileLastSeenGeneration,
+			lastAppliedGeneration: this.settings.configProfileLastAppliedGeneration,
+			lastBackupGeneration: this.settings.configProfileLastBackupGeneration,
+			latestGeneration: null,
+			latestCreatedAt: null,
+			latestFileCount: null,
+			latestSize: null,
+			stagedGeneration: this.settings.configProfileLastSeenGeneration || null,
+		};
 	}
 
 	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
@@ -898,6 +940,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.diskMirror?.destroy();
 
 		this.attachmentOrchestrator?.destroy();
+		this.profilePackageService?.destroy();
 
 		if (this.statusInterval) {
 			clearInterval(this.statusInterval);
@@ -912,6 +955,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.connectionController = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
+		this.profilePackageService = null;
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.editorWorkspace?.reset();
 		this.idbDegradedHandled = false;

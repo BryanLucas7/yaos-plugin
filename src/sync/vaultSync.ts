@@ -3,6 +3,7 @@ import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
+import type { ProfilePackageRef } from "../profile/profilePackage";
 import { ORIGIN_SEED } from "./origins";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
@@ -116,6 +117,7 @@ type ServerReceiptStartupValidation =
  *   pathToBlob:      Y.Map<BlobRef>        — vault-relative path -> { hash, size }
  *   blobMeta:        Y.Map<BlobMeta>       — sha256 hex -> { size, mime, createdAt }
  *   blobTombstones:  Y.Map<BlobTombstone>  — vault-relative path -> { deletedAt, device? }
+ *   profilePackages: Y.Map<ProfilePackageRef> — package preset -> latest profile package metadata
  */
 export class VaultSync {
 	readonly ydoc: Y.Doc;
@@ -133,6 +135,7 @@ export class VaultSync {
 	readonly pathToBlob: Y.Map<BlobRef>;
 	readonly blobMeta: Y.Map<BlobMeta>;
 	readonly blobTombstones: Y.Map<BlobTombstone>;
+	readonly profilePackages: Y.Map<ProfilePackageRef>;
 
 	/**
 	 * In-memory reverse map: Y.Text instance -> fileId.
@@ -214,6 +217,7 @@ export class VaultSync {
 		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
 		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
+		this.profilePackages = this.ydoc.getMap<ProfilePackageRef>("profilePackages");
 		this.meta.observe(() => {
 			this._pathIndexesDirty = true;
 		});
@@ -1679,6 +1683,7 @@ export class VaultSync {
 		tombstonedPathCount: number;
 		storedSchemaVersion: number | null;
 		blobPathCount: number;
+		profilePackageCount: number;
 		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
 		serverReceiptStartupValidation: ServerReceiptStartupValidation;
 		svEcho: SvEchoCounters;
@@ -1697,6 +1702,7 @@ export class VaultSync {
 			tombstonedPathCount: this._deletedPathIndex.size,
 			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
+			profilePackageCount: this.profilePackages.size,
 			serverReceipt: {
 				...this.serverAckTracker.getState(),
 				persistenceUnavailable: this._serverAckPersistenceUnavailable,

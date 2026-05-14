@@ -22,6 +22,9 @@ export interface CommandsRuntimeHost {
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
+	publishObsidianProfilePackageNow(): Promise<void>;
+	applyLatestObsidianProfilePackage(): Promise<void>;
+	restorePreviousObsidianProfilePackage(): Promise<void>;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
@@ -198,6 +201,30 @@ export function registerCommands(
 			void host.importUntrackedFiles().then(() => {
 				new Notice(`Imported ${count} untracked file(s).`);
 			});
+		},
+	});
+
+	registrar.addCommand({
+		id: "publish-profile-package",
+		name: "Publish Obsidian profile package now",
+		callback: () => {
+			void host.publishObsidianProfilePackageNow();
+		},
+	});
+
+	registrar.addCommand({
+		id: "apply-profile-package",
+		name: "Apply latest PC profile package",
+		callback: () => {
+			void host.applyLatestObsidianProfilePackage();
+		},
+	});
+
+	registrar.addCommand({
+		id: "restore-profile-package-backup",
+		name: "Restore previous Obsidian profile package",
+		callback: () => {
+			void host.restorePreviousObsidianProfilePackage();
 		},
 	});
 
