@@ -55,6 +55,28 @@ interface ProfilePackageServiceDeps {
 	getVaultSync(): VaultSync | null;
 	getTraceHttpContext(): TraceHttpContext | undefined;
 	log(message: string): void;
+	/**
+	 * Optional safe-state gate. Returns null when it is safe to apply a profile package
+	 * (vault loaded, sync connected, no reconcile in flight, no pending uploads), or a
+	 * short human-readable reason when not. When omitted, defaults to "safe".
+	 */
+	isSafeToApplyProfile?(): { safe: true } | { safe: false; reason: string };
+}
+
+export type ProfileApplyStep =
+	| "safe-state-gate"
+	| "load-ref"
+	| "ensure-staged"
+	| "validate"
+	| "create-backup"
+	| "write-files"
+	| "persist-applied-generation";
+
+export class ProfileApplyError extends Error {
+	constructor(public readonly step: ProfileApplyStep, public readonly cause: unknown) {
+		super(`[${step}] ${formatUnknown(cause)}`);
+		this.name = "ProfileApplyError";
+	}
 }
 
 interface BackupManifest {
@@ -248,38 +270,66 @@ export class ProfilePackageService {
 			new Notice("YAOS: set Obsidian profile mode to Subscribe on this device first.", 7000);
 			return;
 		}
-		const ref = this.latestRef ?? this.readLatestRef();
-		if (!ref) {
-			new Notice("YAOS: no PC profile package is available yet.", 7000);
-			return;
-		}
-		if (!manual && settings.configProfileManualApplyAfterInitial && settings.configProfileLastAppliedGeneration) {
-			return;
-		}
 		if (this.busy) {
 			new Notice("YAOS: profile package operation already running.", 5000);
 			return;
 		}
+		// Safe-state gate (1.6.7): refuse to apply during reconcile/initial-sync to avoid
+		// touching .obsidian while the sync engine is still settling.
+		const gateProbe = this.deps.isSafeToApplyProfile?.();
+		if (gateProbe && !gateProbe.safe) {
+			this.deps.log(`Profile package apply blocked by safe-state gate: ${gateProbe.reason}`);
+			new Notice(`YAOS: profile apply postponed — ${gateProbe.reason}`, 9000);
+			return;
+		}
 		this.busy = true;
 		try {
-			const bytes = await this.ensureStaged(ref);
-			const validated = await validateProfilePackageArchive(bytes, {
-				expectedHash: ref.hash,
-				expectedManifestHash: ref.manifestHash,
-				configDir: this.configDir,
+			const ref = await this.applyStep("load-ref", async () => {
+				const candidate = this.latestRef ?? this.readLatestRef();
+				if (!candidate) throw new Error("no PC profile package is available yet");
+				if (!manual && settings.configProfileManualApplyAfterInitial && settings.configProfileLastAppliedGeneration) {
+					throw new Error("manual-apply-required-after-initial");
+				}
+				return candidate;
 			});
-			const skipped = await this.applyValidatedPackage(validated.manifest, validated.files);
-			await this.deps.updateSettings((next) => {
-				next.configProfileLastAppliedGeneration = ref.generation;
-			}, "profile-package-apply");
+			const bytes = await this.applyStep("ensure-staged", () => this.ensureStaged(ref));
+			const validated = await this.applyStep("validate", () =>
+				validateProfilePackageArchive(bytes, {
+					expectedHash: ref.hash,
+					expectedManifestHash: ref.manifestHash,
+					configDir: this.configDir,
+				}),
+			);
+			const skipped = await this.applyStep("write-files", () =>
+				this.applyValidatedPackage(validated.manifest, validated.files),
+			);
+			await this.applyStep("persist-applied-generation", () =>
+				this.deps.updateSettings((next) => {
+					next.configProfileLastAppliedGeneration = ref.generation;
+				}, "profile-package-apply"),
+			);
 			const suffix = skipped.length > 0 ? ` ${skipped.length} active plugin file(s) were skipped; see console.` : "";
 			this.deps.log(`Profile package applied: generation=${ref.generation}${skipped.length ? ` skipped=${skipped.join(",")}` : ""}`);
 			new Notice(`YAOS: PC profile applied. Close and reopen Obsidian.${suffix}`, 12000);
 		} catch (err) {
-			console.error("[yaos] Profile package apply failed:", err);
-			new Notice(`YAOS: profile package apply failed: ${formatUnknown(err)}`, 9000);
+			const step = err instanceof ProfileApplyError ? err.step : "unknown";
+			const cause = err instanceof ProfileApplyError ? err.cause : err;
+			console.error(`[yaos] Profile package apply failed at step "${step}":`, cause);
+			this.deps.log(`Profile package apply failed at step "${step}": ${formatUnknown(cause)}`);
+			new Notice(`YAOS: profile apply failed at "${step}": ${formatUnknown(cause)}`, 12000);
 		} finally {
 			this.busy = false;
+		}
+	}
+
+	private async applyStep<T>(step: ProfileApplyStep, fn: () => Promise<T>): Promise<T> {
+		try {
+			this.deps.log(`Profile apply step start: ${step}`);
+			const result = await fn();
+			this.deps.log(`Profile apply step ok: ${step}`);
+			return result;
+		} catch (err) {
+			throw new ProfileApplyError(step, err);
 		}
 	}
 

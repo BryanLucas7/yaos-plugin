@@ -28,6 +28,8 @@ export interface CommandsRuntimeHost {
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
+	exportFlightLogsToVault(): Promise<{ copied: number; skipped: number; errors: number; targetDir: string }>;
+	buildLastBootSummaryText(): Promise<string>;
 }
 
 export function registerCommands(
@@ -280,6 +282,43 @@ export function registerCommands(
 		name: "Nuclear reset (wipe sync state and reseed from disk)",
 		callback: () => {
 			host.nuclearReset();
+		},
+	});
+
+	registrar.addCommand({
+		id: "export-flight-logs-to-vault",
+		name: "Export flight logs to vault (for mobile diagnostics)",
+		callback: () => {
+			void host.exportFlightLogsToVault().then(
+				(result) => new Notice(
+					`YAOS: mirrored flight logs → ${result.targetDir}/ — copied=${result.copied} skipped=${result.skipped} errors=${result.errors}.`,
+					9000,
+				),
+				(err) => {
+					console.error("[yaos] export-flight-logs-to-vault failed", err);
+					new Notice("YAOS: failed to export flight logs. See console.", 7000);
+				},
+			);
+		},
+	});
+
+	registrar.addCommand({
+		id: "copy-last-boot-summary",
+		name: "Copy last boot summary to clipboard",
+		callback: () => {
+			void host.buildLastBootSummaryText().then(
+				(text) => navigator.clipboard.writeText(text).then(
+					() => new Notice("YAOS: last boot summary copied to clipboard.", 4000),
+					() => {
+						console.debug("[yaos] last boot summary:\n" + text);
+						new Notice("YAOS: clipboard unavailable — printed to console.", 6000);
+					},
+				),
+				(err) => {
+					console.error("[yaos] buildLastBootSummaryText failed", err);
+					new Notice("YAOS: failed to build last boot summary. See console.", 7000);
+				},
+			);
 		},
 	});
 }

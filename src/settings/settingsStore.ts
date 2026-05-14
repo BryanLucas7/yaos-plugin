@@ -86,6 +86,18 @@ export interface VaultSyncSettings {
 	updateRepoBranch: string;
 	/** Expose window.__YAOS_DEBUG__ programmatic control surface for QA. Never ship enabled. */
 	qaDebugMode: boolean;
+	/**
+	 * Internal: number of remaining boots in which the flight recorder must be forced ON
+	 * (regardless of `qaTraceEnabled`) and logs mirrored to the vault. Decrements each boot
+	 * until 0. Seeded on first 1.6.7 boot to 3 to capture the mobile crash window.
+	 */
+	_diagBoot3Remaining: number;
+	/**
+	 * Internal: vault-relative folder where flight logs are mirrored so they can ride along
+	 * with normal note sync (the canonical `.obsidian/plugins/yaos/flight-logs` path is not
+	 * synced on mobile).
+	 */
+	diagnosticsDir: string;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -120,6 +132,8 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
 	qaDebugMode: false,
+	_diagBoot3Remaining: 3,
+	diagnosticsDir: "YAOS-Diagnostics",
 };
 
 export interface SettingsPersistence {
@@ -221,6 +235,19 @@ export function readVaultSyncSettings(
 	}
 	if (typeof settings.configProfileLastBackupGeneration !== "string") {
 		settings.configProfileLastBackupGeneration = DEFAULT_SETTINGS.configProfileLastBackupGeneration;
+		migrated = true;
+	}
+	// 1.6.7 diagnostics: seed forced 3-boot recorder window for users upgrading from <=1.6.6.
+	if (
+		typeof settings._diagBoot3Remaining !== "number" ||
+		!Number.isFinite(settings._diagBoot3Remaining) ||
+		settings._diagBoot3Remaining < 0
+	) {
+		settings._diagBoot3Remaining = DEFAULT_SETTINGS._diagBoot3Remaining;
+		migrated = true;
+	}
+	if (typeof settings.diagnosticsDir !== "string" || settings.diagnosticsDir.trim() === "") {
+		settings.diagnosticsDir = DEFAULT_SETTINGS.diagnosticsDir;
 		migrated = true;
 	}
 	return { settings, migrated };

@@ -232,6 +232,61 @@ export class FlightTraceController {
 	}
 
 	/**
+	 * Mirror flight logs from the (unsynced) plugin folder into a vault-root folder so the
+	 * files travel with normal note sync. Returns counts. Safe to call on a timer; idempotent
+	 * per file (last-writer-wins overwrites if content grew).
+	 */
+	async mirrorToVault(vaultRelDir: string): Promise<{ copied: number; skipped: number; errors: number }> {
+		const adapter = this.deps.app.vault.adapter;
+		const sourceRoot = `${this.deps.app.vault.configDir}/plugins/yaos/flight-logs`;
+		let copied = 0;
+		let skipped = 0;
+		let errors = 0;
+		try {
+			if (!(await adapter.exists(sourceRoot))) return { copied, skipped, errors };
+			try {
+				await this.flush();
+			} catch {
+				// continue even if flush fails — we want any data we have.
+			}
+			await ensureFolder(adapter, vaultRelDir);
+			const dayDirs = (await adapter.list(sourceRoot)).folders;
+			for (const dayDir of dayDirs) {
+				const day = dayDir.split("/").pop() ?? "unknown-day";
+				const targetDay = `${vaultRelDir}/${day}`;
+				await ensureFolder(adapter, targetDay);
+				let files: string[] = [];
+				try {
+					files = (await adapter.list(dayDir)).files;
+				} catch {
+					errors++;
+					continue;
+				}
+				for (const filePath of files) {
+					const name = filePath.split("/").pop() ?? "";
+					if (!name) continue;
+					const targetPath = `${targetDay}/${name}`;
+					try {
+						const content = await adapter.read(filePath);
+						const existing = (await adapter.exists(targetPath)) ? await adapter.read(targetPath) : null;
+						if (existing === content) {
+							skipped++;
+							continue;
+						}
+						await adapter.write(targetPath, content);
+						copied++;
+					} catch {
+						errors++;
+					}
+				}
+			}
+		} catch {
+			errors++;
+		}
+		return { copied, skipped, errors };
+	}
+
+	/**
 	 * Delete all flight log files.
 	 * If a trace is active, stops it first.
 	 */
@@ -434,6 +489,21 @@ export async function clearFlightLogs(app: App): Promise<void> {
 		// Try to remove the root itself
 		try { await app.vault.adapter.rmdir(root, false); } catch { /* ok */ }
 	} catch { /* nothing to clear */ }
+}
+
+async function ensureFolder(adapter: App["vault"]["adapter"], path: string): Promise<void> {
+	const parts = path.split("/").filter(Boolean);
+	let current = "";
+	for (const part of parts) {
+		current = current ? `${current}/${part}` : part;
+		try {
+			if (!(await adapter.exists(current))) {
+				await adapter.mkdir(current);
+			}
+		} catch {
+			// ignore — write will surface the real error
+		}
+	}
 }
 
 async function deleteDirectoryRecursive(app: App, dir: string): Promise<void> {

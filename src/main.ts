@@ -123,6 +123,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private flightTrace: FlightTraceController | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
+	private diagnosticBootForced = false;
+	private diagnosticMirrorTimer: ReturnType<typeof setInterval> | null = null;
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -484,6 +486,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				getVaultSync: () => this.vaultSync,
 				getTraceHttpContext: () => this.getTraceHttpContext(),
 				log: (message) => this.log(message),
+				isSafeToApplyProfile: () => this.isSafeToApplyProfile(),
 			});
 
 			// 5. Status tracking
@@ -608,6 +611,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				exportFullFlightTrace: () => this.exportFullFlightTrace(),
 				showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
 				clearFlightLogs: () => this.clearFlightLogs(),
+				exportFlightLogsToVault: () => this.exportFlightLogsToVault(),
+				buildLastBootSummaryText: () => this.buildLastBootSummaryText(),
 				});
 				this.commandsRegistered = true;
 			}
@@ -753,6 +758,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getVaultSync: () => this.vaultSync,
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			log: (message) => this.log(message),
+			isSafeToApplyProfile: () => this.isSafeToApplyProfile(),
 		});
 		return await service.getPluginCandidates();
 	}
@@ -1420,6 +1426,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			log: (message) => this.log(message),
 		});
 		void this.refreshFlightTraceState("startup");
+		this.startDiagnosticMirrorLoop();
 	}
 
 	private getTraceHttpContext(): TraceHttpContext | undefined {
@@ -1597,6 +1604,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
+		if (this.diagnosticMirrorTimer) {
+			clearInterval(this.diagnosticMirrorTimer);
+			this.diagnosticMirrorTimer = null;
+		}
+		if (this.diagnosticBootForced) {
+			const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
+			void this.flightTrace?.mirrorToVault(targetDir).catch(() => undefined);
+		}
 		void this.flightTrace?.stop();
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
@@ -1610,6 +1625,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.settings = settings;
 		const autoModeApplied = this.applyInitialMobileProfileMode();
 		const mobileSafetyApplied = this.applyMobileProfileSafetyDefaults();
+		const diagBootApplied = this.applyDiagnosticBootOverrides();
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -1640,7 +1656,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated || autoModeApplied || mobileSafetyApplied) {
+		if (migrated || autoModeApplied || mobileSafetyApplied || diagBootApplied) {
 			await this.persistPluginState();
 		}
 	}
@@ -1661,6 +1677,102 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.settings.configProfileInitialAutoApply) return false;
 		this.settings.configProfileInitialAutoApply = false;
 		return true;
+	}
+
+	/**
+	 * 1.6.7 diagnostics: when `_diagBoot3Remaining > 0`, force the flight recorder ON in
+	 * `safe` mode for this boot (without persisting that override) and decrement the
+	 * counter. Result: the next 3 startups on each device leave a trace on disk that gets
+	 * mirrored into the vault for offline retrieval. Returns true when a counter was
+	 * decremented (caller must persist).
+	 */
+	private applyDiagnosticBootOverrides(): boolean {
+		const remaining = typeof this.settings._diagBoot3Remaining === "number" ? this.settings._diagBoot3Remaining : 0;
+		if (remaining <= 0) return false;
+		this.diagnosticBootForced = true;
+		this.settings.qaTraceEnabled = true;
+		if (this.settings.qaTraceMode !== "safe" && this.settings.qaTraceMode !== "qa-safe") {
+			this.settings.qaTraceMode = "safe";
+		}
+		this.settings._diagBoot3Remaining = Math.max(0, remaining - 1);
+		this.log(`Diagnostic boot window active — ${this.settings._diagBoot3Remaining} boot(s) remaining after this one.`);
+		return true;
+	}
+
+	/**
+	 * Safe-state gate for `applyProfilePackage`. Refuses to apply while the sync engine
+	 * is still settling, to avoid touching `.obsidian` mid-reconcile.
+	 */
+	isSafeToApplyProfile(): { safe: true } | { safe: false; reason: string } {
+		if (!this.vaultSync) return { safe: false, reason: "sync not initialized" };
+		if (!this.vaultSync.providerSynced) return { safe: false, reason: "waiting for first server sync" };
+		if (this.awaitingFirstProviderSyncAfterStartup) return { safe: false, reason: "awaiting first provider sync after startup" };
+		if (this.reconciliationController?.isReconcileInFlight) return { safe: false, reason: "reconcile in flight" };
+		const pending = this.getBlobSync()?.pendingUploads ?? 0;
+		if (pending > 0) return { safe: false, reason: `${pending} pending blob upload(s)` };
+		return { safe: true };
+	}
+
+	private startDiagnosticMirrorLoop(): void {
+		if (this.diagnosticMirrorTimer || !this.diagnosticBootForced) return;
+		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
+		const tick = async () => {
+			try {
+				const result = await this.flightTrace?.mirrorToVault(targetDir);
+				if (result && (result.copied > 0 || result.errors > 0)) {
+					this.log(`Diagnostic mirror → ${targetDir}: copied=${result.copied} skipped=${result.skipped} errors=${result.errors}`);
+				}
+			} catch (err) {
+				this.log(`Diagnostic mirror failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		};
+		void tick();
+		this.diagnosticMirrorTimer = setInterval(() => { void tick(); }, 15_000);
+	}
+
+	async exportFlightLogsToVault(): Promise<{ copied: number; skipped: number; errors: number; targetDir: string }> {
+		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
+		const result = (await this.flightTrace?.mirrorToVault(targetDir)) ?? { copied: 0, skipped: 0, errors: 0 };
+		return { ...result, targetDir };
+	}
+
+	async buildLastBootSummaryText(): Promise<string> {
+		const adapter = this.app.vault.adapter;
+		const root = `${this.app.vault.configDir}/plugins/yaos/flight-logs`;
+		const lines: string[] = [];
+		lines.push(`# YAOS boot summary`);
+		lines.push(`generated: ${new Date().toISOString()}`);
+		lines.push(`plugin: ${this.manifest.version}`);
+		lines.push(`platform: ${Platform.isMobileApp ? "mobile" : "desktop"}`);
+		lines.push(`diag-boots-remaining: ${this.settings._diagBoot3Remaining}`);
+		try {
+			const safe = this.isSafeToApplyProfile();
+			lines.push(`safe-to-apply-profile: ${safe.safe ? "yes" : `no (${safe.reason})`}`);
+		} catch (err) {
+			lines.push(`safe-to-apply-profile: error (${err instanceof Error ? err.message : String(err)})`);
+		}
+		try {
+			if (await adapter.exists(root)) {
+				const days = (await adapter.list(root)).folders.sort();
+				const latestDay = days[days.length - 1];
+				if (latestDay) {
+					const files = (await adapter.list(latestDay)).files.sort();
+					const latestFile = files[files.length - 1];
+					if (latestFile) {
+						const content = await adapter.read(latestFile);
+						const tailLines = content.split("\n").filter(Boolean).slice(-50);
+						lines.push(`source: ${latestFile}`);
+						lines.push(`--- last 50 events ---`);
+						lines.push(...tailLines);
+					}
+				}
+			} else {
+				lines.push(`(no flight logs found at ${root})`);
+			}
+		} catch (err) {
+			lines.push(`error reading flight logs: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		return lines.join("\n");
 	}
 
 	async saveSettings(reason = "settings-save") {
