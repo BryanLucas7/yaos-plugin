@@ -294,6 +294,42 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 			new Setting(containerEl)
+				.setName("Sync Obsidian profile")
+				.setDesc("Sync an explicit mobile allowlist from the Obsidian config folder. YAOS tokens, logs, backups, and desktop-only plugins are never synced.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.configProfileSyncEnabled)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileSyncEnabled = value;
+								if (!value) settings.configProfileMode = "off";
+								if (value && settings.configProfileMode === "off") {
+									settings.configProfileMode = "subscribe";
+								}
+							}, "settings:config-profile-toggle");
+							this.display();
+						}),
+				);
+
+			if (this.host.settings.configProfileSyncEnabled) {
+				new Setting(containerEl)
+					.setName("Obsidian profile mode")
+					.setDesc("Use Publish on the source computer and Subscribe on mobile devices.")
+					.addDropdown((dropdown) =>
+						dropdown
+							.addOption("publish", "Publish from this device")
+							.addOption("subscribe", "Subscribe on this device")
+							.addOption("off", "Off")
+							.setValue(this.host.settings.configProfileMode)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileMode = value as VaultSyncSettings["configProfileMode"];
+								}, "settings:config-profile-mode");
+							}),
+					);
+			}
+
+			new Setting(containerEl)
 				.setName("Max text file size in kilobytes")
 				.setDesc("Text files larger than this are skipped for live document sync.")
 			.addText((text) =>

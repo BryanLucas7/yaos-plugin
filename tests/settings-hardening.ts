@@ -53,13 +53,31 @@ console.log("\n--- Test 4: server capability can lower the effective attachment 
 		"5 MB server capability lowers effective attachment cap to 5120 KB",
 	);
 	assert(
-		attachmentSizeCapKB(50 * 1024 * 1024) === MAX_ATTACHMENT_SIZE_KB,
+		attachmentSizeCapKB(150 * 1024 * 1024) === MAX_ATTACHMENT_SIZE_KB,
 		"larger server capability does not raise the client above the built-in ceiling",
 	);
 	assert(
 		attachmentSizeCapKB(null) === MAX_ATTACHMENT_SIZE_KB,
 		"missing server capability falls back to built-in ceiling",
 	);
+}
+
+console.log("\n--- Test 5: 100 MB attachment max is preserved ---");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		attachmentSyncExplicitlyConfigured: true,
+		maxAttachmentSizeKB: 100 * 1024,
+	});
+	assert(settings.maxAttachmentSizeKB === 100 * 1024, "100 MB attachment setting is preserved");
+	assert(!migrated, "100 MB attachment setting does not force migration");
+}
+
+console.log("\n--- Test 6: profile sync defaults preserve original behavior ---");
+{
+	const { settings } = readVaultSyncSettings({});
+	assert(settings.configProfileSyncEnabled === false, "profile sync is disabled by default");
+	assert(settings.configProfileMode === "off", "profile sync mode defaults to off");
+	assert(settings.configProfileAllowlistPreset === "mobile", "mobile preset is the default allowlist");
 }
 
 console.log("\n──────────────────────────────────────────────────");

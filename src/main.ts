@@ -15,6 +15,7 @@ import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
+import type { ProfileSyncDirection } from "./sync/profileSyncPolicy";
 import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
@@ -188,12 +189,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.reconciliationController;
 	}
 
-	private isMarkdownPathSyncable(path: string): boolean {
-		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	private isMarkdownPathSyncable(path: string, direction: ProfileSyncDirection = "upload"): boolean {
+		const runtimeConfig = this.getRuntimeConfig();
+		return isMarkdownSyncable(path, this.excludePatterns, runtimeConfig.vaultConfigDir, {
+			enabled: runtimeConfig.configProfileSyncEnabled,
+			mode: runtimeConfig.configProfileMode,
+			preset: runtimeConfig.configProfileAllowlistPreset,
+			direction,
+		});
 	}
 
-	private isBlobPathSyncable(path: string): boolean {
-		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	private isBlobPathSyncable(path: string, direction: ProfileSyncDirection = "upload"): boolean {
+		const runtimeConfig = this.getRuntimeConfig();
+		return isBlobSyncable(path, this.excludePatterns, runtimeConfig.vaultConfigDir, {
+			enabled: runtimeConfig.configProfileSyncEnabled,
+			mode: runtimeConfig.configProfileMode,
+			preset: runtimeConfig.configProfileAllowlistPreset,
+			direction,
+		});
 	}
 
 	private getRuntimeConfig(): RuntimeConfig {

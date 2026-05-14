@@ -1,8 +1,9 @@
 import { randomBase64Url } from "../utils/base64url";
+import type { ConfigProfileAllowlistPreset, ConfigProfileMode } from "../sync/profileSyncPolicy";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
-export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
+export const MAX_ATTACHMENT_SIZE_KB = 100 * 1024;
 
 export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): number {
 	if (
@@ -43,12 +44,18 @@ export interface VaultSyncSettings {
 	enableAttachmentSync: boolean;
 	/** True once the user has explicitly changed the attachment sync toggle. */
 	attachmentSyncExplicitlyConfigured: boolean;
-	/** Maximum attachment size in KB. Files larger are skipped. Capped at 10240 (10 MB). */
+	/** Maximum attachment size in KB. Files larger are skipped. Capped at 102400 (100 MB). */
 	maxAttachmentSizeKB: number;
 	/** Number of parallel upload/download slots. */
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
+	/** Enable explicit allowlisted Obsidian configuration profile sync. */
+	configProfileSyncEnabled: boolean;
+	/** Publish profile files from this device, subscribe to them, or keep the original YAOS behavior. */
+	configProfileMode: ConfigProfileMode;
+	/** Active allowlist preset for profile sync. */
+	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
 	/** Enable QA flight recorder tracing. */
 	qaTraceEnabled: boolean;
 	/** QA trace mode: safe/qa-safe/full/local-private. */
@@ -79,6 +86,9 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
 	showRemoteCursors: true,
+	configProfileSyncEnabled: false,
+	configProfileMode: "off",
+	configProfileAllowlistPreset: "mobile",
 	qaTraceEnabled: false,
 	qaTraceMode: "safe",
 	qaTraceSecret: "",
@@ -137,6 +147,18 @@ export function readVaultSyncSettings(
 			attachmentSizeCapKB(),
 			Math.max(1, Math.floor(Number(settings.maxAttachmentSizeKB) || DEFAULT_SETTINGS.maxAttachmentSizeKB)),
 		);
+		migrated = true;
+	}
+	if (settings.configProfileMode !== "publish" && settings.configProfileMode !== "subscribe" && settings.configProfileMode !== "off") {
+		settings.configProfileMode = DEFAULT_SETTINGS.configProfileMode;
+		migrated = true;
+	}
+	if (settings.configProfileAllowlistPreset !== "mobile") {
+		settings.configProfileAllowlistPreset = DEFAULT_SETTINGS.configProfileAllowlistPreset;
+		migrated = true;
+	}
+	if (typeof settings.configProfileSyncEnabled !== "boolean") {
+		settings.configProfileSyncEnabled = DEFAULT_SETTINGS.configProfileSyncEnabled;
 		migrated = true;
 	}
 	return { settings, migrated };

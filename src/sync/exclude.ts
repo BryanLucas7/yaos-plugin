@@ -1,18 +1,13 @@
+import {
+	type ConfigProfileSyncPolicy,
+	isConfigProfilePath,
+	isConfigProfilePathSyncable,
+	normalizeSyncPath,
+} from "./profileSyncPolicy";
+
 /** Paths that are always excluded, regardless of user settings. */
 function normalizePrefix(path: string): string {
-	return path
-		.replace(/\\/g, "/")
-		.replace(/\/{2,}/g, "/")
-		.replace(/^\.\//, "")
-		.replace(/^\/+/, "");
-}
-
-function alwaysExcludedPrefixes(configDir: string): string[] {
-	const normalizedConfigDir = normalizePrefix(configDir).replace(/\/$/, "");
-	return [
-		`${normalizedConfigDir}/`,
-		".trash/",
-	];
+	return normalizeSyncPath(path);
 }
 
 /**
@@ -27,8 +22,24 @@ function alwaysExcludedPrefixes(configDir: string): string[] {
  */
 export function isExcluded(path: string, patterns: string[], configDir: string): boolean {
 	const normalizedPath = normalizePrefix(path);
-	for (const prefix of alwaysExcludedPrefixes(configDir)) {
-		if (normalizedPath.startsWith(prefix)) return true;
+	if (normalizedPath.startsWith(".trash/")) return true;
+	if (isConfigProfilePath(path, configDir)) return true;
+	for (const prefix of patterns) {
+		if (normalizedPath.startsWith(normalizePrefix(prefix))) return true;
+	}
+	return false;
+}
+
+export function isExcludedForDirection(
+	path: string,
+	patterns: string[],
+	configDir: string,
+	configProfilePolicy?: ConfigProfileSyncPolicy,
+): boolean {
+	const normalizedPath = normalizePrefix(path);
+	if (normalizedPath.startsWith(".trash/")) return true;
+	if (isConfigProfilePath(path, configDir)) {
+		return !isConfigProfilePathSyncable(path, configDir, configProfilePolicy);
 	}
 	for (const prefix of patterns) {
 		if (normalizedPath.startsWith(normalizePrefix(prefix))) return true;

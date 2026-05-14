@@ -78,6 +78,7 @@ export class AttachmentOrchestrator {
 			this.deps.trace,
 			this.deps.getPreservedUnresolvedEntries(),
 			this.deps.onPreservedUnresolvedChanged,
+			this.deps.getRuntimeConfig,
 		);
 
 		this.blobSync = blobSync;
