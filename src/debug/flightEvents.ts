@@ -100,6 +100,15 @@ export const FLIGHT_KIND = {
 	recoveryLoopDetected: "recovery.loop.detected",
 	recoveryQuarantined: "recovery.quarantined",
 
+	// Blob / attachment lifecycle (1.6.8)
+	blobDownloadQueued: "blob.download.queued",
+	blobDownloadStart: "blob.download.start",
+	blobDownloadOk: "blob.download.ok",
+	blobDownloadFailed: "blob.download.failed",
+	blobDrainTick: "blob.drain.tick",
+	blobEngineStart: "blob.engine.start",
+	blobEngineStop: "blob.engine.stop",
+
 	// Tombstone / remote delete lifecycle
 	/** Emitted by diskMirror: CRDT remote delete observed, deciding action. */
 	deleteRemoteObserved: "delete.remote.observed",

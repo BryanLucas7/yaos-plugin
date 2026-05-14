@@ -612,6 +612,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
 				clearFlightLogs: () => this.clearFlightLogs(),
 				exportFlightLogsToVault: () => this.exportFlightLogsToVault(),
+				exportEnabledPluginsToVault: () => this.exportEnabledPluginsToVault(),
 				buildLastBootSummaryText: () => this.buildLastBootSummaryText(),
 				});
 				this.commandsRegistered = true;
@@ -1625,6 +1626,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.settings = settings;
 		const autoModeApplied = this.applyInitialMobileProfileMode();
 		const mobileSafetyApplied = this.applyMobileProfileSafetyDefaults();
+		this.applyMobileAttachmentKillSwitch();
 		const diagBootApplied = this.applyDiagnosticBootOverrides();
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
@@ -1677,6 +1679,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.settings.configProfileInitialAutoApply) return false;
 		this.settings.configProfileInitialAutoApply = false;
 		return true;
+	}
+
+	/**
+	 * 1.6.8 mobile attachment kill switch. Mobile crashes correlate with
+	 * `pendingBlobDownloads > 0` post-startup (see 1.6.7 diagnostic logs). While the
+	 * underlying download/orchestrator bug is unfixed, force the attachment engine OFF
+	 * on mobile each boot. The override is in-memory (does not persist) so users on
+	 * desktop never see a regression, and once we fix the root cause we just flip
+	 * `mobileAttachmentKillSwitch` to false.
+	 */
+	private applyMobileAttachmentKillSwitch(): boolean {
+		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
+		if (!this.settings.mobileAttachmentKillSwitch) return false;
+		if (!this.settings.enableAttachmentSync) return false;
+		this.log("Mobile attachment kill switch active — attachment sync forced OFF for this boot.");
+		this.settings.enableAttachmentSync = false;
+		return false; // do not persist; want desktop & re-enable to keep working
 	}
 
 	/**
@@ -1736,6 +1755,54 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return { ...result, targetDir };
 	}
 
+	async exportEnabledPluginsToVault(): Promise<{ path: string; count: number }> {
+		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
+		const adapter = this.app.vault.adapter;
+		const parts = targetDir.split("/").filter(Boolean);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (!(await adapter.exists(current))) {
+				await adapter.mkdir(current);
+			}
+		}
+		const platform = Platform.isMobileApp ? "mobile" : "desktop";
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const path = `${targetDir}/plugins-${platform}-${stamp}.json`;
+		const plugins = (this.app as unknown as {
+			plugins?: {
+				enabledPlugins?: Set<string>;
+				manifests?: Record<string, { id?: string; name?: string; version?: string; isDesktopOnly?: boolean }>;
+			};
+		}).plugins;
+		const enabled = plugins?.enabledPlugins ? Array.from(plugins.enabledPlugins).sort() : [];
+		const manifests = plugins?.manifests ?? {};
+		const installed = Object.keys(manifests).sort();
+		const payload = {
+			generatedAt: new Date().toISOString(),
+			platform,
+			yaosVersion: this.manifest.version,
+			deviceName: this.settings.deviceName,
+			settings: {
+				enableAttachmentSync: this.settings.enableAttachmentSync,
+				mobileAttachmentKillSwitch: this.settings.mobileAttachmentKillSwitch,
+				configProfileSyncEnabled: this.settings.configProfileSyncEnabled,
+				configProfileMode: this.settings.configProfileMode,
+			},
+			enabledCount: enabled.length,
+			installedCount: installed.length,
+			enabledPlugins: enabled.map((id) => ({
+				id,
+				name: manifests[id]?.name ?? id,
+				version: manifests[id]?.version ?? null,
+				isDesktopOnly: manifests[id]?.isDesktopOnly === true,
+			})),
+			installedButDisabled: installed.filter((id) => !enabled.includes(id)),
+		};
+		await adapter.write(path, `${JSON.stringify(payload, null, 2)}\n`);
+		return { path, count: enabled.length };
+	}
+
 	async buildLastBootSummaryText(): Promise<string> {
 		const adapter = this.app.vault.adapter;
 		const root = `${this.app.vault.configDir}/plugins/yaos/flight-logs`;
@@ -1745,6 +1812,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		lines.push(`plugin: ${this.manifest.version}`);
 		lines.push(`platform: ${Platform.isMobileApp ? "mobile" : "desktop"}`);
 		lines.push(`diag-boots-remaining: ${this.settings._diagBoot3Remaining}`);
+		lines.push(`attachment-sync-enabled: ${this.settings.enableAttachmentSync}`);
+		lines.push(`mobile-attachment-kill-switch: ${this.settings.mobileAttachmentKillSwitch}`);
+		try {
+			const plugins = (this.app as unknown as {
+				plugins?: {
+					enabledPlugins?: Set<string>;
+					manifests?: Record<string, { id?: string; name?: string; version?: string }>;
+				};
+			}).plugins;
+			const enabled = plugins?.enabledPlugins ? Array.from(plugins.enabledPlugins).sort() : [];
+			const manifests = plugins?.manifests ?? {};
+			lines.push(`enabled-plugins (${enabled.length}):`);
+			for (const id of enabled) {
+				const m = manifests[id];
+				lines.push(`  - ${id}${m?.version ? `@${m.version}` : ""}${m?.name && m.name !== id ? ` (${m.name})` : ""}`);
+			}
+		} catch (err) {
+			lines.push(`enabled-plugins: error (${err instanceof Error ? err.message : String(err)})`);
+		}
 		try {
 			const safe = this.isSafeToApplyProfile();
 			lines.push(`safe-to-apply-profile: ${safe.safe ? "yes" : `no (${safe.reason})`}`);

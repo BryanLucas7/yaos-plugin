@@ -29,6 +29,7 @@ export interface CommandsRuntimeHost {
 	resetLocalCache(): void;
 	nuclearReset(): void;
 	exportFlightLogsToVault(): Promise<{ copied: number; skipped: number; errors: number; targetDir: string }>;
+	exportEnabledPluginsToVault(): Promise<{ path: string; count: number }>;
 	buildLastBootSummaryText(): Promise<string>;
 }
 
@@ -297,6 +298,20 @@ export function registerCommands(
 				(err) => {
 					console.error("[yaos] export-flight-logs-to-vault failed", err);
 					new Notice("YAOS: failed to export flight logs. See console.", 7000);
+				},
+			);
+		},
+	});
+
+	registrar.addCommand({
+		id: "export-enabled-plugins-list",
+		name: "Export enabled plugins list to vault (for cross-device diff)",
+		callback: () => {
+			void host.exportEnabledPluginsToVault().then(
+				(result) => new Notice(`YAOS: wrote ${result.count} enabled plugins → ${result.path}.`, 9000),
+				(err) => {
+					console.error("[yaos] export-enabled-plugins-list failed", err);
+					new Notice("YAOS: failed to export plugin list. See console.", 7000);
 				},
 			);
 		},

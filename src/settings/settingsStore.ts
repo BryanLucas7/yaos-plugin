@@ -98,6 +98,13 @@ export interface VaultSyncSettings {
 	 * synced on mobile).
 	 */
 	diagnosticsDir: string;
+	/**
+	 * Mobile attachment kill switch (1.6.8). When true, attachment sync is forced OFF on
+	 * mobile each boot regardless of `enableAttachmentSync`. Flight logs from 1.6.7 showed
+	 * mobile crashing while `pendingBlobDownloads > 0`, so we disable the engine until
+	 * the root cause is fixed. Set to false manually in `data.json` to override.
+	 */
+	mobileAttachmentKillSwitch: boolean;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -134,6 +141,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	qaDebugMode: false,
 	_diagBoot3Remaining: 3,
 	diagnosticsDir: "YAOS-Diagnostics",
+	mobileAttachmentKillSwitch: true,
 };
 
 export interface SettingsPersistence {
@@ -248,6 +256,17 @@ export function readVaultSyncSettings(
 	}
 	if (typeof settings.diagnosticsDir !== "string" || settings.diagnosticsDir.trim() === "") {
 		settings.diagnosticsDir = DEFAULT_SETTINGS.diagnosticsDir;
+		migrated = true;
+	}
+	// 1.6.8: seed mobile attachment kill switch (default true) for users upgrading.
+	if (typeof settings.mobileAttachmentKillSwitch !== "boolean") {
+		settings.mobileAttachmentKillSwitch = DEFAULT_SETTINGS.mobileAttachmentKillSwitch;
+		migrated = true;
+	}
+	// 1.6.8: while the mobile crash is unresolved, re-arm the 3-boot window once it
+	// reaches 0 so we keep capturing logs across cycles.
+	if (settings._diagBoot3Remaining === 0) {
+		settings._diagBoot3Remaining = 3;
 		migrated = true;
 	}
 	return { settings, migrated };
