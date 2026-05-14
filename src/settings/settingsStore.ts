@@ -1,5 +1,9 @@
 import { randomBase64Url } from "../utils/base64url";
 import type { ConfigProfileAllowlistPreset, ConfigProfileMode } from "../sync/profileSyncPolicy";
+import {
+	DEFAULT_MOBILE_PROFILE_PLUGIN_IDS,
+	normalizeProfilePluginIds,
+} from "../profile/profilePackage";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
@@ -56,6 +60,10 @@ export interface VaultSyncSettings {
 	configProfileMode: ConfigProfileMode;
 	/** Active allowlist preset for profile sync. */
 	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
+	/** Mobile plugin directories included in the profile package when this device publishes. */
+	configProfileMobilePluginIds: string[];
+	/** True after YAOS has made its one-time platform-specific profile mode choice. */
+	configProfileAutoModeInitialized: boolean;
 	/** Automatically apply the first staged PC profile package on a new subscriber. */
 	configProfileInitialAutoApply: boolean;
 	/** Require a command/button after the first profile package has been applied. */
@@ -99,6 +107,8 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	configProfileSyncEnabled: false,
 	configProfileMode: "off",
 	configProfileAllowlistPreset: "mobile",
+	configProfileMobilePluginIds: [...DEFAULT_MOBILE_PROFILE_PLUGIN_IDS],
+	configProfileAutoModeInitialized: false,
 	configProfileInitialAutoApply: true,
 	configProfileManualApplyAfterInitial: true,
 	configProfileLastSeenGeneration: "",
@@ -174,6 +184,23 @@ export function readVaultSyncSettings(
 	}
 	if (typeof settings.configProfileSyncEnabled !== "boolean") {
 		settings.configProfileSyncEnabled = DEFAULT_SETTINGS.configProfileSyncEnabled;
+		migrated = true;
+	}
+	const normalizedMobilePluginIds = normalizeProfilePluginIds(
+		Array.isArray(settings.configProfileMobilePluginIds)
+			? settings.configProfileMobilePluginIds.filter((value): value is string => typeof value === "string")
+			: undefined,
+	);
+	if (
+		!Array.isArray(settings.configProfileMobilePluginIds) ||
+		normalizedMobilePluginIds.length !== settings.configProfileMobilePluginIds.length ||
+		normalizedMobilePluginIds.some((pluginId, index) => pluginId !== settings.configProfileMobilePluginIds[index])
+	) {
+		settings.configProfileMobilePluginIds = normalizedMobilePluginIds;
+		migrated = true;
+	}
+	if (typeof settings.configProfileAutoModeInitialized !== "boolean") {
+		settings.configProfileAutoModeInitialized = DEFAULT_SETTINGS.configProfileAutoModeInitialized;
 		migrated = true;
 	}
 	if (typeof settings.configProfileInitialAutoApply !== "boolean") {

@@ -5,6 +5,7 @@ import {
 	buildMobileLazyPluginDataJson,
 	buildProfilePackageArchive,
 	isProfilePackagePathAllowed,
+	normalizeProfilePluginIds,
 	validateProfilePackageArchive,
 } from "../src/profile/profilePackage";
 
@@ -47,6 +48,14 @@ console.log("\n--- Test 1: package allowlist includes mobile profile and approve
 	]) {
 		assert(isProfilePackagePathAllowed(path), `${path} is allowed in profile package`);
 	}
+	assert(
+		!isProfilePackagePathAllowed(".obsidian/plugins/custom-mobile-plugin/main.js"),
+		"custom plugin is blocked until explicitly allowed",
+	);
+	assert(
+		isProfilePackagePathAllowed(".obsidian/plugins/custom-mobile-plugin/main.js", ".obsidian", ["custom-mobile-plugin"]),
+		"custom plugin is allowed by configurable allowlist",
+	);
 }
 
 console.log("\n--- Test 2: package denylist blocks YAOS identity, unsafe plugins, and stale backups ---");
@@ -76,6 +85,9 @@ console.log("\n--- Test 3: synthesized mobile plugin activation is filtered ---"
 	assert(ids.includes("obsidian-meta-bind-plugin"), "community plugin list includes Meta Bind when packaged");
 	assert(!ids.includes("agent-client"), "community plugin list excludes Agent Client");
 	assert(!ids.includes("rich-text-editor"), "community plugin list excludes Rich Text Editor");
+	assert(ids.includes("custom-mobile-plugin") === false, "unpackaged custom plugin is not activated");
+	const customIds = JSON.parse(buildMobileCommunityPluginsJson(["custom-mobile-plugin"])) as string[];
+	assert(customIds.includes("custom-mobile-plugin"), "packaged custom plugin is activated");
 }
 
 console.log("\n--- Test 4: Lazy Plugin Loader and BRAT configs are mobile-safe ---");
@@ -100,6 +112,14 @@ console.log("\n--- Test 4: Lazy Plugin Loader and BRAT configs are mobile-safe -
 	}))) as { pluginList: string[]; updateAtStartup: boolean };
 	assert(brat.pluginList.length === 1 && brat.pluginList[0] === "BryanLucas7/yaos-plugin", "BRAT config only tracks YAOS fork");
 	assert(brat.updateAtStartup === false, "BRAT startup updates are disabled on mobile");
+
+	const normalized = normalizeProfilePluginIds([
+		"custom-mobile-plugin",
+		"agent-client",
+		"custom-mobile-plugin",
+		"bad/path",
+	], []);
+	assert(normalized.length === 1 && normalized[0] === "custom-mobile-plugin", "custom allowlist is deduped and denylisted IDs are removed");
 }
 
 console.log("\n--- Test 5: archive validation catches hashes and unsafe paths ---");
@@ -117,6 +137,7 @@ console.log("\n--- Test 5: archive validation catches hashes and unsafe paths --
 		expectedManifestHash: pkg.manifestHash,
 	});
 	assert(validated.manifest.files.length === 2, "valid package passes manifest validation");
+	assert(validated.manifest.pluginIds?.includes("dataview") === true, "manifest records packaged plugin IDs");
 	await assertRejects(
 		() => validateProfilePackageArchive(pkg.bytes, { expectedHash: "0".repeat(64) }),
 		"archive validation rejects package hash mismatch",
@@ -131,6 +152,19 @@ console.log("\n--- Test 5: archive validation catches hashes and unsafe paths --
 		}),
 		"archive builder rejects YAOS data.json",
 	);
+	const customPkg = await buildProfilePackageArchive([
+		{ path: ".obsidian/plugins/custom-mobile-plugin/main.js", data: strToU8("console.log('custom');\n") },
+	], {
+		generation: "custom-generation",
+		createdAt: "2026-05-14T00:00:00.000Z",
+		deviceName: "test-pc",
+		allowedPluginIds: ["custom-mobile-plugin"],
+	});
+	const customValidated = await validateProfilePackageArchive(customPkg.bytes, {
+		expectedHash: customPkg.hash,
+		expectedManifestHash: customPkg.manifestHash,
+	});
+	assert(customValidated.manifest.pluginIds?.includes("custom-mobile-plugin") === true, "custom package validates from manifest pluginIds");
 }
 
 console.log("\n──────────────────────────────────────────────────");

@@ -78,11 +78,31 @@ console.log("\n--- Test 6: profile sync defaults preserve original behavior ---"
 	assert(settings.configProfileSyncEnabled === false, "profile sync is disabled by default");
 	assert(settings.configProfileMode === "off", "profile sync mode defaults to off");
 	assert(settings.configProfileAllowlistPreset === "mobile", "mobile preset is the default allowlist");
+	assert(settings.configProfileAutoModeInitialized === false, "profile platform auto-mode starts uninitialized");
+	assert(settings.configProfileMobilePluginIds.includes("dataview"), "recommended mobile plugin allowlist is seeded");
+	assert(!settings.configProfileMobilePluginIds.includes("agent-client"), "blocked plugins are not in the default mobile allowlist");
 	assert(settings.configProfileInitialAutoApply === true, "initial profile auto-apply is enabled by default");
 	assert(settings.configProfileManualApplyAfterInitial === true, "future profile packages require manual apply by default");
 	assert(settings.configProfileLastSeenGeneration === "", "last seen profile generation starts empty");
 	assert(settings.configProfileLastAppliedGeneration === "", "last applied profile generation starts empty");
 	assert(settings.configProfileLastBackupGeneration === "", "last backup profile generation starts empty");
+}
+
+console.log("\n--- Test 7: profile plugin allowlist is sanitized ---");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		configProfileMobilePluginIds: [
+			"dataview",
+			"agent-client",
+			"dataview",
+			"bad/path",
+			"custom-mobile-plugin",
+		],
+	});
+	assert(settings.configProfileMobilePluginIds.length === 2, "allowlist keeps only valid unique plugin IDs");
+	assert(settings.configProfileMobilePluginIds[0] === "dataview", "allowlist preserves first valid plugin order");
+	assert(settings.configProfileMobilePluginIds[1] === "custom-mobile-plugin", "allowlist keeps valid custom plugin IDs");
+	assert(migrated, "sanitized allowlist marks settings as migrated");
 }
 
 console.log("\n──────────────────────────────────────────────────");

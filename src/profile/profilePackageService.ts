@@ -6,14 +6,16 @@ import type { VaultSync } from "../sync/vaultSync";
 import { ORIGIN_SEED } from "../sync/origins";
 import { formatUnknown } from "../utils/format";
 import {
-	MOBILE_PROFILE_PLUGIN_IDS,
 	PROFILE_PACKAGE_MAP_KEY,
 	buildMobileBratDataJson,
 	buildMobileCommunityPluginsJson,
 	buildMobileLazyPluginDataJson,
 	buildProfilePackageArchive,
+	isBlockedProfilePluginId,
 	isProfilePackagePathAllowed,
 	normalizeProfilePackagePath,
+	normalizeProfilePluginId,
+	normalizeProfilePluginIds,
 	pluginIdFromProfilePackagePath,
 	validateProfilePackageArchive,
 	type ProfilePackageFileInput,
@@ -35,6 +37,17 @@ export interface ProfilePackageSummary {
 	stagedGeneration: string | null;
 }
 
+export interface ProfilePackagePluginCandidate {
+	id: string;
+	name: string;
+	version: string | null;
+	installed: boolean;
+	included: boolean;
+	desktopOnly: boolean;
+	blocked: boolean;
+	reason: string;
+}
+
 interface ProfilePackageServiceDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
@@ -50,6 +63,13 @@ interface BackupManifest {
 	createdAt: string;
 	paths: string[];
 	files: string[];
+}
+
+interface PluginManifestInfo {
+	id: string;
+	name: string;
+	version: string | null;
+	isDesktopOnly: boolean;
 }
 
 const PROFILE_PACKAGE_LOCAL_DIR_SUFFIX = "plugins/yaos/profile-packages";
@@ -135,6 +155,43 @@ export class ProfilePackageService {
 		};
 	}
 
+	async getPluginCandidates(): Promise<ProfilePackagePluginCandidate[]> {
+		const configured = new Set(this.configuredMobilePluginIds());
+		const installed = new Set(await this.listInstalledPluginIds());
+		for (const pluginId of configured) installed.add(pluginId);
+		const candidates: ProfilePackagePluginCandidate[] = [];
+		for (const pluginId of Array.from(installed).sort((a, b) => a.localeCompare(b))) {
+			const manifest = await this.readPluginManifest(pluginId);
+			const blocked = isBlockedProfilePluginId(pluginId);
+			const desktopOnly = manifest?.isDesktopOnly === true;
+			const installedPlugin = manifest !== null;
+			const included = configured.has(pluginId) && installedPlugin && !blocked && !desktopOnly;
+			let reason = "Will be included in the next published mobile profile package.";
+			if (blocked) {
+				reason = pluginId === "yaos"
+					? "YAOS is installed and updated by BRAT; profile packages never overwrite it."
+					: "Blocked by the profile package denylist.";
+			} else if (!installedPlugin) {
+				reason = "Configured, but this plugin folder or manifest is not installed on this device.";
+			} else if (desktopOnly) {
+				reason = "Excluded automatically because manifest.json has isDesktopOnly: true.";
+			} else if (!configured.has(pluginId)) {
+				reason = "Installed and mobile-compatible, but not selected for the mobile profile package.";
+			}
+			candidates.push({
+				id: pluginId,
+				name: manifest?.name || pluginId,
+				version: manifest?.version ?? null,
+				installed: installedPlugin,
+				included,
+				desktopOnly,
+				blocked,
+				reason,
+			});
+		}
+		return candidates;
+	}
+
 	async publishNow(): Promise<void> {
 		const settings = this.deps.getSettings();
 		if (!settings.configProfileSyncEnabled || settings.configProfileMode !== "publish") {
@@ -153,12 +210,14 @@ export class ProfilePackageService {
 		try {
 			const generation = generationId();
 			const createdAt = new Date().toISOString();
-			const files = await this.collectProfileFiles();
+			const allowedPluginIds = await this.effectiveMobilePluginIds();
+			const files = await this.collectProfileFiles(allowedPluginIds);
 			const pkg = await buildProfilePackageArchive(files, {
 				generation,
 				createdAt,
 				deviceName: settings.deviceName || "Unnamed device",
 				configDir: this.configDir,
+				allowedPluginIds,
 			});
 			const transport = this.transport();
 			await transport.upload(pkg.hash, pkg.bytes);
@@ -333,7 +392,29 @@ export class ProfilePackageService {
 		return `${this.localDir}/${BACKUP_DIR}/${generation}.json`;
 	}
 
-	private async collectProfileFiles(): Promise<ProfilePackageFileInput[]> {
+	private configuredMobilePluginIds(): string[] {
+		return normalizeProfilePluginIds(this.deps.getSettings().configProfileMobilePluginIds);
+	}
+
+	private async effectiveMobilePluginIds(): Promise<string[]> {
+		const result: string[] = [];
+		for (const pluginId of this.configuredMobilePluginIds()) {
+			if (isBlockedProfilePluginId(pluginId)) continue;
+			const manifest = await this.readPluginManifest(pluginId);
+			if (!manifest) {
+				this.deps.log(`Profile package skipped missing plugin manifest: ${pluginId}`);
+				continue;
+			}
+			if (manifest.isDesktopOnly) {
+				this.deps.log(`Profile package skipped desktop-only plugin: ${pluginId}`);
+				continue;
+			}
+			result.push(pluginId);
+		}
+		return result;
+	}
+
+	private async collectProfileFiles(allowedPluginIds: string[]): Promise<ProfilePackageFileInput[]> {
 		const configDir = this.configDir;
 		const result = new Map<string, Uint8Array>();
 		const packagedPluginIds = new Set<string>();
@@ -351,18 +432,18 @@ export class ProfilePackageService {
 		];
 		for (const file of rootFiles) {
 			const path = `${configDir}/${file}`;
-			if (await this.exists(path) && isProfilePackagePathAllowed(path, configDir)) {
+			if (await this.exists(path) && isProfilePackagePathAllowed(path, configDir, allowedPluginIds)) {
 				result.set(normalizeProfilePackagePath(path), new Uint8Array(await this.adapter.readBinary(path)));
 			}
 		}
 		for (const folder of ["snippets", "themes", "icons"]) {
-			await this.collectFolder(`${configDir}/${folder}`, result);
+			await this.collectFolder(`${configDir}/${folder}`, result, allowedPluginIds);
 		}
-		for (const pluginId of MOBILE_PROFILE_PLUGIN_IDS) {
+		for (const pluginId of allowedPluginIds) {
 			const pluginDir = `${configDir}/plugins/${pluginId}`;
 			if (!await this.exists(pluginDir)) continue;
 			const beforeCount = result.size;
-			await this.collectFolder(pluginDir, result);
+			await this.collectFolder(pluginDir, result, allowedPluginIds);
 			if (result.size > beforeCount) {
 				packagedPluginIds.add(pluginId);
 			}
@@ -371,11 +452,15 @@ export class ProfilePackageService {
 			normalizeProfilePackagePath(`${configDir}/community-plugins.json`),
 			textBytes(buildMobileCommunityPluginsJson(packagedPluginIds)),
 		);
-		await this.applyProfileFileSynthesizers(result);
+		await this.applyProfileFileSynthesizers(result, packagedPluginIds);
 		return Array.from(result, ([path, data]) => ({ path, data }));
 	}
 
-	private async collectFolder(path: string, result: Map<string, Uint8Array>): Promise<void> {
+	private async collectFolder(
+		path: string,
+		result: Map<string, Uint8Array>,
+		allowedPluginIds: Iterable<string>,
+	): Promise<void> {
 		if (!await this.exists(path)) return;
 		let listed: { files: string[]; folders: string[] };
 		try {
@@ -385,19 +470,22 @@ export class ProfilePackageService {
 		}
 		for (const file of listed.files) {
 			const normalized = normalizeProfilePackagePath(file);
-			if (!isProfilePackagePathAllowed(normalized, this.configDir)) continue;
+			if (!isProfilePackagePathAllowed(normalized, this.configDir, allowedPluginIds)) continue;
 			result.set(normalized, new Uint8Array(await this.adapter.readBinary(normalized)));
 		}
 		for (const folder of listed.folders) {
-			await this.collectFolder(folder, result);
+			await this.collectFolder(folder, result, allowedPluginIds);
 		}
 	}
 
-	private async applyProfileFileSynthesizers(result: Map<string, Uint8Array>): Promise<void> {
+	private async applyProfileFileSynthesizers(
+		result: Map<string, Uint8Array>,
+		pluginIds: Iterable<string>,
+	): Promise<void> {
 		const configDir = this.configDir;
 		const lazyPath = normalizeProfilePackagePath(`${configDir}/plugins/lazy-plugins/data.json`);
 		if (result.has(lazyPath)) {
-			result.set(lazyPath, textBytes(buildMobileLazyPluginDataJson(await this.readTextIfExists(lazyPath))));
+			result.set(lazyPath, textBytes(buildMobileLazyPluginDataJson(await this.readTextIfExists(lazyPath), pluginIds)));
 		}
 		const bratPath = normalizeProfilePackagePath(`${configDir}/plugins/obsidian42-brat/data.json`);
 		if (result.has(bratPath)) {
@@ -475,6 +563,11 @@ export class ProfilePackageService {
 
 	private async createBackup(manifest: ProfilePackageManifest, targetPaths: string[]): Promise<void> {
 		const existingFiles: ProfilePackageFileInput[] = [];
+		const backupAllowedPluginIds = new Set(this.configuredMobilePluginIds());
+		for (const path of targetPaths) {
+			const pluginId = pluginIdFromProfilePackagePath(path, this.configDir);
+			if (pluginId) backupAllowedPluginIds.add(pluginId);
+		}
 		for (const path of targetPaths) {
 			if (await this.exists(path)) {
 				existingFiles.push({
@@ -488,6 +581,7 @@ export class ProfilePackageService {
 			createdAt: new Date().toISOString(),
 			deviceName: "local-backup",
 			configDir: this.configDir,
+			allowedPluginIds: backupAllowedPluginIds,
 		});
 		const backupManifest: BackupManifest = {
 			schemaVersion: 1,
@@ -519,6 +613,39 @@ export class ProfilePackageService {
 		} catch (err) {
 			console.warn(`[yaos] Failed to disable plugin before profile apply: ${pluginId}`, err);
 			return false;
+		}
+	}
+
+	private async listInstalledPluginIds(): Promise<string[]> {
+		const pluginRoot = `${this.configDir}/plugins`;
+		if (!await this.exists(pluginRoot)) return [];
+		try {
+			const listed = await this.adapter.list(pluginRoot);
+			return listed.folders
+				.map((folder) => normalizeProfilePackagePath(folder).split("/").pop() ?? "")
+				.map((pluginId) => normalizeProfilePluginId(pluginId))
+				.filter((pluginId): pluginId is string => !!pluginId);
+		} catch {
+			return [];
+		}
+	}
+
+	private async readPluginManifest(pluginId: string): Promise<PluginManifestInfo | null> {
+		const normalized = normalizeProfilePluginId(pluginId);
+		if (!normalized) return null;
+		const manifestPath = `${this.configDir}/plugins/${normalized}/manifest.json`;
+		if (!await this.exists(manifestPath)) return null;
+		try {
+			const parsed = JSON.parse(await this.adapter.read(manifestPath)) as Record<string, unknown>;
+			const id = typeof parsed.id === "string" && parsed.id.trim() ? parsed.id.trim() : normalized;
+			return {
+				id,
+				name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : id,
+				version: typeof parsed.version === "string" ? parsed.version : null,
+				isDesktopOnly: parsed.isDesktopOnly === true,
+			};
+		} catch {
+			return null;
 		}
 	}
 

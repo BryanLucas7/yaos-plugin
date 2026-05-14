@@ -21,6 +21,8 @@ export interface RuntimeConfig {
 	configProfileSyncEnabled: boolean;
 	configProfileMode: ConfigProfileMode;
 	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
+	configProfileMobilePluginIds: string[];
+	configProfileAutoModeInitialized: boolean;
 	configProfileInitialAutoApply: boolean;
 	configProfileManualApplyAfterInitial: boolean;
 	configProfileLastSeenGeneration: string;
@@ -54,6 +56,8 @@ export function buildRuntimeConfig(
 		configProfileSyncEnabled: settings.configProfileSyncEnabled,
 		configProfileMode: settings.configProfileMode,
 		configProfileAllowlistPreset: settings.configProfileAllowlistPreset,
+		configProfileMobilePluginIds: [...settings.configProfileMobilePluginIds],
+		configProfileAutoModeInitialized: settings.configProfileAutoModeInitialized,
 		configProfileInitialAutoApply: settings.configProfileInitialAutoApply,
 		configProfileManualApplyAfterInitial: settings.configProfileManualApplyAfterInitial,
 		configProfileLastSeenGeneration: settings.configProfileLastSeenGeneration,

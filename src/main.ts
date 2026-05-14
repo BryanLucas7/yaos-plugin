@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFile, arrayBufferToHex } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -66,7 +66,10 @@ import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
-import { ProfilePackageService } from "./profile/profilePackageService";
+import {
+	ProfilePackageService,
+	type ProfilePackagePluginCandidate,
+} from "./profile/profilePackageService";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
@@ -737,6 +740,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			latestSize: null,
 			stagedGeneration: this.settings.configProfileLastSeenGeneration || null,
 		};
+	}
+
+	async getConfigProfilePluginCandidates(): Promise<ProfilePackagePluginCandidate[]> {
+		if (this.profilePackageService) {
+			return await this.profilePackageService.getPluginCandidates();
+		}
+		const service = new ProfilePackageService({
+			app: this.app,
+			getSettings: () => this.settings,
+			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
+			getVaultSync: () => this.vaultSync,
+			getTraceHttpContext: () => this.getTraceHttpContext(),
+			log: (message) => this.log(message),
+		});
+		return await service.getPluginCandidates();
 	}
 
 	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
@@ -1590,6 +1608,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = persistedState;
 		this.persistedState = persistedState;
 		this.settings = settings;
+		const autoModeApplied = this.applyInitialMobileProfileMode();
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -1620,9 +1639,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated) {
+		if (migrated || autoModeApplied) {
 			await this.persistPluginState();
 		}
+	}
+
+	private applyInitialMobileProfileMode(): boolean {
+		if (this.settings.configProfileAutoModeInitialized) return false;
+		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
+		this.settings.configProfileSyncEnabled = true;
+		this.settings.configProfileMode = "subscribe";
+		this.settings.configProfileInitialAutoApply = true;
+		this.settings.configProfileManualApplyAfterInitial = true;
+		this.settings.configProfileAutoModeInitialized = true;
+		return true;
 	}
 
 	async saveSettings(reason = "settings-save") {

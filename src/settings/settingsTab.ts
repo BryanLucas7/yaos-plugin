@@ -7,7 +7,14 @@ import {
 	type VaultSyncSettings,
 } from "./settingsStore";
 import { randomBase64Url } from "../utils/base64url";
-import type { ProfilePackageSummary } from "../profile/profilePackageService";
+import {
+	DEFAULT_MOBILE_PROFILE_PLUGIN_IDS,
+	normalizeProfilePluginIds,
+} from "../profile/profilePackage";
+import type {
+	ProfilePackagePluginCandidate,
+	ProfilePackageSummary,
+} from "../profile/profilePackageService";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -39,6 +46,7 @@ export interface VaultSyncSettingsHost {
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
 	getProfilePackageSummary(): ProfilePackageSummary;
+	getConfigProfilePluginCandidates(): Promise<ProfilePackagePluginCandidate[]>;
 	publishObsidianProfilePackageNow(): Promise<void>;
 	applyLatestObsidianProfilePackage(): Promise<void>;
 	restorePreviousObsidianProfilePackage(): Promise<void>;
@@ -114,6 +122,69 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		private readonly host: VaultSyncSettingsHost,
 	) {
 		super(app, plugin);
+	}
+
+	private renderProfilePluginAllowlist(containerEl: HTMLElement): void {
+		const loadingEl = containerEl.createEl("p", {
+			text: "Loading installed plugins...",
+			cls: "yaos-settings-status-subtitle",
+		});
+		void this.host.getConfigProfilePluginCandidates().then((candidates) => {
+			if (!containerEl.isConnected) return;
+			loadingEl.remove();
+			const actions = containerEl.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
+			actions.createEl("button", { text: "Reset recommended" }).addEventListener("click", () => {
+				void this.host.updateSettings((settings) => {
+					settings.configProfileMobilePluginIds = [...DEFAULT_MOBILE_PROFILE_PLUGIN_IDS];
+				}, "settings:profile-plugin-allowlist-reset").then(() => this.display());
+			});
+			actions.createEl("button", { text: "Include compatible installed" }).addEventListener("click", () => {
+				void this.host.updateSettings((settings) => {
+					settings.configProfileMobilePluginIds = candidates
+						.filter((candidate) => candidate.installed && !candidate.blocked && !candidate.desktopOnly)
+						.map((candidate) => candidate.id);
+				}, "settings:profile-plugin-allowlist-compatible").then(() => this.display());
+			});
+
+			if (candidates.length === 0) {
+				containerEl.createEl("p", {
+					text: "No community plugin folders were found.",
+					cls: "yaos-settings-status-subtitle",
+				});
+				return;
+			}
+
+			for (const candidate of candidates) {
+				const descParts = [
+					candidate.id,
+					candidate.version ? `v${candidate.version}` : null,
+					candidate.reason,
+				].filter((part): part is string => !!part);
+				new Setting(containerEl)
+					.setName(candidate.name)
+					.setDesc(descParts.join(" - "))
+					.addToggle((toggle) => {
+						toggle
+							.setValue(candidate.included)
+							.setDisabled(candidate.blocked || candidate.desktopOnly || !candidate.installed)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									const next = new Set(normalizeProfilePluginIds(settings.configProfileMobilePluginIds, []));
+									if (value) {
+										next.add(candidate.id);
+									} else {
+										next.delete(candidate.id);
+									}
+									settings.configProfileMobilePluginIds = normalizeProfilePluginIds(next, []);
+								}, "settings:profile-plugin-allowlist");
+								this.display();
+							});
+					});
+			}
+		}, () => {
+			if (!containerEl.isConnected) return;
+			loadingEl.setText("Could not load installed plugins. Check the console.");
+		});
 	}
 
 	display(): void {
@@ -390,6 +461,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						void this.host.restorePreviousObsidianProfilePackage().then(() => this.display());
 					});
 				}
+
+				const pluginAllowlistEl = containerEl.createDiv({ cls: "yaos-settings-status-card" });
+				pluginAllowlistEl.createEl("div", {
+					text: "Mobile profile plugins",
+					cls: "yaos-settings-status-title",
+				});
+				pluginAllowlistEl.createEl("p", {
+					text: "Select installed plugins to include in the package. Desktop-only plugins are detected from manifest.json and disabled here automatically.",
+					cls: "yaos-settings-status-subtitle",
+				});
+				this.renderProfilePluginAllowlist(pluginAllowlistEl);
 			}
 
 			new Setting(containerEl)
