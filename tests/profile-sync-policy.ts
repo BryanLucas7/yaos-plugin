@@ -47,23 +47,32 @@ console.log("\n--- Test 1: profile sync stays off by default ---");
 
 console.log("\n--- Test 2: publish mode can upload mobile profile files ---");
 {
-	assert(isBlobSyncable(".obsidian/workspace-mobile.json", [], configDir, publish), "workspace-mobile is uploadable in publish mode");
-	assert(isBlobSyncable(".obsidian/plugins/yaos/main.js", [], configDir, publish), "YAOS main.js is uploadable in publish mode");
-	assert(isBlobSyncable(".obsidian/plugins/dataview/main.js", [], configDir, publish), "approved plugin payload is uploadable in publish mode");
+	assert(isBlobSyncable(".obsidian/appearance.json", [], configDir, publish), "appearance.json is uploadable in publish mode");
+	assert(isBlobSyncable(".obsidian/graph.json", [], configDir, publish), "graph.json is uploadable in publish mode");
+	assert(isBlobSyncable(".obsidian/snippets/mobile.css", [], configDir, publish), "snippets are uploadable in publish mode");
+	assert(isBlobSyncable(".obsidian/themes/FastPpuccin/theme.css", [], configDir, publish), "themes are uploadable in publish mode");
 }
 
 console.log("\n--- Test 3: subscribe mode downloads but does not upload profile files ---");
 {
-	assert(!isBlobSyncable(".obsidian/workspace-mobile.json", [], configDir, subscribeUpload), "subscribe mode blocks profile uploads");
-	assert(isBlobSyncable(".obsidian/workspace-mobile.json", [], configDir, subscribeDownload), "subscribe mode allows profile downloads");
+	assert(!isBlobSyncable(".obsidian/appearance.json", [], configDir, subscribeUpload), "subscribe mode blocks profile uploads");
+	assert(isBlobSyncable(".obsidian/appearance.json", [], configDir, subscribeDownload), "subscribe mode allows profile downloads");
 }
 
-console.log("\n--- Test 4: sensitive and backup paths are always blocked ---");
+console.log("\n--- Test 4: live plugin, workspace, activation, and backup paths are always blocked ---");
 {
 	for (const path of [
+		".obsidian/community-plugins.json",
+		".obsidian/workspace-mobile.json",
+		".obsidian/workspaces.json",
+		".obsidian/plugins/yaos/main.js",
+		".obsidian/plugins/yaos/manifest.json",
+		".obsidian/plugins/yaos/styles.css",
 		".obsidian/plugins/yaos/data.json",
 		".obsidian/plugins/yaos/logs/today.log",
 		".obsidian/plugins/yaos/diagnostics/report.json",
+		".obsidian/plugins/dataview/main.js",
+		".obsidian/plugins/obsidian42-brat/data.json",
 		".obsidian/plugins/agent-client/main.js",
 		".obsidian/plugins/rich-text-editor/main.js",
 		".obsidian/workspace-mobile.before-clear.json",

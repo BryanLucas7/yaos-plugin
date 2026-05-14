@@ -295,7 +295,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(containerEl)
 				.setName("Sync Obsidian profile")
-				.setDesc("Sync an explicit mobile allowlist from the Obsidian config folder. YAOS tokens, logs, backups, and desktop-only plugins are never synced.")
+				.setDesc("Sync a conservative mobile allowlist from the Obsidian config folder. Live plugin files, plugin settings, workspaces, BRAT config, YAOS tokens, logs, and backups are never synced.")
 				.addToggle((toggle) =>
 					toggle
 						.setValue(this.host.settings.configProfileSyncEnabled)
