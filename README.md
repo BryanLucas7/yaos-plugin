@@ -124,7 +124,7 @@ After enabling, go to **Settings → YAOS**.
 | **Exclude paths** | Comma-separated prefixes to skip (e.g. `templates/, .trash/`) |
 | **Max text file size** | Skip text files larger than this for live document sync |
 | **Sync attachments** | Enable R2 sync for images, PDFs, and other non-markdown files |
-| **Max attachment size** | Skip attachments larger than this (default 10 MB) |
+| **Max attachment size** | Skip attachments larger than this (default 100 MB) |
 | **Parallel transfers** | Number of simultaneous attachment upload/download slots |
 | **Show remote cursors** | Display cursor positions and selections from other devices |
 | **Edits from other apps** | Control how YAOS handles changes from git, scripts, or other editors |

@@ -35,7 +35,8 @@ export async function handleProfileLockRoute(
 	if (req.method === "PUT") {
 		let body: ProfileLockPutBody;
 		try {
-			body = (await req.json()) as ProfileLockPutBody;
+			const parsed: unknown = await req.json();
+			body = typeof parsed === "object" && parsed !== null ? parsed : {};
 		} catch {
 			return json({ error: "invalid json" }, 400);
 		}

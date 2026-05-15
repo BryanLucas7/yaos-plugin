@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFile, arrayBufferToHex, normalizePath } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -78,6 +78,19 @@ import { formatUnknown, yTextToString } from "./utils/format";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runVfsTortureTest } from "./dev/vfsTortureTest";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
+import { filterBratBetaList, type BratBetaEntry } from "./profile/bratFilter";
+import { applyLazyDesktopToMobileClone, getInstantPluginIdsFromLazy, type LazyData } from "./profile/lazyPluginLoader";
+import {
+	OBSIDIAN_MOBILE_DIR,
+	planMobileFolderPreparation,
+} from "./profile/obsidianMobileFolder";
+import { ProfileMirrorService } from "./profile/profileMirrorService";
+import { HttpProfileLockTransport } from "./profile/profileLockStore";
+import { ALLOWED_ROOT_CONFIG_FILES, createProfilePolicy, type PluginManifestLike, type Profile, type ProfilePolicy } from "./profile/profilePolicy";
+import { ProfilePublisher } from "./profile/profilePublisher";
+import { ProfileSubscriber } from "./profile/profileSubscriber";
+import { HttpProfileBlobTransport, sha256Hex as sha256BytesHex } from "./profile/profileTransport";
+import type { ScannedConfigDir, ScannedFile, ScannedPlugin } from "./profile/profileManifest";
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -107,8 +120,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
+	private profileMirrorService: ProfileMirrorService | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
+	private pendingProfilePluginRestartIds: string[] = [];
+	private profileLazyCloneOccurredDuringPublish = false;
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -177,6 +193,404 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.reconciliationController;
 	}
 
+	private setupProfileMirrorService(): void {
+		this.profileMirrorService = new ProfileMirrorService({
+			applyLock: (lock) => this.applyProfileMirrorLock(lock),
+			publish: () => this.publishProfileMirrorCurrentSettings(),
+			getRemoteLock: () => this.createProfileLockTransport().getLock(),
+			updateSettings: (mutate, reason) =>
+				this.updateSettings((settings) => mutate(settings), reason),
+			isMobileDevice: () => Platform.isMobileApp,
+			log: (message) => this.log(message),
+		});
+	}
+
+	private createProfileEndpoint(): { host: string; vaultId: string; token: string } {
+		const host = this.settings.host.trim();
+		const vaultId = this.settings.vaultId.trim();
+		const token = this.settings.token.trim();
+		if (!host || !vaultId || !token) {
+			throw new Error("Profile Mirror requires host, vault ID, and token.");
+		}
+		return { host, vaultId, token };
+	}
+
+	private createProfileLockTransport(): HttpProfileLockTransport {
+		return new HttpProfileLockTransport(this.createProfileEndpoint());
+	}
+
+	private createProfileBlobTransport(): HttpProfileBlobTransport {
+		return new HttpProfileBlobTransport(this.createProfileEndpoint());
+	}
+
+	private profileConfigDir(profile: Profile): string {
+		const explicit = profile === "desktop"
+			? this.settings.configProfileDesktopConfigDir.trim()
+			: this.settings.configProfileMobileConfigDir.trim();
+		return normalizePath(explicit || (profile === "desktop" ? this.app.vault.configDir : OBSIDIAN_MOBILE_DIR));
+	}
+
+	private createSettingsProfilePolicy(): ProfilePolicy {
+		const base = createProfilePolicy();
+		const included = new Set(this.settings.configProfileIncludedPluginIds.map((id) => id.trim()).filter(Boolean));
+		const excluded = new Set(this.settings.configProfileExcludedPluginIds.map((id) => id.trim()).filter(Boolean));
+		return {
+			isBootstrapPluginId: (pluginId) => base.isBootstrapPluginId(pluginId),
+			isAllowedRootConfigFile: (name) => base.isAllowedRootConfigFile(name),
+			isPathAllowedForProfile: (relativePath, profile) => base.isPathAllowedForProfile(relativePath, profile),
+			isPluginAllowedForProfile: (pluginId, manifest, profile) => {
+				if (excluded.has(pluginId)) return false;
+				if (included.size > 0 && !included.has(pluginId)) return false;
+				return base.isPluginAllowedForProfile(pluginId, manifest, profile);
+			},
+		};
+	}
+
+	private async publishProfileMirrorCurrentSettings(): Promise<void> {
+		const profile = this.settings.configProfileCurrentProfile;
+		const lockTransport = this.createProfileLockTransport();
+		const blobTransport = this.createProfileBlobTransport();
+		const policy = this.createSettingsProfilePolicy();
+		this.profileLazyCloneOccurredDuringPublish = false;
+		const publisher = new ProfilePublisher({
+			profile,
+			policy,
+			transport: {
+				getLock: () => lockTransport.getLock(),
+				putLock: (body) => lockTransport.putLock(body),
+				uploadJsonBlob: (value) => blobTransport.uploadJsonBlob(value),
+				existsBatch: (hashes) => blobTransport.existsBatch(hashes),
+				uploadBlob: (bytes, expectedHash) => blobTransport.uploadBlob(bytes, expectedHash),
+			},
+			trust: {
+				canPublishProfile: this.settings.configProfileCanPublishProfile,
+				canPublishPluginCode: this.settings.configProfileCanPublishPluginCode,
+			},
+			deviceId: this.settings.deviceName || "unknown-device",
+			deviceName: this.settings.deviceName || "Unknown device",
+			now: () => new Date().toISOString(),
+			nextGeneration: (previous) => `${Date.now().toString(36)}-${profile}-${previous ? "r" : "i"}`,
+			getInstantPluginIds: (targetProfile) => this.getInstantProfilePluginIds(targetProfile),
+		});
+
+		const configDir = this.profileConfigDir(profile);
+		const outcome = await publisher.publish(() => this.scanProfileConfigDir(configDir));
+		if (outcome.kind === "no-permission") {
+			new Notice("Profile mirror: this device is not allowed to publish.");
+			return;
+		}
+		if (outcome.kind === "max-rebases-exceeded") {
+			new Notice("Profile mirror: publish conflict. Try again after this device catches up.", 7000);
+			return;
+		}
+		await this.updateSettings((settings) => {
+			settings.configProfileBaseGeneration = outcome.lock.generation;
+			settings.configProfileLastSeenGeneration = outcome.lock.generation;
+			if (this.profileLazyCloneOccurredDuringPublish) {
+				settings.configProfileLazyMobileInitialized = true;
+			}
+		}, "profile-mirror:publish");
+		new Notice(`Profile mirror: published ${profile} profile.`);
+	}
+
+	private async applyProfileMirrorLock(lock: import("./profile/profileLock").ProfileLock): Promise<void> {
+		const profile = this.settings.configProfileCurrentProfile;
+		const blobTransport = this.createProfileBlobTransport();
+		const configDir = this.profileConfigDir(profile);
+		const subscriber = new ProfileSubscriber({
+			profile,
+			transport: {
+				downloadBlob: (hash) => blobTransport.downloadBlob(hash),
+				downloadJsonBlob: (hash) => blobTransport.downloadJsonBlob(hash),
+			},
+			fs: {
+				hashOf: (path) => this.hashConfigFile(configDir, path),
+				writeStaging: (path, bytes) => this.writeConfigFile(`${configDir}/.profile-staging`, path, bytes),
+				writeLive: (path, bytes) => this.writeConfigFile(configDir, path, bytes),
+				listLiveUnder: (prefix) => this.listRelativeFiles(normalizePath(`${configDir}/${prefix}`), configDir),
+				deleteLive: (path) => this.deleteConfigFile(configDir, path),
+			},
+			state: {
+				getLastAppliedGeneration: async () => this.settings.configProfileLastAppliedGeneration || null,
+				setLastAppliedGeneration: async (generation) => {
+					await this.updateSettings((settings) => {
+						settings.configProfileLastAppliedGeneration = generation;
+						settings.configProfileLastSeenGeneration = generation;
+					}, "profile-mirror:apply");
+				},
+				getPendingPluginRestartIds: async () => [...this.pendingProfilePluginRestartIds],
+				setPendingPluginRestartIds: async (ids) => {
+					this.pendingProfilePluginRestartIds = [...ids];
+					this.refreshStatusBar();
+				},
+			},
+			runtime: {
+				isPluginActive: (pluginId) => this.isCommunityPluginActive(pluginId),
+			},
+		});
+		const outcome = await subscriber.applyLock(lock);
+		if (outcome.deferredPluginIds.length > 0) {
+			new Notice(`Profile mirror: ${outcome.deferredPluginIds.length} plugin update(s) will apply after restart.`, 7000);
+		}
+	}
+
+	private async scanProfileConfigDir(configDir: string): Promise<ScannedConfigDir> {
+		const rootConfigFiles: ScannedConfigDir["rootConfigFiles"] = [];
+		for (const name of ALLOWED_ROOT_CONFIG_FILES) {
+			const path = normalizePath(`${configDir}/${name}`);
+			if (!(await this.adapterExists(path))) continue;
+			const bytes = await this.readAdapterBytes(path);
+			rootConfigFiles.push({
+				name,
+				hash: await sha256BytesHex(bytes),
+				size: bytes.byteLength,
+				bytes,
+			});
+		}
+
+		const scanTypedFolder = async (
+			folderName: "snippets" | "themes" | "icons",
+			kind: ScannedFile["kind"],
+		): Promise<ScannedFile[]> => {
+			const folder = normalizePath(`${configDir}/${folderName}`);
+			const files = await this.listRelativeFiles(folder, configDir);
+			const out: ScannedFile[] = [];
+			for (const relativePath of files) {
+				const bytes = await this.readAdapterBytes(normalizePath(`${configDir}/${relativePath}`));
+				out.push({
+					path: relativePath,
+					hash: await sha256BytesHex(bytes),
+					size: bytes.byteLength,
+					kind,
+					bytes,
+				});
+			}
+			return out;
+		};
+
+		const plugins = await this.scanProfilePlugins(configDir);
+		const rawCommunityPluginIds = await this.readJsonFromAdapter<string[]>(normalizePath(`${configDir}/community-plugins.json`)) ?? [];
+
+		return {
+			rootConfigFiles,
+			snippetFiles: await scanTypedFolder("snippets", "snippet"),
+			themeFiles: await scanTypedFolder("themes", "theme"),
+			iconFiles: await scanTypedFolder("icons", "icon"),
+			plugins,
+			rawCommunityPluginIds: Array.isArray(rawCommunityPluginIds)
+				? rawCommunityPluginIds.filter((id): id is string => typeof id === "string")
+				: [],
+		};
+	}
+
+	private async scanProfilePlugins(configDir: string): Promise<ScannedPlugin[]> {
+		const pluginsDir = normalizePath(`${configDir}/plugins`);
+		if (!(await this.adapterExists(pluginsDir))) return [];
+		let folders: string[] = [];
+		try {
+			folders = (await this.app.vault.adapter.list(pluginsDir)).folders;
+		} catch {
+			return [];
+		}
+
+		const plugins: ScannedPlugin[] = [];
+		for (const folder of folders) {
+			const pluginId = folder.split("/").pop();
+			if (!pluginId) continue;
+			const manifestPath = normalizePath(`${folder}/manifest.json`);
+			const manifest = await this.readJsonFromAdapter<PluginManifestLike>(manifestPath);
+			if (!manifest || typeof manifest.id !== "string" || typeof manifest.version !== "string") continue;
+
+			const files = await this.listRelativeFiles(folder, configDir);
+			const codeFiles: ScannedPlugin["codeFiles"] = [];
+			let dataJson: ScannedPlugin["dataJson"] = null;
+			const otherBehaviorFiles: ScannedPlugin["otherBehaviorFiles"] = [];
+
+			for (const relativePath of files) {
+				const bytes = await this.readAdapterBytes(normalizePath(`${configDir}/${relativePath}`));
+				const entry = {
+					path: relativePath,
+					hash: await sha256BytesHex(bytes),
+					size: bytes.byteLength,
+					bytes,
+				};
+				const tail = relativePath.split("/").pop() ?? "";
+				if (tail === "data.json") {
+					const transformed = await this.transformPluginDataJsonForProfile(pluginId, bytes);
+					dataJson = transformed;
+				} else {
+					codeFiles.push(entry);
+				}
+			}
+
+			plugins.push({
+				pluginId,
+				manifest,
+				codeFiles,
+				dataJson,
+				otherBehaviorFiles,
+			});
+		}
+		return plugins;
+	}
+
+	private async transformPluginDataJsonForProfile(
+		pluginId: string,
+		bytes: Uint8Array,
+	): Promise<{ hash: string; size: number; bytes: Uint8Array }> {
+		if (pluginId === "lazy-plugins" && this.settings.configProfileCurrentProfile === "mobile") {
+			try {
+				const data = JSON.parse(new TextDecoder().decode(bytes)) as LazyData;
+				const cloned = applyLazyDesktopToMobileClone({
+					current: data,
+					initialCloneEnabled: this.settings.configProfileInitialCloneDesktopLazyToMobile,
+					alreadyInitialised: this.settings.configProfileLazyMobileInitialized,
+				});
+				if (cloned.didClone) {
+					this.profileLazyCloneOccurredDuringPublish = true;
+					const nextBytes = new TextEncoder().encode(JSON.stringify(cloned.next, null, 2));
+					return {
+						hash: await sha256BytesHex(nextBytes),
+						size: nextBytes.byteLength,
+						bytes: nextBytes,
+					};
+				}
+			} catch {
+				// Fall back to the original data.json; malformed plugin data should not block the whole profile.
+			}
+		}
+
+		if (pluginId === "obsidian42-brat") {
+			try {
+				const data = JSON.parse(new TextDecoder().decode(bytes)) as { betaPlugins?: unknown };
+				const entries = Array.isArray(data.betaPlugins)
+					? data.betaPlugins as BratBetaEntry[]
+					: [];
+				const next = {
+					...data,
+					betaPlugins: filterBratBetaList({
+						entries,
+						profile: this.settings.configProfileCurrentProfile,
+						policy: this.createSettingsProfilePolicy(),
+					}),
+				};
+				const nextBytes = new TextEncoder().encode(JSON.stringify(next, null, 2));
+				return {
+					hash: await sha256BytesHex(nextBytes),
+					size: nextBytes.byteLength,
+					bytes: nextBytes,
+				};
+			} catch {
+				// BRAT remains bootstrap-local; if parsing fails, leave the original bytes alone.
+			}
+		}
+
+		return {
+			hash: await sha256BytesHex(bytes),
+			size: bytes.byteLength,
+			bytes,
+		};
+	}
+
+	private async getInstantProfilePluginIds(profile: Profile): Promise<string[]> {
+		const configDir = this.profileConfigDir(profile);
+		const lazyData = await this.readJsonFromAdapter<LazyData>(normalizePath(`${configDir}/plugins/lazy-plugins/data.json`));
+		return getInstantPluginIdsFromLazy(lazyData, profile);
+	}
+
+	private isCommunityPluginActive(pluginId: string): boolean {
+		const plugins = (this.app as unknown as {
+			plugins?: { enabledPlugins?: Set<string> };
+		}).plugins;
+		return plugins?.enabledPlugins?.has(pluginId) === true;
+	}
+
+	private async hashConfigFile(configDir: string, relativePath: string): Promise<string | null> {
+		const path = normalizePath(`${configDir}/${relativePath}`);
+		if (!(await this.adapterExists(path))) return null;
+		const bytes = await this.readAdapterBytes(path);
+		return sha256BytesHex(bytes);
+	}
+
+	private async writeConfigFile(configDir: string, relativePath: string, bytes: Uint8Array): Promise<void> {
+		const path = normalizePath(configDir ? `${configDir}/${relativePath}` : relativePath);
+		const parent = path.split("/").slice(0, -1).join("/");
+		if (parent) await this.ensureAdapterDir(parent);
+		await this.app.vault.adapter.writeBinary(path, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+	}
+
+	private async deleteConfigFile(configDir: string, relativePath: string): Promise<void> {
+		const path = normalizePath(configDir ? `${configDir}/${relativePath}` : relativePath);
+		if (!(await this.adapterExists(path))) return;
+		await this.app.vault.adapter.remove(path);
+	}
+
+	private async listRelativeFiles(folder: string, baseDir: string): Promise<string[]> {
+		if (!(await this.adapterExists(folder))) return [];
+		const out: string[] = [];
+		const visit = async (dir: string) => {
+			let listed: { files: string[]; folders: string[] };
+			try {
+				listed = await this.app.vault.adapter.list(dir);
+			} catch {
+				return;
+			}
+			for (const file of listed.files) {
+				out.push(this.relativeConfigPath(baseDir, file));
+			}
+			for (const child of listed.folders) {
+				await visit(child);
+			}
+		};
+		await visit(folder);
+		return out.sort();
+	}
+
+	private relativeConfigPath(configDir: string, path: string): string {
+		const normalizedBase = normalizePath(configDir).replace(/\/$/, "");
+		const normalizedPath = normalizePath(path);
+		return normalizedPath.startsWith(`${normalizedBase}/`)
+			? normalizedPath.slice(normalizedBase.length + 1)
+			: normalizedPath;
+	}
+
+	private async readAdapterBytes(path: string): Promise<Uint8Array> {
+		return new Uint8Array(await this.app.vault.adapter.readBinary(normalizePath(path)));
+	}
+
+	private async readJsonFromAdapter<T>(path: string): Promise<T | null> {
+		try {
+			if (!(await this.adapterExists(path))) return null;
+			return JSON.parse(await this.app.vault.adapter.read(normalizePath(path))) as T;
+		} catch {
+			return null;
+		}
+	}
+
+	private async adapterExists(path: string): Promise<boolean> {
+		try {
+			return await this.app.vault.adapter.exists(normalizePath(path));
+		} catch {
+			return false;
+		}
+	}
+
+	private async ensureAdapterDir(path: string): Promise<void> {
+		const normalized = normalizePath(path);
+		if (!normalized) return;
+		const parts = normalized.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (await this.adapterExists(current)) continue;
+			try {
+				await this.app.vault.adapter.mkdir(current);
+			} catch {
+				// Directory may have been created by another file operation.
+			}
+		}
+	}
+
 	private isMarkdownPathSyncable(path: string): boolean {
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
@@ -219,6 +633,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
 		await this.loadSettings();
+		this.setupProfileMirrorService();
+		await this.profileMirrorService?.onSettingsLoaded(this.settings);
 		this.applyRuntimeSettings("load-settings");
 		this.createReconciliationController();
 		this.editorWorkspace = new EditorWorkspaceOrchestrator({
@@ -401,6 +817,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				traceContext: this.getTraceHttpContext(),
 				trace: (source, msg, details) => this.trace(source, msg, details),
 			});
+			(this.vaultSync.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
+				.on("custom-message", (payload: string) => {
+					void this.profileMirrorService?.onWebSocketMessage(payload, this.settings);
+				});
 
 			// 2. EditorBindingManager
 			this.editorBindings = new EditorBindingManager(
@@ -506,6 +926,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
+					prepareObsidianMobileFolder: () => this.prepareObsidianMobileFolder(),
+					publishObsidianProfileMirrorNow: () => this.publishObsidianProfileMirrorNow(),
+					applyLatestObsidianProfileMirror: () => this.applyLatestObsidianProfileMirror(),
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
@@ -594,6 +1017,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.scheduleTraceStateSnapshot("startup-complete");
 			this.attachmentOrchestrator?.markStartupReady("startup-complete");
 			void this.traceRuntime?.refreshServerTrace();
+			if (providerSynced) {
+				void this.profileMirrorService?.refreshFromRemote(this.settings);
+			}
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -613,6 +1039,55 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async importUntrackedFiles(): Promise<void> {
 		await this.reconciliationController.importUntrackedFiles();
+	}
+
+	async prepareObsidianMobileFolder(): Promise<void> {
+		const mobileDir = normalizePath(this.settings.configProfileMobileConfigDir.trim() || OBSIDIAN_MOBILE_DIR);
+		const existingMobileFiles = await this.listRelativeFiles(mobileDir, mobileDir);
+		const yaosDataPresentInsideMobile = await this.adapterExists(normalizePath(`${mobileDir}/plugins/yaos/data.json`));
+		const ops = planMobileFolderPreparation({
+			currentDesktopFiles: [],
+			existingMobileFiles,
+			yaosDataPresentInsideMobile,
+		});
+
+		for (const op of ops) {
+			if (op.kind === "ensureDir") {
+				await this.ensureAdapterDir(op.path);
+			} else if (op.kind === "writeJson") {
+				const bytes = new TextEncoder().encode(JSON.stringify(op.value, null, 2));
+				await this.writeConfigFile("", op.path, bytes);
+			} else if (op.kind === "instruct-user") {
+				new Notice(op.message, 12000);
+			}
+		}
+		new Notice("Mobile profile folder prepared.");
+	}
+
+	async publishObsidianProfileMirrorNow(): Promise<void> {
+		if (!this.profileMirrorService) {
+			new Notice("Profile mirror is not initialized.");
+			return;
+		}
+		try {
+			await this.profileMirrorService.publishNow(this.settings);
+		} catch (err) {
+			console.error("[yaos] Profile mirror publish failed:", err);
+			new Notice(`Profile mirror publish failed: ${formatUnknown(err)}`, 10000);
+		}
+	}
+
+	async applyLatestObsidianProfileMirror(): Promise<void> {
+		if (!this.profileMirrorService) {
+			new Notice("Profile mirror is not initialized.");
+			return;
+		}
+		try {
+			await this.profileMirrorService.refreshFromRemote(this.settings);
+		} catch (err) {
+			console.error("[yaos] Profile mirror apply failed:", err);
+			new Notice(`Profile mirror apply failed: ${formatUnknown(err)}`, 10000);
+		}
 	}
 
 	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
@@ -772,7 +1247,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.reconciliationController.reset();
 		this.connectionController?.stop();
 
-		this.vaultSync?.destroy();
+		void this.vaultSync?.destroy();
 
 		this.vaultSync = null;
 		this.connectionController = null;
@@ -1177,6 +1652,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt);
 		} else {
 			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus);
+		}
+		if (this.pendingProfilePluginRestartIds.length > 0) {
+			this.statusBarEl.createSpan({
+				text: ` · ${this.pendingProfilePluginRestartIds.length} profile plugin update(s) pending restart`,
+				cls: "yaos-profile-restart-pending",
+			});
 		}
 	}
 

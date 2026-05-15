@@ -202,7 +202,7 @@ export async function buildDiagnosticsBundle(
 		frontmatterQuarantine: buildFrontmatterQuarantineDebugLines(input.frontmatterQuarantine),
 	};
 
-	const bundle = redactor.redactDeep(rawDiagnostics) as Record<string, unknown>;
+	const bundle = redactor.redactDeep(rawDiagnostics);
 
 	// Post-redaction leak check (INV-SEC-02): abort if any known vault path
 	// survived into the serialised safe bundle.

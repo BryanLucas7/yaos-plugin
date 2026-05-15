@@ -148,7 +148,8 @@ export class DiskMirror {
 
 				// Remote tombstone transition.
 				if (newPath && isDeleted && !wasDeleted) {
-					const baselineText = this.vaultSync.idToText.get(fileId)?.toString() ?? null;
+					const baselineYText = this.vaultSync.idToText.get(fileId);
+					const baselineText = baselineYText ? yTextToString(baselineYText) : null;
 					void this.handleRemoteDelete(newPath, { baselineText });
 					return;
 				}
@@ -549,7 +550,7 @@ export class DiskMirror {
 					const lastKnownContent =
 						options.baselineText !== undefined
 							? options.baselineText
-							: ytext?.toString() ?? null;
+							: ytext ? yTextToString(ytext) : null;
 
 					let decision: RemoteDeleteDecision = { kind: "apply-delete" };
 

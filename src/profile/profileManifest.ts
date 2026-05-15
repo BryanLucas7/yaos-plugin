@@ -40,18 +40,19 @@ export interface ScannedFile {
 	size: number;
 	kind: ProfileFileKind;
 	pluginId?: string;
+	bytes?: Uint8Array;
 }
 
 export interface ScannedPlugin {
 	pluginId: string;
 	manifest: PluginManifestLike;
-	codeFiles: Array<{ path: string; hash: string; size: number }>;
-	dataJson: { hash: string; size: number } | null;
-	otherBehaviorFiles: Array<{ path: string; hash: string; size: number }>;
+	codeFiles: Array<{ path: string; hash: string; size: number; bytes?: Uint8Array }>;
+	dataJson: { hash: string; size: number; bytes?: Uint8Array } | null;
+	otherBehaviorFiles: Array<{ path: string; hash: string; size: number; bytes?: Uint8Array }>;
 }
 
 export interface ScannedConfigDir {
-	rootConfigFiles: Array<{ name: string; hash: string; size: number }>;
+	rootConfigFiles: Array<{ name: string; hash: string; size: number; bytes?: Uint8Array }>;
 	snippetFiles: ScannedFile[];
 	themeFiles: ScannedFile[];
 	iconFiles: ScannedFile[];

@@ -8,6 +8,7 @@
  * source of truth.
  */
 
+import { requestUrl } from "obsidian";
 import {
 	emptyProfileLock,
 	isProfileLock,
@@ -41,7 +42,7 @@ export class HttpProfileLockTransport implements ProfileLockTransport {
 		return `${host}/vault/${encodeURIComponent(this.endpoint.vaultId)}/profile-lock`;
 	}
 
-	private headers(extra: Record<string, string> = {}): HeadersInit {
+	private headers(extra: Record<string, string> = {}): Record<string, string> {
 		return {
 			Authorization: `Bearer ${this.endpoint.token}`,
 			...extra,
@@ -49,36 +50,39 @@ export class HttpProfileLockTransport implements ProfileLockTransport {
 	}
 
 	async getLock(): Promise<ProfileLock | null> {
-		const response = await fetch(this.url(), {
+		const response = await requestUrl({
+			url: this.url(),
 			method: "GET",
 			headers: this.headers(),
 		});
-		if (!response.ok) {
+		if (response.status !== 200) {
 			throw new Error(`profile-lock GET failed (${response.status})`);
 		}
-		const body = (await response.json()) as { lock?: unknown };
+		const body = response.json as { lock?: unknown };
 		if (!isProfileLock(body.lock)) return null;
 		return body.lock;
 	}
 
 	async putLock(body: ProfileLockPutBody): Promise<ProfileLockCasResult> {
-		const response = await fetch(this.url(), {
+		const response = await requestUrl({
+			url: this.url(),
 			method: "PUT",
-			headers: this.headers({ "Content-Type": "application/json" }),
+			headers: this.headers(),
+			contentType: "application/json",
 			body: JSON.stringify(body),
 		});
 
 		if (response.status === 409) {
-			const data = (await response.json()) as { current?: unknown };
+			const data = response.json as { current?: unknown };
 			const current = isProfileLock(data.current) ? data.current : emptyProfileLock();
 			return { kind: "stale-base", current };
 		}
 
-		if (!response.ok) {
+		if (response.status !== 200) {
 			throw new Error(`profile-lock PUT failed (${response.status})`);
 		}
 
-		const data = (await response.json()) as { lock?: unknown };
+		const data = response.json as { lock?: unknown };
 		if (!isProfileLock(data.lock)) {
 			throw new Error("profile-lock PUT returned malformed payload");
 		}

@@ -2,7 +2,7 @@ import { randomBase64Url } from "../utils/base64url";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
-export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
+export const MAX_ATTACHMENT_SIZE_KB = 100 * 1024;
 
 export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): number {
 	if (
@@ -43,7 +43,7 @@ export interface VaultSyncSettings {
 	enableAttachmentSync: boolean;
 	/** True once the user has explicitly changed the attachment sync toggle. */
 	attachmentSyncExplicitlyConfigured: boolean;
-	/** Maximum attachment size in KB. Files larger are skipped. Capped at 10240 (10 MB). */
+	/** Maximum attachment size in KB. Files larger are skipped. Capped at 102400 (100 MB). */
 	maxAttachmentSizeKB: number;
 	/** Number of parallel upload/download slots. */
 	attachmentConcurrency: number;
@@ -53,6 +53,40 @@ export interface VaultSyncSettings {
 	updateRepoUrl: string;
 	/** Optional default branch for provider-native update links. */
 	updateRepoBranch: string;
+
+	// ── Profile Mirror (Etapa 10) ────────────────────────────────────────
+	/** Master switch for the profile-mirror channel. */
+	configProfileSyncEnabled: boolean;
+	/** Per-device role. */
+	configProfileMode: "off" | "publish" | "subscribe";
+	/** Whether this device may publish anything at all. */
+	configProfileTrustedPublisher: boolean;
+	/** May publish profile manifests (configs, themes, snippets, behavior). */
+	configProfileCanPublishProfile: boolean;
+	/** May publish PluginCodeManifest + pluginLocks updates. */
+	configProfileCanPublishPluginCode: boolean;
+	/** Which profile this device represents. */
+	configProfileCurrentProfile: "desktop" | "mobile";
+	/** Optional explicit desktop configDir override (defaults to .obsidian). */
+	configProfileDesktopConfigDir: string;
+	/** Optional explicit mobile configDir override (defaults to .obsidian-mobile). */
+	configProfileMobileConfigDir: string;
+	/** True after the first-mobile auto-mode has been applied (subscribe). */
+	configProfileAutoModeInitialized: boolean;
+	/** Last lock generation observed via WS / GET. */
+	configProfileLastSeenGeneration: string;
+	/** Last lock generation fully applied to the configDir. */
+	configProfileLastAppliedGeneration: string;
+	/** Generation the publisher believes the remote is on (for CAS). */
+	configProfileBaseGeneration: string;
+	/** Optional explicit allowlist of plugin ids the user has chosen. */
+	configProfileIncludedPluginIds: string[];
+	/** Optional explicit denylist of plugin ids the user has chosen. */
+	configProfileExcludedPluginIds: string[];
+	/** First-pass clone desktop Lazy section into mobile. */
+	configProfileInitialCloneDesktopLazyToMobile: boolean;
+	/** True once the desktop->mobile Lazy clone has happened. */
+	configProfileLazyMobileInitialized: boolean;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -73,6 +107,23 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	showRemoteCursors: true,
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
+
+	configProfileSyncEnabled: false,
+	configProfileMode: "off",
+	configProfileTrustedPublisher: false,
+	configProfileCanPublishProfile: false,
+	configProfileCanPublishPluginCode: false,
+	configProfileCurrentProfile: "desktop",
+	configProfileDesktopConfigDir: "",
+	configProfileMobileConfigDir: ".obsidian-mobile",
+	configProfileAutoModeInitialized: false,
+	configProfileLastSeenGeneration: "",
+	configProfileLastAppliedGeneration: "",
+	configProfileBaseGeneration: "",
+	configProfileIncludedPluginIds: [],
+	configProfileExcludedPluginIds: [],
+	configProfileInitialCloneDesktopLazyToMobile: true,
+	configProfileLazyMobileInitialized: false,
 };
 
 export interface SettingsPersistence {

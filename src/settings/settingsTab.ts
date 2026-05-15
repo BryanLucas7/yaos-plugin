@@ -39,6 +39,9 @@ export interface VaultSyncSettingsHost {
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;
 	buildRecoveryKitText(): string | null;
+	prepareObsidianMobileFolder(): Promise<void>;
+	publishObsidianProfileMirrorNow(): Promise<void>;
+	applyLatestObsidianProfileMirror(): Promise<void>;
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -262,6 +265,151 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			}
 		}
 
+		if (!setupIncomplete) {
+			/* eslint-disable obsidianmd/ui/sentence-case -- Profile ids and Obsidian config names are literal user-facing values. */
+			addSectionHeading(containerEl, "Profile Mirror");
+
+			const profileCard = containerEl.createDiv({ cls: "yaos-settings-status-card" });
+			addCardRow(profileCard, "Mode", this.host.settings.configProfileMode);
+			addCardRow(profileCard, "Profile", this.host.settings.configProfileCurrentProfile);
+			addCardRow(profileCard, "Seen generation", this.host.settings.configProfileLastSeenGeneration || "(none)");
+			addCardRow(profileCard, "Applied generation", this.host.settings.configProfileLastAppliedGeneration || "(none)");
+			addCardRow(profileCard, "Base generation", this.host.settings.configProfileBaseGeneration || "(none)");
+
+			new Setting(containerEl)
+				.setName("Sync Obsidian profile")
+				.setDesc("Sync approved Obsidian settings, themes, snippets, plugin code, and per-profile plugin behavior.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.configProfileSyncEnabled)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileSyncEnabled = value;
+							}, "settings:profile-sync-enabled");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Profile mode")
+				.setDesc("Publish sends this profile to the server. Subscribe applies the latest remote profile to this device.")
+				.addDropdown((dropdown) =>
+					dropdown
+						.addOption("off", "Off")
+						.addOption("publish", "Publish from this device")
+						.addOption("subscribe", "Subscribe on this device")
+						.setValue(this.host.settings.configProfileMode)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileMode = value as VaultSyncSettings["configProfileMode"];
+							}, "settings:profile-mode");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Current profile")
+				.setDesc("desktop uses the active obsidian config folder. mobile can use .obsidian-mobile after you enable override config folder.")
+				.addDropdown((dropdown) =>
+					dropdown
+						.addOption("desktop", "Desktop")
+						.addOption("mobile", "Mobile")
+						.setValue(this.host.settings.configProfileCurrentProfile)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileCurrentProfile = value as VaultSyncSettings["configProfileCurrentProfile"];
+							}, "settings:profile-current-profile");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Trusted publisher")
+				.setDesc("Allow this device to publish profile changes. Keep disabled on devices that should only receive.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.configProfileTrustedPublisher)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileTrustedPublisher = value;
+								if (!value) {
+									settings.configProfileCanPublishProfile = false;
+									settings.configProfileCanPublishPluginCode = false;
+								}
+							}, "settings:profile-trusted-publisher");
+							this.display();
+						}),
+				);
+
+			if (this.host.settings.configProfileTrustedPublisher) {
+				new Setting(containerEl)
+					.setName("Publish profile behavior")
+					.setDesc("Publish configs, themes, snippets, workspace files, and plugin data.json for this profile.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileCanPublishProfile)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileCanPublishProfile = value;
+								}, "settings:profile-can-publish-profile");
+							}),
+					);
+
+				new Setting(containerEl)
+					.setName("Publish plugin versions")
+					.setDesc("Publish shared plugin code locks. Behavior remains profile-specific.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileCanPublishPluginCode)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileCanPublishPluginCode = value;
+								}, "settings:profile-can-publish-code");
+							}),
+					);
+			}
+
+			new Setting(containerEl)
+				.setName("Included plugin ids")
+				.setDesc("Optional comma-separated allowlist. Leave empty to include all compatible plugins.")
+				.addText((text) =>
+					text
+						.setPlaceholder("plugin id, another id")
+						.setValue(this.host.settings.configProfileIncludedPluginIds.join(", "))
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileIncludedPluginIds = value.split(",").map((v) => v.trim()).filter(Boolean);
+							}, "settings:profile-included-plugins");
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Excluded plugin ids")
+				.setDesc("Comma-separated plugins to exclude in addition to the safety denylist.")
+				.addText((text) =>
+					text
+						.setPlaceholder("plugin id, another id")
+						.setValue(this.host.settings.configProfileExcludedPluginIds.join(", "))
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileExcludedPluginIds = value.split(",").map((v) => v.trim()).filter(Boolean);
+							}, "settings:profile-excluded-plugins");
+						}),
+				);
+
+			const profileActions = containerEl.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
+			profileActions.createEl("button", { text: "Prepare mobile profile" }).addEventListener("click", () => {
+				void this.host.prepareObsidianMobileFolder().then(() => this.display());
+			});
+			profileActions.createEl("button", { text: "Publish now" }).addEventListener("click", () => {
+				void this.host.publishObsidianProfileMirrorNow().then(() => this.display());
+			});
+			profileActions.createEl("button", { text: "Apply latest" }).addEventListener("click", () => {
+				void this.host.applyLatestObsidianProfileMirror().then(() => this.display());
+			});
+			/* eslint-enable obsidianmd/ui/sentence-case */
+		}
+
 		addSectionHeading(containerEl, "This device");
 		new Setting(containerEl)
 			.setName("Device name")
@@ -372,7 +520,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.setDesc(`Attachments larger than this are skipped. Maximum ${attachmentCapKB} KB.`)
 				.addText((text) =>
 					text
-						.setPlaceholder("10240")
+						.setPlaceholder("102400")
 						.setValue(String(this.host.settings.maxAttachmentSizeKB))
 						.onChange(async (value) => {
 							const n = parseInt(value, 10);

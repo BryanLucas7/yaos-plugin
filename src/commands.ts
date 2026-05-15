@@ -15,6 +15,9 @@ export interface CommandsRuntimeHost {
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
+	prepareObsidianMobileFolder(): Promise<void>;
+	publishObsidianProfileMirrorNow(): Promise<void>;
+	applyLatestObsidianProfileMirror(): Promise<void>;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
@@ -131,6 +134,30 @@ export function registerCommands(
 			void host.importUntrackedFiles().then(() => {
 				new Notice(`Imported ${count} untracked file(s).`);
 			});
+		},
+	});
+
+	registrar.addCommand({
+		id: "prepare-obsidian-mobile-folder",
+		name: "Prepare mobile profile folder",
+		callback: () => {
+			void host.prepareObsidianMobileFolder();
+		},
+	});
+
+	registrar.addCommand({
+		id: "publish-profile-mirror-now",
+		name: "Publish Obsidian profile now",
+		callback: () => {
+			void host.publishObsidianProfileMirrorNow();
+		},
+	});
+
+	registrar.addCommand({
+		id: "apply-profile-mirror-now",
+		name: "Apply latest Obsidian profile now",
+		callback: () => {
+			void host.applyLatestObsidianProfileMirror();
 		},
 	});
 

@@ -36,12 +36,16 @@ function fakeHash(seed: string): string {
 	return code.repeat(32);
 }
 
+function fakeBytes(seed: string, size: number): Uint8Array {
+	return new Uint8Array(size).fill(seed.charCodeAt(0));
+}
+
 function makeScan(overrides: Partial<ScannedConfigDir> = {}): ScannedConfigDir {
 	return {
 		rootConfigFiles: [
-			{ name: "app.json", hash: fakeHash("a"), size: 100 },
-			{ name: "appearance.json", hash: fakeHash("b"), size: 50 },
-			{ name: "core-plugins.json", hash: fakeHash("c"), size: 30 },
+			{ name: "app.json", hash: fakeHash("a"), size: 100, bytes: fakeBytes("a", 100) },
+			{ name: "appearance.json", hash: fakeHash("b"), size: 50, bytes: fakeBytes("b", 50) },
+			{ name: "core-plugins.json", hash: fakeHash("c"), size: 30, bytes: fakeBytes("c", 30) },
 		],
 		snippetFiles: [],
 		themeFiles: [],
@@ -51,28 +55,28 @@ function makeScan(overrides: Partial<ScannedConfigDir> = {}): ScannedConfigDir {
 				pluginId: "dataview",
 				manifest: { id: "dataview", version: "0.5.68", isDesktopOnly: false },
 				codeFiles: [
-					{ path: "plugins/dataview/main.js", hash: fakeHash("d"), size: 50000 },
-					{ path: "plugins/dataview/manifest.json", hash: fakeHash("e"), size: 200 },
+					{ path: "plugins/dataview/main.js", hash: fakeHash("d"), size: 50000, bytes: fakeBytes("d", 50000) },
+					{ path: "plugins/dataview/manifest.json", hash: fakeHash("e"), size: 200, bytes: fakeBytes("e", 200) },
 				],
-				dataJson: { hash: fakeHash("f"), size: 300 },
+				dataJson: { hash: fakeHash("f"), size: 300, bytes: fakeBytes("f", 300) },
 				otherBehaviorFiles: [],
 			},
 			{
 				pluginId: "agent-client",
 				manifest: { id: "agent-client", version: "1.0.0", isDesktopOnly: false },
 				codeFiles: [
-					{ path: "plugins/agent-client/main.js", hash: fakeHash("1"), size: 1000 },
+					{ path: "plugins/agent-client/main.js", hash: fakeHash("1"), size: 1000, bytes: fakeBytes("1", 1000) },
 				],
-				dataJson: { hash: fakeHash("2"), size: 50 },
+				dataJson: { hash: fakeHash("2"), size: 50, bytes: fakeBytes("2", 50) },
 				otherBehaviorFiles: [],
 			},
 			{
 				pluginId: "yaos",
 				manifest: { id: "yaos", version: "1.6.1", isDesktopOnly: false },
 				codeFiles: [
-					{ path: "plugins/yaos/main.js", hash: fakeHash("y"), size: 500000 },
+					{ path: "plugins/yaos/main.js", hash: fakeHash("y"), size: 500000, bytes: fakeBytes("y", 500000) },
 				],
-				dataJson: { hash: fakeHash("z"), size: 1000 },
+				dataJson: { hash: fakeHash("z"), size: 1000, bytes: fakeBytes("z", 1000) },
 				otherBehaviorFiles: [],
 			},
 		],
@@ -84,7 +88,8 @@ function makeScan(overrides: Partial<ScannedConfigDir> = {}): ScannedConfigDir {
 class InMemoryTransport implements PublisherTransport {
 	storedLock: ProfileLock | null = null;
 	uploads: unknown[] = [];
-	rawUploads = 0;
+	rawUploads: Array<{ hash: string; size: number }> = [];
+	presentHashes = new Set<string>();
 	preStaleAttempts = 0;
 	private staleTimes = 0;
 
@@ -114,8 +119,13 @@ class InMemoryTransport implements PublisherTransport {
 		const seed = JSON.stringify(value).length.toString(16);
 		return seed.padStart(64, "0").slice(0, 64);
 	}
-	async existsBatch(): Promise<Set<string>> { return new Set(); }
-	async uploadBlob(): Promise<void> { this.rawUploads++; }
+	async existsBatch(hashes: string[]): Promise<Set<string>> {
+		return new Set(hashes.filter((hash) => this.presentHashes.has(hash)));
+	}
+	async uploadBlob(bytes: Uint8Array, expectedHash: string): Promise<void> {
+		this.rawUploads.push({ hash: expectedHash, size: bytes.byteLength });
+		this.presentHashes.add(expectedHash);
+	}
 }
 
 const policy = createProfilePolicy();
@@ -275,6 +285,27 @@ console.log("\n--- Cycle 15.1: trust separates profile and plugin code ---");
 		assert(result2.lock.profileManifests.desktop?.manifestHash === "old".padEnd(64, "0").slice(0, 64),
 			"code-only publish PRESERVED existing desktop profile manifest reference");
 	}
+}
+
+// ── Cycle 15.2 — file blobs are uploaded before lock publish ────────────
+console.log("\n--- Cycle 15.2: publisher uploads content blobs referenced by manifests ---");
+{
+	const transport = new InMemoryTransport();
+	transport.presentHashes.add(fakeHash("a")); // server already has app.json
+	const pub = new ProfilePublisher({
+		profile: "desktop", policy, transport,
+		trust: { canPublishProfile: true, canPublishPluginCode: true },
+		deviceId: "pc-1", deviceName: "PC",
+		now: () => "now", nextGeneration: () => "blob-gen",
+	});
+	const result = await pub.publish(async () => makeScan());
+	assert(result.kind === "accepted", "publish accepted");
+	const uploadedHashes = new Set(transport.rawUploads.map((u) => u.hash));
+	assert(!uploadedHashes.has(fakeHash("a")), "already-present app.json blob was not uploaded again");
+	assert(uploadedHashes.has(fakeHash("b")), "appearance.json content blob uploaded");
+	assert(uploadedHashes.has(fakeHash("f")), "dataview data.json behavior blob uploaded");
+	assert(uploadedHashes.has(fakeHash("d")), "dataview main.js plugin-code blob uploaded");
+	assert(!uploadedHashes.has(fakeHash("y")), "YAOS plugin code was not uploaded");
 }
 
 // ── Stale-base rebases automatically ─────────────────────────────────────

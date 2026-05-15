@@ -10,6 +10,8 @@
  * fails the SHA-256 check and is rejected.
  */
 
+import { requestUrl } from "obsidian";
+
 export interface BlobEndpoint {
 	host: string;
 	vaultId: string;
@@ -38,7 +40,7 @@ function existsUrl(endpoint: BlobEndpoint): string {
 	return `${host}/vault/${encodeURIComponent(endpoint.vaultId)}/blobs/exists`;
 }
 
-function authHeaders(endpoint: BlobEndpoint, extra: Record<string, string> = {}): HeadersInit {
+function authHeaders(endpoint: BlobEndpoint, extra: Record<string, string> = {}): Record<string, string> {
 	return { Authorization: `Bearer ${endpoint.token}`, ...extra };
 }
 
@@ -61,13 +63,15 @@ export class HttpProfileBlobTransport implements ProfileBlobTransport {
 	async existsBatch(candidates: string[]): Promise<Set<string>> {
 		const filtered = candidates.filter(isValidHash);
 		if (filtered.length === 0) return new Set();
-		const response = await fetch(existsUrl(this.endpoint), {
+		const response = await requestUrl({
+			url: existsUrl(this.endpoint),
 			method: "POST",
-			headers: authHeaders(this.endpoint, { "Content-Type": "application/json" }),
+			contentType: "application/json",
+			headers: authHeaders(this.endpoint),
 			body: JSON.stringify({ hashes: filtered }),
 		});
-		if (!response.ok) throw new Error(`exists failed (${response.status})`);
-		const body = (await response.json()) as { present?: string[] };
+		if (response.status !== 200) throw new Error(`exists failed (${response.status})`);
+		const body = response.json as { present?: string[] };
 		const present = Array.isArray(body.present) ? body.present : [];
 		return new Set(present);
 	}
@@ -76,24 +80,27 @@ export class HttpProfileBlobTransport implements ProfileBlobTransport {
 		if (!isValidHash(expectedHash)) {
 			throw new Error("uploadBlob: invalid hash");
 		}
-		const response = await fetch(blobUrl(this.endpoint, expectedHash), {
+		const response = await requestUrl({
+			url: blobUrl(this.endpoint, expectedHash),
 			method: "PUT",
-			headers: authHeaders(this.endpoint, { "Content-Type": "application/octet-stream" }),
-			body: bytes as unknown as BodyInit,
+			headers: authHeaders(this.endpoint),
+			contentType: "application/octet-stream",
+			body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
 		});
-		if (!response.ok) throw new Error(`upload failed (${response.status})`);
+		if (response.status !== 204) throw new Error(`upload failed (${response.status})`);
 	}
 
 	async downloadBlob(expectedHash: string): Promise<Uint8Array> {
 		if (!isValidHash(expectedHash)) {
 			throw new Error("downloadBlob: invalid hash");
 		}
-		const response = await fetch(blobUrl(this.endpoint, expectedHash), {
+		const response = await requestUrl({
+			url: blobUrl(this.endpoint, expectedHash),
 			method: "GET",
 			headers: authHeaders(this.endpoint),
 		});
-		if (!response.ok) throw new Error(`download failed (${response.status})`);
-		const bytes = new Uint8Array(await response.arrayBuffer());
+		if (response.status !== 200) throw new Error(`download failed (${response.status})`);
+		const bytes = new Uint8Array(response.arrayBuffer);
 		const actual = await sha256Hex(bytes);
 		if (actual !== expectedHash) {
 			throw new Error(`download integrity check failed: expected ${expectedHash}, got ${actual}`);

@@ -18,7 +18,6 @@ import {
 	type ProfileLock,
 	type ProfileLockCasResult,
 	type ProfileManifest,
-	type PluginCodeManifest,
 	type PluginVersionLock,
 	type ProfileManifestRef,
 } from "./profileLock";
@@ -54,7 +53,7 @@ export interface ProfilePublisherDeps {
 	now(): string;
 	nextGeneration(previous: string): string;
 	/** Optional hook to look up Lazy `instant` ids for the mobile profile. */
-	getInstantPluginIds?(profile: Profile): ReadonlyArray<string>;
+	getInstantPluginIds?(profile: Profile): ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
 	/** Used to capture the synthesized community-plugins.json so it can also be uploaded as a blob. */
 	getCommunityPluginsHash?(synthesized: string[]): Promise<{ hash: string; size: number }>;
 }
@@ -66,6 +65,14 @@ export type PublishOutcome =
 	| { kind: "max-rebases-exceeded"; current: ProfileLock };
 
 const MAX_REBASES = 3;
+const SYNTHESIZED_COMMUNITY_PLUGINS_PATH = "community-plugins.json";
+
+interface ScannedBlob {
+	path: string;
+	hash: string;
+	size: number;
+	bytes?: Uint8Array;
+}
 
 export class ProfilePublisher {
 	private readonly dirtyPaths = new Set<string>();
@@ -136,7 +143,7 @@ export class ProfilePublisher {
 				scan: scannedDir,
 				profile: this.deps.profile,
 				policy: this.deps.policy,
-				instantPluginIdsForProfile: this.deps.getInstantPluginIds?.(this.deps.profile),
+				instantPluginIdsForProfile: await this.deps.getInstantPluginIds?.(this.deps.profile),
 			});
 
 			let community: { hash: string; size: number } | null = null;
@@ -151,7 +158,7 @@ export class ProfilePublisher {
 				}
 				if (community) {
 					profileManifest.files.push({
-						path: "community-plugins.json",
+						path: SYNTHESIZED_COMMUNITY_PLUGINS_PATH,
 						hash: community.hash,
 						size: community.size,
 						kind: "config",
@@ -170,6 +177,14 @@ export class ProfilePublisher {
 					sourceDeviceId: this.deps.deviceId,
 				})
 				: [];
+
+			await this.uploadReferencedContentBlobs({
+				scannedDir,
+				profileManifest,
+				pluginCodeBuilt,
+				uploadProfileBlobs: this.deps.trust.canPublishProfile,
+				uploadPluginCodeBlobs: this.deps.trust.canPublishPluginCode,
+			});
 
 			const manifestHash = this.deps.trust.canPublishProfile
 				? await this.deps.transport.uploadJsonBlob(profileManifest)
@@ -256,5 +271,79 @@ export class ProfilePublisher {
 			pluginLocks,
 			profileManifests,
 		};
+	}
+
+	private async uploadReferencedContentBlobs(args: {
+		scannedDir: ScannedConfigDir;
+		profileManifest: ProfileManifest;
+		pluginCodeBuilt: BuiltPluginCode[];
+		uploadProfileBlobs: boolean;
+		uploadPluginCodeBlobs: boolean;
+	}): Promise<void> {
+		const blobsByPath = this.indexScannedBlobs(args.scannedDir);
+		const required = new Map<string, ScannedBlob>();
+
+		const requireBlob = (file: { path: string; hash: string; size: number }) => {
+			if (file.path === SYNTHESIZED_COMMUNITY_PLUGINS_PATH) return;
+			const blob = blobsByPath.get(file.path);
+			if (!blob?.bytes) {
+				throw new Error(`profile publish missing content bytes for ${file.path}`);
+			}
+			if (blob.hash !== file.hash || blob.size !== file.size) {
+				throw new Error(`profile publish scan mismatch for ${file.path}`);
+			}
+			required.set(file.hash, blob);
+		};
+
+		if (args.uploadProfileBlobs) {
+			for (const file of args.profileManifest.files) {
+				requireBlob(file);
+			}
+		}
+
+		if (args.uploadPluginCodeBlobs) {
+			for (const built of args.pluginCodeBuilt) {
+				for (const file of built.manifest.files) {
+					requireBlob(file);
+				}
+			}
+		}
+
+		if (required.size === 0) return;
+		const hashes = Array.from(required.keys());
+		const present = await this.deps.transport.existsBatch(hashes);
+		for (const hash of hashes) {
+			if (present.has(hash)) continue;
+			const blob = required.get(hash)!;
+			await this.deps.transport.uploadBlob(blob.bytes!, hash);
+		}
+	}
+
+	private indexScannedBlobs(scan: ScannedConfigDir): Map<string, ScannedBlob> {
+		const out = new Map<string, ScannedBlob>();
+		for (const root of scan.rootConfigFiles) {
+			out.set(root.name, {
+				path: root.name,
+				hash: root.hash,
+				size: root.size,
+				bytes: root.bytes,
+			});
+		}
+		for (const file of [...scan.snippetFiles, ...scan.themeFiles, ...scan.iconFiles]) {
+			out.set(file.path, file);
+		}
+		for (const plugin of scan.plugins) {
+			if (plugin.dataJson) {
+				const path = `plugins/${plugin.pluginId}/data.json`;
+				out.set(path, { path, ...plugin.dataJson });
+			}
+			for (const file of plugin.otherBehaviorFiles) {
+				out.set(file.path, file);
+			}
+			for (const file of plugin.codeFiles) {
+				out.set(file.path, file);
+			}
+		}
+		return out;
 	}
 }

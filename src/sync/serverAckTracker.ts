@@ -275,8 +275,9 @@ export class ServerAckTracker {
 			candidateCapturedAt: this._candidateCapturedAt,
 			lastKnownServerReceiptEchoAt: this._lastKnownServerReceiptEchoAt,
 		};
-		this._enqueuePersistence(async () => {
-			await this._store!.save(state);
+		const store = this._store;
+		void this._enqueuePersistence(async () => {
+			await store.save(state);
 		});
 	}
 }

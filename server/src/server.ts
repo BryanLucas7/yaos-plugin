@@ -320,9 +320,9 @@ export class VaultSyncServer extends YServer {
 					legacyBytes = new Uint8Array(legacyRaw);
 				} else if (ArrayBuffer.isView(legacyRaw)) {
 					legacyBytes = new Uint8Array(
-						(legacyRaw as ArrayBufferView).buffer,
-						(legacyRaw as ArrayBufferView).byteOffset,
-						(legacyRaw as ArrayBufferView).byteLength,
+						legacyRaw.buffer,
+						legacyRaw.byteOffset,
+						legacyRaw.byteLength,
 					);
 				}
 			}

@@ -75,7 +75,7 @@ export function getInstantPluginIdsFromLazy(
 	data: LazyData | null,
 	profile: "desktop" | "mobile",
 ): string[] {
-	const section = data?.[profile] as LazyProfileSection | undefined;
+	const section = data?.[profile];
 	if (!section?.plugins) return [];
 	return Object.entries(section.plugins)
 		.filter(([, mode]) => mode === "instant")
