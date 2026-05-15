@@ -31,15 +31,3 @@ server/.env
 .wrangler
 server/.partykit
 server/.wrangler
-
-# Agent/session artifacts
-session-*.md
-plan.md
-codex-md.py
-*.session.md
-
-# QA run artifacts (flight traces, manifests, reports)
-qa-runs/
-
-# QA harness compiled plugin
-qa/obsidian-harness/main.js

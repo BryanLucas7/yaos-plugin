@@ -101,8 +101,6 @@ export class DiskMirror {
 
 	private mapObserverCleanups: (() => void)[] = [];
 
-	private _flightEventHandler: ((event: Record<string, unknown>) => void) | null = null;
-
 	private readonly debug: boolean;
 
 	constructor(
@@ -131,10 +129,6 @@ export class DiskMirror {
 		this.preservedUnresolvedPaths = this.preservedUnresolved.paths;
 	}
 
-	setFlightEventHandler(handler: (event: Record<string, unknown>) => void): void {
-		this._flightEventHandler = handler;
-	}
-
 	// -------------------------------------------------------------------
 	// Map observers (structural: add/delete)
 	// -------------------------------------------------------------------
@@ -154,7 +148,8 @@ export class DiskMirror {
 
 				// Remote tombstone transition.
 				if (newPath && isDeleted && !wasDeleted) {
-					const baselineText = this.vaultSync.idToText.get(fileId)?.toString() ?? null;
+					const baselineYText = this.vaultSync.idToText.get(fileId);
+					const baselineText = baselineYText ? yTextToString(baselineYText) : null;
 					void this.handleRemoteDelete(newPath, { baselineText });
 					return;
 				}
@@ -481,16 +476,6 @@ export class DiskMirror {
 				await this.suppressWrite(path, content);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
-				this._flightEventHandler?.({
-					priority: "important",
-					kind: "disk.write.ok",
-					severity: "info",
-					scope: "file",
-					source: "diskMirror",
-					layer: "disk",
-					path: normalized,
-					data: { contentLength: content.length, isCreate: false },
-				});
 			} else {
 				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
 					return;
@@ -508,29 +493,9 @@ export class DiskMirror {
 				this.log(
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
-				this._flightEventHandler?.({
-					priority: "important",
-					kind: "disk.write.ok",
-					severity: "info",
-					scope: "file",
-					source: "diskMirror",
-					layer: "disk",
-					path: normalized,
-					data: { contentLength: content.length, isCreate: true },
-				});
 			}
 		} catch (err) {
 			console.error(`[yaos] flushWrite failed for "${path}":`, err);
-			this._flightEventHandler?.({
-				priority: "critical",
-				kind: "disk.write.failed",
-				severity: "error",
-				scope: "file",
-				source: "diskMirror",
-				layer: "disk",
-				path: normalized,
-				data: { error: err instanceof Error ? err.message : String(err) },
-			});
 		}
 	}
 
@@ -575,17 +540,6 @@ export class DiskMirror {
 			wasSuppressed,
 			hasBaselineText: options.baselineText !== undefined && options.baselineText !== null,
 		});
-		// Flight: remote delete observed — emit before we know the outcome
-		this._flightEventHandler?.({
-			priority: "critical",
-			kind: "delete.remote.observed",
-			severity: "info",
-			scope: "file",
-			source: "diskMirror",
-			layer: "disk",
-			path: normalized,
-			data: { wasOpen, hasBaselineText: options.baselineText !== null && options.baselineText !== undefined },
-		});
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
 				try {
@@ -596,7 +550,7 @@ export class DiskMirror {
 					const lastKnownContent =
 						options.baselineText !== undefined
 							? options.baselineText
-							: ytext?.toString() ?? null;
+							: ytext ? yTextToString(ytext) : null;
 
 					let decision: RemoteDeleteDecision = { kind: "apply-delete" };
 
@@ -680,38 +634,18 @@ export class DiskMirror {
 							this.onPreservedUnresolvedChanged?.();
 						}
 						this.suppressDelete(path);
-					const deleteMode = await this.deleteLocalReplica(file);
-					this.trace?.("disk", "remote-delete-applied", {
-						path,
-						deleteMode,
-						reason: "remote-delete",
-					});
-					this.log(`handleRemoteDelete: deleted "${path}" from disk`);
-					this._flightEventHandler?.({
-						priority: "critical",
-						kind: "delete.disk.applied",
-						severity: "info",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: { deleteMode, reason: "tombstone-applied" },
-					});
+						const deleteMode = await this.deleteLocalReplica(file);
+						this.trace?.("disk", "remote-delete-applied", {
+							path,
+							deleteMode,
+							reason: "remote-delete",
+						});
+						this.log(`handleRemoteDelete: deleted "${path}" from disk`);
 					} else if (decision.kind === "preserve-revive") {
 						// Clear any prior unresolved marker — we now have a baseline.
 						if (this.preservedUnresolved.resolve(normalized)) {
 							this.onPreservedUnresolvedChanged?.();
 						}
-						this._flightEventHandler?.({
-							priority: "critical",
-							kind: "delete.preserved",
-							severity: "warn",
-							scope: "file",
-							source: "diskMirror",
-							layer: "disk",
-							path: normalized,
-							data: { reason: "local-dirty-wins-over-remote-delete", preserveKind: "preserve-revive" },
-						});
 						// Known dirty: local file intentionally differs from baseline.
 						// Revive tombstone so the file re-enters sync. This is the
 						// explicit policy: local dirty work wins over remote delete.
@@ -744,24 +678,11 @@ export class DiskMirror {
 							});
 						}
 					}
-				// kind === "preserve-unresolved": file stays on disk, tombstone
-				// remains in CRDT. The file is NOT auto-revived by later
-				// reconcile/import passes; explicit user action or a future
-				// remote event is required to resolve the limbo state.
-				if (decision.kind === "preserve-unresolved") {
-					this._flightEventHandler?.({
-						priority: "critical",
-						kind: "delete.preserved",
-						severity: "warn",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: {
-							reason: unresolvedReason ?? "preserve-unresolved",
-							preserveKind: "preserve-unresolved",
-						},
-					});
+					// kind === "preserve-unresolved": file stays on disk, tombstone
+					// remains in CRDT. The file is NOT auto-revived by later
+					// reconcile/import passes; explicit user action or a future
+					// remote event is required to resolve the limbo state.
+					if (decision.kind === "preserve-unresolved") {
 						this.unobserveText(normalized);
 						this.openPaths.delete(normalized);
 						this.pendingOpenWrites.delete(normalized);
@@ -1156,16 +1077,6 @@ export class DiskMirror {
 				observedKind: "write",
 				reason: "kind-mismatch",
 			});
-			this._flightEventHandler?.({
-				priority: "critical",
-				kind: "disk.event.not_suppressed",
-				severity: "warn",
-				scope: "file",
-				source: "diskMirror",
-				layer: "disk",
-				path,
-				data: { event, reason: "kind-mismatch", expectedKind: entry.kind },
-			});
 			return false;
 		}
 
@@ -1186,21 +1097,6 @@ export class DiskMirror {
 				expectedBytes: entry.expectedBytes,
 				observedBytes: file.stat.size,
 				reason: "size-mismatch",
-			});
-			this._flightEventHandler?.({
-				priority: "critical",
-				kind: "disk.event.not_suppressed",
-				severity: "warn",
-				scope: "file",
-				source: "diskMirror",
-				layer: "disk",
-				path,
-				data: {
-					event,
-					reason: "size-mismatch",
-					expectedBytes: entry.expectedBytes,
-					observedBytes: file.stat.size,
-				},
 			});
 			return false;
 		}
@@ -1245,21 +1141,6 @@ export class DiskMirror {
 			expectedBytes: entry.expectedBytes,
 			expectedHashPrefix: hashPrefix(entry.expectedHash),
 			reason: "fingerprint-mismatch",
-		});
-		this._flightEventHandler?.({
-			priority: "critical",
-			kind: "disk.event.not_suppressed",
-			severity: "warn",
-			scope: "file",
-			source: "diskMirror",
-			layer: "disk",
-			path,
-			data: {
-				event,
-				reason: "fingerprint-mismatch",
-				expectedBytes: entry.expectedBytes,
-				expectedHashPrefix: hashPrefix(entry.expectedHash),
-			},
 		});
 		return false;
 	}

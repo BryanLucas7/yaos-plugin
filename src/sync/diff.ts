@@ -8,6 +8,8 @@
 import diff from "fast-diff";
 import * as Y from "yjs";
 
+import { yTextToString } from "../utils/format";
+
 /**
  * Diff operation: retain N chars, delete N chars, or insert a string.
  */
@@ -69,10 +71,10 @@ export function applyDiffToYTextWithPostcondition(
 	newText: string,
 	origin: string,
 ): DiffPostconditionResult {
-	const currentText = ytext.toString();
+	const currentText = yTextToString(ytext) ?? "";
 	if (currentText !== oldText) {
 		forceReplaceYText(ytext, newText, origin);
-		const afterForce = ytext.toString();
+		const afterForce = yTextToString(ytext) ?? "";
 		return {
 			diffSkippedDueToStaleBase: true,
 			matchesAfterDiff: false,
@@ -84,7 +86,7 @@ export function applyDiffToYTextWithPostcondition(
 
 	applyDiffToYText(ytext, oldText, newText, origin);
 
-	const afterDiff = ytext.toString();
+	const afterDiff = yTextToString(ytext) ?? "";
 	if (afterDiff === newText) {
 		return {
 			diffSkippedDueToStaleBase: false,
@@ -96,7 +98,7 @@ export function applyDiffToYTextWithPostcondition(
 	}
 
 	forceReplaceYText(ytext, newText, origin);
-	const afterForce = ytext.toString();
+	const afterForce = yTextToString(ytext) ?? "";
 	return {
 		diffSkippedDueToStaleBase: false,
 		matchesAfterDiff: false,

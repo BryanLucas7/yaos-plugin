@@ -134,7 +134,7 @@ If you set `SYNC_TOKEN`, that environment value becomes the required token inste
 
 ## Operational safeguards
 
-- Blob uploads are capped at 10 MB by default.
+- Blob uploads are capped at 100 MB by default.
 - Blob existence checks use bounded concurrency.
 - Snapshot creation is daily-idempotent through the `/snapshots/maybe` route.
 - Snapshot archives are stored compressed to keep R2 usage modest.

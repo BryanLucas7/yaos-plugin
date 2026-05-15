@@ -178,6 +178,10 @@ export class CapabilityUpdateService {
 		return this.serverCapabilities?.snapshots ?? false;
 	}
 
+	get maxBlobUploadBytes(): number | null {
+		return this.serverCapabilities?.maxBlobUploadBytes ?? null;
+	}
+
 	get hasCachedCapabilities(): boolean {
 		return this.serverCapabilities !== null;
 	}

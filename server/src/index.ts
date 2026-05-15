@@ -14,6 +14,7 @@ import {
 	supportsBuckets,
 } from "./routes/auth";
 import { handleBlobRoute } from "./routes/blobs";
+import { handleProfileLockRoute } from "./routes/profileLock";
 import { corsPreflight, html, json, withCors } from "./routes/http";
 import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
@@ -161,6 +162,10 @@ const worker = {
 
 		if (resource === "blobs") {
 			return withCors(await handleBlobRoute(env, vaultRoute.vaultId, req, rest, json));
+		}
+
+		if (resource === "profile-lock") {
+			return withCors(await handleProfileLockRoute(env, vaultRoute.vaultId, req, rest, json));
 		}
 
 		if (resource === "snapshots") {

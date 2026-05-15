@@ -6,15 +6,6 @@ import {
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
-import { randomBase64Url } from "../utils/base64url";
-import {
-	DEFAULT_MOBILE_PROFILE_PLUGIN_IDS,
-	normalizeProfilePluginIds,
-} from "../profile/profilePackage";
-import type {
-	ProfilePackagePluginCandidate,
-	ProfilePackageSummary,
-} from "../profile/profilePackageService";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -45,14 +36,12 @@ export interface VaultSyncSettingsHost {
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
-	getProfilePackageSummary(): ProfilePackageSummary;
-	getConfigProfilePluginCandidates(): Promise<ProfilePackagePluginCandidate[]>;
-	publishObsidianProfilePackageNow(): Promise<void>;
-	applyLatestObsidianProfilePackage(): Promise<void>;
-	restorePreviousObsidianProfilePackage(): Promise<void>;
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;
 	buildRecoveryKitText(): string | null;
+	prepareObsidianMobileFolder(): Promise<void>;
+	publishObsidianProfileMirrorNow(): Promise<void>;
+	applyLatestObsidianProfileMirror(): Promise<void>;
 }
 
 const CLOUDFLARE_DEPLOY_URL = "https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server";
@@ -122,69 +111,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		private readonly host: VaultSyncSettingsHost,
 	) {
 		super(app, plugin);
-	}
-
-	private renderProfilePluginAllowlist(containerEl: HTMLElement): void {
-		const loadingEl = containerEl.createEl("p", {
-			text: "Loading installed plugins...",
-			cls: "yaos-settings-status-subtitle",
-		});
-		void this.host.getConfigProfilePluginCandidates().then((candidates) => {
-			if (!containerEl.isConnected) return;
-			loadingEl.remove();
-			const actions = containerEl.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
-			actions.createEl("button", { text: "Reset recommended" }).addEventListener("click", () => {
-				void this.host.updateSettings((settings) => {
-					settings.configProfileMobilePluginIds = [...DEFAULT_MOBILE_PROFILE_PLUGIN_IDS];
-				}, "settings:profile-plugin-allowlist-reset").then(() => this.display());
-			});
-			actions.createEl("button", { text: "Include compatible installed" }).addEventListener("click", () => {
-				void this.host.updateSettings((settings) => {
-					settings.configProfileMobilePluginIds = candidates
-						.filter((candidate) => candidate.installed && !candidate.blocked && !candidate.desktopOnly)
-						.map((candidate) => candidate.id);
-				}, "settings:profile-plugin-allowlist-compatible").then(() => this.display());
-			});
-
-			if (candidates.length === 0) {
-				containerEl.createEl("p", {
-					text: "No community plugin folders were found.",
-					cls: "yaos-settings-status-subtitle",
-				});
-				return;
-			}
-
-			for (const candidate of candidates) {
-				const descParts = [
-					candidate.id,
-					candidate.version ? `v${candidate.version}` : null,
-					candidate.reason,
-				].filter((part): part is string => !!part);
-				new Setting(containerEl)
-					.setName(candidate.name)
-					.setDesc(descParts.join(" - "))
-					.addToggle((toggle) => {
-						toggle
-							.setValue(candidate.included)
-							.setDisabled(candidate.blocked || candidate.desktopOnly || !candidate.installed)
-							.onChange(async (value) => {
-								await this.host.updateSettings((settings) => {
-									const next = new Set(normalizeProfilePluginIds(settings.configProfileMobilePluginIds, []));
-									if (value) {
-										next.add(candidate.id);
-									} else {
-										next.delete(candidate.id);
-									}
-									settings.configProfileMobilePluginIds = normalizeProfilePluginIds(next, []);
-								}, "settings:profile-plugin-allowlist");
-								this.display();
-							});
-					});
-			}
-		}, () => {
-			if (!containerEl.isConnected) return;
-			loadingEl.setText("Could not load installed plugins. Check the console.");
-		});
 	}
 
 	display(): void {
@@ -339,6 +265,151 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			}
 		}
 
+		if (!setupIncomplete) {
+			/* eslint-disable obsidianmd/ui/sentence-case -- Profile ids and Obsidian config names are literal user-facing values. */
+			addSectionHeading(containerEl, "Profile Mirror");
+
+			const profileCard = containerEl.createDiv({ cls: "yaos-settings-status-card" });
+			addCardRow(profileCard, "Mode", this.host.settings.configProfileMode);
+			addCardRow(profileCard, "Profile", this.host.settings.configProfileCurrentProfile);
+			addCardRow(profileCard, "Seen generation", this.host.settings.configProfileLastSeenGeneration || "(none)");
+			addCardRow(profileCard, "Applied generation", this.host.settings.configProfileLastAppliedGeneration || "(none)");
+			addCardRow(profileCard, "Base generation", this.host.settings.configProfileBaseGeneration || "(none)");
+
+			new Setting(containerEl)
+				.setName("Sync Obsidian profile")
+				.setDesc("Sync approved Obsidian settings, themes, snippets, plugin code, and per-profile plugin behavior.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.configProfileSyncEnabled)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileSyncEnabled = value;
+							}, "settings:profile-sync-enabled");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Profile mode")
+				.setDesc("Publish sends this profile to the server. Subscribe applies the latest remote profile to this device.")
+				.addDropdown((dropdown) =>
+					dropdown
+						.addOption("off", "Off")
+						.addOption("publish", "Publish from this device")
+						.addOption("subscribe", "Subscribe on this device")
+						.setValue(this.host.settings.configProfileMode)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileMode = value as VaultSyncSettings["configProfileMode"];
+							}, "settings:profile-mode");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Current profile")
+				.setDesc("desktop uses the active obsidian config folder. mobile can use .obsidian-mobile after you enable override config folder.")
+				.addDropdown((dropdown) =>
+					dropdown
+						.addOption("desktop", "Desktop")
+						.addOption("mobile", "Mobile")
+						.setValue(this.host.settings.configProfileCurrentProfile)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileCurrentProfile = value as VaultSyncSettings["configProfileCurrentProfile"];
+							}, "settings:profile-current-profile");
+							this.display();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Trusted publisher")
+				.setDesc("Allow this device to publish profile changes. Keep disabled on devices that should only receive.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.host.settings.configProfileTrustedPublisher)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileTrustedPublisher = value;
+								if (!value) {
+									settings.configProfileCanPublishProfile = false;
+									settings.configProfileCanPublishPluginCode = false;
+								}
+							}, "settings:profile-trusted-publisher");
+							this.display();
+						}),
+				);
+
+			if (this.host.settings.configProfileTrustedPublisher) {
+				new Setting(containerEl)
+					.setName("Publish profile behavior")
+					.setDesc("Publish configs, themes, snippets, workspace files, and plugin data.json for this profile.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileCanPublishProfile)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileCanPublishProfile = value;
+								}, "settings:profile-can-publish-profile");
+							}),
+					);
+
+				new Setting(containerEl)
+					.setName("Publish plugin versions")
+					.setDesc("Publish shared plugin code locks. Behavior remains profile-specific.")
+					.addToggle((toggle) =>
+						toggle
+							.setValue(this.host.settings.configProfileCanPublishPluginCode)
+							.onChange(async (value) => {
+								await this.host.updateSettings((settings) => {
+									settings.configProfileCanPublishPluginCode = value;
+								}, "settings:profile-can-publish-code");
+							}),
+					);
+			}
+
+			new Setting(containerEl)
+				.setName("Included plugin ids")
+				.setDesc("Optional comma-separated allowlist. Leave empty to include all compatible plugins.")
+				.addText((text) =>
+					text
+						.setPlaceholder("plugin id, another id")
+						.setValue(this.host.settings.configProfileIncludedPluginIds.join(", "))
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileIncludedPluginIds = value.split(",").map((v) => v.trim()).filter(Boolean);
+							}, "settings:profile-included-plugins");
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Excluded plugin ids")
+				.setDesc("Comma-separated plugins to exclude in addition to the safety denylist.")
+				.addText((text) =>
+					text
+						.setPlaceholder("plugin id, another id")
+						.setValue(this.host.settings.configProfileExcludedPluginIds.join(", "))
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.configProfileExcludedPluginIds = value.split(",").map((v) => v.trim()).filter(Boolean);
+							}, "settings:profile-excluded-plugins");
+						}),
+				);
+
+			const profileActions = containerEl.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
+			profileActions.createEl("button", { text: "Prepare mobile profile" }).addEventListener("click", () => {
+				void this.host.prepareObsidianMobileFolder().then(() => this.display());
+			});
+			profileActions.createEl("button", { text: "Publish now" }).addEventListener("click", () => {
+				void this.host.publishObsidianProfileMirrorNow().then(() => this.display());
+			});
+			profileActions.createEl("button", { text: "Apply latest" }).addEventListener("click", () => {
+				void this.host.applyLatestObsidianProfileMirror().then(() => this.display());
+			});
+			/* eslint-enable obsidianmd/ui/sentence-case */
+		}
+
 		addSectionHeading(containerEl, "This device");
 		new Setting(containerEl)
 			.setName("Device name")
@@ -368,111 +439,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							}, "settings:exclude-patterns");
 					}),
 			);
-
-			new Setting(containerEl)
-				.setName("Sync Obsidian profile")
-				.setDesc("Publish a versioned mobile profile package from the PC and apply it manually on mobile. YAOS connection data and YAOS plugin files are never included.")
-				.addToggle((toggle) =>
-					toggle
-						.setValue(this.host.settings.configProfileSyncEnabled)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.configProfileSyncEnabled = value;
-								if (!value) settings.configProfileMode = "off";
-								if (value && settings.configProfileMode === "off") {
-									settings.configProfileMode = "subscribe";
-								}
-							}, "settings:config-profile-toggle");
-							this.display();
-						}),
-				);
-
-			if (this.host.settings.configProfileSyncEnabled) {
-				const profileSummary = this.host.getProfilePackageSummary();
-				new Setting(containerEl)
-					.setName("Obsidian profile mode")
-					.setDesc("Use Publish on the source computer and Subscribe on mobile devices. The normal live sync blocks Obsidian config files; profile changes move only through packages.")
-					.addDropdown((dropdown) =>
-						dropdown
-							.addOption("publish", "Publish from this device")
-							.addOption("subscribe", "Subscribe on this device")
-							.addOption("off", "Off")
-							.setValue(this.host.settings.configProfileMode)
-							.onChange(async (value) => {
-								await this.host.updateSettings((settings) => {
-									settings.configProfileMode = value as VaultSyncSettings["configProfileMode"];
-								}, "settings:config-profile-mode");
-							}),
-					);
-
-				new Setting(containerEl)
-					.setName("Initial auto-apply")
-					.setDesc("Experimental desktop/testing option. Mobile safety disables this so profile packages are applied only by command/button.")
-					.addToggle((toggle) =>
-						toggle
-							.setValue(this.host.settings.configProfileInitialAutoApply)
-							.onChange(async (value) => {
-								await this.host.updateSettings((settings) => {
-									settings.configProfileInitialAutoApply = value;
-								}, "settings:profile-initial-auto-apply");
-							}),
-					);
-
-				new Setting(containerEl)
-					.setName("Manual apply after initial")
-					.setDesc("New PC profile packages wait until you apply them.")
-					.addToggle((toggle) =>
-						toggle
-							.setValue(this.host.settings.configProfileManualApplyAfterInitial)
-							.onChange(async (value) => {
-								await this.host.updateSettings((settings) => {
-									settings.configProfileManualApplyAfterInitial = value;
-								}, "settings:profile-manual-after-initial");
-							}),
-					);
-
-				const profileCard = containerEl.createDiv({ cls: "yaos-settings-status-card" });
-				addCardRow(profileCard, "Latest package", profileSummary.latestGeneration ?? "None seen");
-				addCardRow(profileCard, "Latest package time", profileSummary.latestCreatedAt ?? "Unknown");
-				addCardRow(
-					profileCard,
-					"Package files",
-					profileSummary.latestFileCount == null ? "Unknown" : String(profileSummary.latestFileCount),
-				);
-				addCardRow(
-					profileCard,
-					"Package size",
-					profileSummary.latestSize == null ? "Unknown" : `${Math.ceil(profileSummary.latestSize / 1024)} KB`,
-				);
-				addCardRow(profileCard, "Seen", profileSummary.stagedGeneration ?? "None");
-				addCardRow(profileCard, "Applied", profileSummary.lastAppliedGeneration || "Never");
-				addCardRow(profileCard, "Backup", profileSummary.lastBackupGeneration || "None");
-				const profileActions = profileCard.createDiv({ cls: "modal-button-container yaos-settings-status-actions" });
-				if (this.host.settings.configProfileMode === "publish") {
-					profileActions.createEl("button", { text: "Publish package now" }).addEventListener("click", () => {
-						void this.host.publishObsidianProfilePackageNow().then(() => this.display());
-					});
-				}
-				if (this.host.settings.configProfileMode === "subscribe") {
-					profileActions.createEl("button", { text: "Apply latest package" }).addEventListener("click", () => {
-						void this.host.applyLatestObsidianProfilePackage().then(() => this.display());
-					});
-					profileActions.createEl("button", { text: "Restore backup" }).addEventListener("click", () => {
-						void this.host.restorePreviousObsidianProfilePackage().then(() => this.display());
-					});
-				}
-
-				const pluginAllowlistEl = containerEl.createDiv({ cls: "yaos-settings-status-card" });
-				pluginAllowlistEl.createEl("div", {
-					text: "Mobile profile plugins",
-					cls: "yaos-settings-status-title",
-				});
-				pluginAllowlistEl.createEl("p", {
-					text: "Select installed plugins to include in the package. Desktop-only plugins are detected from manifest.json and disabled here automatically.",
-					cls: "yaos-settings-status-subtitle",
-				});
-				this.renderProfilePluginAllowlist(pluginAllowlistEl);
-			}
 
 			new Setting(containerEl)
 				.setName("Max text file size in kilobytes")
@@ -554,7 +520,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.setDesc(`Attachments larger than this are skipped. Maximum ${attachmentCapKB} KB.`)
 				.addText((text) =>
 					text
-						.setPlaceholder("10240")
+						.setPlaceholder("102400")
 						.setValue(String(this.host.settings.maxAttachmentSizeKB))
 						.onChange(async (value) => {
 							const n = parseInt(value, 10);
@@ -734,92 +700,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						await this.host.updateSettings((settings) => {
 							settings.debug = value;
 						}, "settings:debug");
-					}),
-			);
-
-		new Setting(advancedBody)
-			.setName("QA flight recorder")
-			.setDesc("Record structured sync traces for QA. Safe mode redacts filenames by default.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.host.settings.qaTraceEnabled)
-					.onChange(async (value) => {
-						await this.host.updateSettings((settings) => {
-							settings.qaTraceEnabled = value;
-						}, "settings:qa-trace-enabled");
-					}),
-			);
-
-		new Setting(advancedBody)
-			.setName("QA flight recorder mode")
-			.setDesc("Safe is recommended. QA-safe uses a shared secret for multi-device runs. Local-private traces cannot be exported.")
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption("safe", "Safe (redacted)")
-					.addOption("qa-safe", "QA-safe (shared secret)")
-					.addOption("full", "Full (filenames)")
-					.addOption("local-private", "Local-private (no export)")
-					.setValue(this.host.settings.qaTraceMode)
-					.onChange(async (value) => {
-						await this.host.updateSettings((settings) => {
-							settings.qaTraceMode = value as VaultSyncSettings["qaTraceMode"];
-						}, "settings:qa-trace-mode");
-					}),
-			);
-
-		new Setting(advancedBody)
-			.setName("QA trace shared secret")
-			.setDesc("Optional secret for QA-safe multi-device correlation. Never shared in exports.")
-			.addText((text) => {
-				text
-					.setPlaceholder("(hidden)")
-					.setValue(this.host.settings.qaTraceSecret ?? "")
-					.onChange(async (value) => {
-						await this.host.updateSettings((settings) => {
-							settings.qaTraceSecret = value.trim();
-						}, "settings:qa-trace-secret");
-					});
-				// Hide the secret field like a password input.
-				text.inputEl.type = "password";
-				text.inputEl.autocomplete = "off";
-			})
-			.addButton((btn) =>
-				btn
-					.setButtonText("Generate")
-					.setTooltip("Generate a new random secret")
-					.onClick(async () => {
-						const secret = randomBase64Url(24);
-						await this.host.updateSettings((settings) => {
-							settings.qaTraceSecret = secret;
-						}, "settings:qa-trace-secret-generate");
-						new Notice("QA trace secret generated.", 3000);
-					}),
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Copy")
-					.setTooltip("Copy secret to clipboard")
-					.onClick(() => {
-						const secret = this.host.settings.qaTraceSecret ?? "";
-						if (!secret) {
-							new Notice("No secret to copy.", 3000);
-							return;
-						}
-						navigator.clipboard.writeText(secret).then(
-							() => new Notice("QA trace secret copied.", 3000),
-							() => new Notice("Failed to copy to clipboard.", 4000),
-						);
-					}),
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Clear")
-					.setTooltip("Clear the secret")
-					.onClick(async () => {
-						await this.host.updateSettings((settings) => {
-							settings.qaTraceSecret = "";
-						}, "settings:qa-trace-secret-clear");
-						new Notice("QA trace secret cleared.", 3000);
 					}),
 			);
 

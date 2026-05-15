@@ -1,1 +1,1 @@
-export const MAX_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
+export const MAX_BLOB_UPLOAD_BYTES = 100 * 1024 * 1024;

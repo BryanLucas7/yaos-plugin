@@ -1,6 +1,5 @@
 import type { ExternalEditPolicy, VaultSyncSettings } from "../settings";
 import { parseExcludePatterns } from "../sync/exclude";
-import type { ConfigProfileAllowlistPreset, ConfigProfileMode } from "../sync/profileSyncPolicy";
 
 export interface RuntimeConfig {
 	host: string;
@@ -18,16 +17,6 @@ export interface RuntimeConfig {
 	maxAttachmentSizeKB: number;
 	attachmentConcurrency: number;
 	showRemoteCursors: boolean;
-	configProfileSyncEnabled: boolean;
-	configProfileMode: ConfigProfileMode;
-	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
-	configProfileMobilePluginIds: string[];
-	configProfileAutoModeInitialized: boolean;
-	configProfileInitialAutoApply: boolean;
-	configProfileManualApplyAfterInitial: boolean;
-	configProfileLastSeenGeneration: string;
-	configProfileLastAppliedGeneration: string;
-	configProfileLastBackupGeneration: string;
 	updateRepoUrl: string;
 	updateRepoBranch: string;
 	vaultConfigDir: string;
@@ -53,16 +42,6 @@ export function buildRuntimeConfig(
 		maxAttachmentSizeKB: settings.maxAttachmentSizeKB,
 		attachmentConcurrency: settings.attachmentConcurrency,
 		showRemoteCursors: settings.showRemoteCursors,
-		configProfileSyncEnabled: settings.configProfileSyncEnabled,
-		configProfileMode: settings.configProfileMode,
-		configProfileAllowlistPreset: settings.configProfileAllowlistPreset,
-		configProfileMobilePluginIds: [...settings.configProfileMobilePluginIds],
-		configProfileAutoModeInitialized: settings.configProfileAutoModeInitialized,
-		configProfileInitialAutoApply: settings.configProfileInitialAutoApply,
-		configProfileManualApplyAfterInitial: settings.configProfileManualApplyAfterInitial,
-		configProfileLastSeenGeneration: settings.configProfileLastSeenGeneration,
-		configProfileLastAppliedGeneration: settings.configProfileLastAppliedGeneration,
-		configProfileLastBackupGeneration: settings.configProfileLastBackupGeneration,
 		updateRepoUrl: settings.updateRepoUrl.trim(),
 		updateRepoBranch: settings.updateRepoBranch.trim() || "main",
 		vaultConfigDir,

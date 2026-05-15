@@ -17,8 +17,8 @@ interface AttachmentOrchestratorDeps {
 	getExcludePatterns(): string[];
 	persistBlobQueue(snapshot: BlobQueueSnapshot): Promise<void>;
 	clearPersistedBlobQueue(): Promise<void>;
-	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[];
-	onPreservedUnresolvedChanged(): void;
+	getPreservedUnresolvedEntries?(): PreservedUnresolvedEntry[];
+	onPreservedUnresolvedChanged?(): void;
 	trace: TraceRecord;
 	scheduleTraceStateSnapshot(reason: string): void;
 	refreshStatusBar(): void;
@@ -76,9 +76,8 @@ export class AttachmentOrchestrator {
 			},
 			this.deps.getBlobHashCache(),
 			this.deps.trace,
-			this.deps.getPreservedUnresolvedEntries(),
-			this.deps.onPreservedUnresolvedChanged,
-			this.deps.getRuntimeConfig,
+			this.deps.getPreservedUnresolvedEntries?.() ?? [],
+			this.deps.onPreservedUnresolvedChanged?.bind(this.deps),
 		);
 
 		this.blobSync = blobSync;

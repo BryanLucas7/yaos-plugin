@@ -41,10 +41,6 @@ const PATH_EXTENSIONS = [
 	"ogg",
 	"zip",
 	"json",
-	"txt",
-	"csv",
-	"bmp",
-	"ico",
 ] as const;
 
 /**
@@ -94,7 +90,6 @@ export interface PathRedactor {
 
 const REDACTION_PREFIX = "path:";
 const HASH_PREFIX_LENGTH = 16;
-const HASH_SEPARATOR = "\u0000";
 
 interface CreateOptions {
 	/** Pre-known paths to seed the cache with (e.g. active CRDT/disk paths). */
@@ -121,7 +116,7 @@ export async function createPathRedactor(
 	const cache = new Map<string, string>();
 
 	async function compute(path: string): Promise<string> {
-		const digest = await sha256(`${salt}${HASH_SEPARATOR}${path}`);
+		const digest = await sha256(`${salt}\0${path}`);
 		return `${REDACTION_PREFIX}${digest.slice(0, HASH_PREFIX_LENGTH)}`;
 	}
 
@@ -144,7 +139,7 @@ export async function createPathRedactor(
 		// bundle. Cross-bundle linkage via this fallback is prevented by
 		// folding the salt into the seed.
 		let h = 0x811c9dc5;
-		const seed = `${salt}${HASH_SEPARATOR}${path}`;
+		const seed = `${salt}\0${path}`;
 		for (let i = 0; i < seed.length; i++) {
 			h ^= seed.charCodeAt(i);
 			h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
@@ -171,7 +166,8 @@ export async function createPathRedactor(
 		const sortedKeys = [...cache.keys()].sort((a, b) => b.length - a.length);
 		for (const path of sortedKeys) {
 			if (result.includes(path)) {
-				result = result.split(path).join(cache.get(path)!);
+				const replacement = cache.get(path);
+				if (replacement !== undefined) result = result.split(path).join(replacement);
 			}
 		}
 		// Pass 2: regex scan for quoted path-shaped strings not yet in cache
@@ -228,8 +224,6 @@ const KNOWN_PATH_KEYS: ReadonlySet<string> = new Set([
 	"resolvedPath",
 	"pendingOldPath",
 	"pendingNewPath",
-	"conflictPath",
-	"normalizedPath",
 ]);
 
 /**
@@ -242,11 +236,6 @@ const KNOWN_PATH_LIST_KEYS: ReadonlySet<string> = new Set([
 	"missingInCrdt",
 	"paths",
 	"affectedPaths",
-	"affectedPathSample",
-	"createdPathSample",
-	"blockedUpdatePathSample",
-	"blockedPathSample",
-	"pathSample",
 	"openPaths",
 ]);
 

@@ -23,7 +23,6 @@ import {
 } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { isBlobSyncable, type BlobRef } from "../types";
-import type { RuntimeConfig } from "../runtime/runtimeConfig";
 import { ORIGIN_SEED } from "./origins";
 import {
 	appendTraceParams,
@@ -412,7 +411,6 @@ export class BlobSyncManager {
 		private trace?: TraceRecord,
 		initialPreservedUnresolved: PreservedUnresolvedEntry[] = [],
 		private onPreservedUnresolvedChanged?: () => void,
-		private getRuntimeConfig?: () => RuntimeConfig,
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
@@ -428,23 +426,6 @@ export class BlobSyncManager {
 			initialPreservedUnresolved.filter((entry) => entry.kind === "blob"),
 		);
 		this.preservedUnresolvedPaths = this.preservedUnresolved.paths;
-	}
-
-	private blobPathSyncable(path: string, direction: "upload" | "download"): boolean {
-		const runtimeConfig = this.getRuntimeConfig?.();
-		return isBlobSyncable(
-			path,
-			runtimeConfig?.excludePatterns ?? [],
-			this.app.vault.configDir,
-			runtimeConfig
-				? {
-					enabled: runtimeConfig.configProfileSyncEnabled,
-					mode: runtimeConfig.configProfileMode,
-					preset: runtimeConfig.configProfileAllowlistPreset,
-					direction,
-				}
-				: undefined,
-		);
 	}
 
 	// -------------------------------------------------------------------
@@ -464,7 +445,6 @@ export class BlobSyncManager {
 					if (event.transaction.origin === ORIGIN_SEED) return;
 					const ref = this.vaultSync.pathToBlob.get(path);
 					if (!ref) return;
-					if (!this.blobPathSyncable(path, "download")) return;
 					this.log(
 						`observer: remote blob ref for "${path}" hash=${ref.hash.slice(0, 12)}…`,
 					);
@@ -485,7 +465,6 @@ export class BlobSyncManager {
 						}
 						transactionHashes.set(path, oldRef.hash);
 					}
-					if (!this.blobPathSyncable(path, "download")) return;
 					void this.handleRemoteDelete(path, oldRef?.hash ?? null);
 				}
 			});
@@ -507,7 +486,6 @@ export class BlobSyncManager {
 					if (transactionHashes?.has(path)) return;
 					// Try to find known hash from pathToBlob (may already be deleted)
 					const ref = this.vaultSync.pathToBlob.get(path);
-					if (!this.blobPathSyncable(path, "download")) return;
 					void this.handleRemoteDelete(path, ref?.hash ?? null);
 				}
 			});
@@ -697,12 +675,6 @@ export class BlobSyncManager {
 					file.path,
 					excludePatterns,
 					this.app.vault.configDir,
-					{
-						enabled: this.getRuntimeConfig?.().configProfileSyncEnabled ?? false,
-						mode: this.getRuntimeConfig?.().configProfileMode ?? "off",
-						preset: this.getRuntimeConfig?.().configProfileAllowlistPreset ?? "mobile",
-						direction: "upload",
-					},
 				)
 			)
 				continue;
@@ -731,10 +703,6 @@ export class BlobSyncManager {
 
 		// CRDT blobs not on disk → schedule download
 		for (const path of crdtBlobPaths) {
-			if (!this.blobPathSyncable(path, "download")) {
-				skipped++;
-				continue;
-			}
 			if (!diskBlobs.has(path)) {
 				const ref = this.vaultSync.pathToBlob.get(path);
 				if (ref) {

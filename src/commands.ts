@@ -9,28 +9,18 @@ export interface CommandsRuntimeHost {
 	getConnectionController(): ConnectionController | null;
 	getDiagnosticsService(): DiagnosticsService | null;
 	getSnapshotService(): SnapshotService | null;
-	getFilesNeedingAttentionText(): string;
 	getUntrackedFileCount(): number;
 	isDebugEnabled(): boolean;
-	startQaFlightTrace(mode?: string): Promise<void>;
-	stopQaFlightTrace(): Promise<void>;
-	exportSafeFlightTrace(): Promise<void>;
-	exportFullFlightTrace(): Promise<void>;
-	showTimelineForCurrentFile(): void;
-	clearFlightLogs(): Promise<void>;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
 	runSchemaMigrationToV2(): void;
 	runVfsTortureTest(): Promise<void>;
 	importUntrackedFiles(): Promise<void>;
-	publishObsidianProfilePackageNow(): Promise<void>;
-	applyLatestObsidianProfilePackage(): Promise<void>;
-	restorePreviousObsidianProfilePackage(): Promise<void>;
+	prepareObsidianMobileFolder(): Promise<void>;
+	publishObsidianProfileMirrorNow(): Promise<void>;
+	applyLatestObsidianProfileMirror(): Promise<void>;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
-	exportFlightLogsToVault(): Promise<{ copied: number; skipped: number; errors: number; targetDir: string }>;
-	exportEnabledPluginsToVault(): Promise<{ path: string; count: number }>;
-	buildLastBootSummaryText(): Promise<string>;
 }
 
 export function registerCommands(
@@ -45,56 +35,6 @@ export function registerCommands(
 				host.getConnectionController()?.reconnect("manual-command");
 				new Notice("Reconnecting...");
 			}
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-start",
-		name: "Start QA flight trace",
-		callback: () => {
-			void host.startQaFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-stop",
-		name: "Stop QA flight trace",
-		callback: () => {
-			void host.stopQaFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-export-safe",
-		name: "Export safe QA flight trace",
-		callback: () => {
-			void host.exportSafeFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-export-full",
-		name: "Export QA flight trace with filenames",
-		callback: () => {
-			void host.exportFullFlightTrace();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-timeline-current-file",
-		name: "Show timeline for current file",
-		callback: () => {
-			host.showTimelineForCurrentFile();
-		},
-	});
-
-	registrar.addCommand({
-		id: "qa-flight-trace-clear-logs",
-		name: "Clear flight logs",
-		callback: () => {
-			void host.clearFlightLogs().then(() => {
-				new Notice("Flight logs cleared.", 4000);
-			});
 		},
 	});
 
@@ -139,16 +79,6 @@ export function registerCommands(
 			const text = host.getDiagnosticsService()?.buildRecentEventsText(80) ?? "No events recorded yet.";
 			new Notice("Recent sync events printed to console.", 5000);
 			console.debug("[yaos] Recent sync events:\n" + text);
-		},
-	});
-
-	registrar.addCommand({
-		id: "show-files-needing-attention",
-		name: "Show files needing attention",
-		callback: () => {
-			const text = host.getFilesNeedingAttentionText();
-			new Notice("Files needing attention printed to console.", 7000);
-			console.debug("[yaos] Files needing attention:\n" + text);
 		},
 	});
 
@@ -208,26 +138,26 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
-		id: "publish-profile-package",
-		name: "Publish Obsidian profile package now",
+		id: "prepare-obsidian-mobile-folder",
+		name: "Prepare mobile profile folder",
 		callback: () => {
-			void host.publishObsidianProfilePackageNow();
+			void host.prepareObsidianMobileFolder();
 		},
 	});
 
 	registrar.addCommand({
-		id: "apply-profile-package",
-		name: "Apply latest PC profile package",
+		id: "publish-profile-mirror-now",
+		name: "Publish Obsidian profile now",
 		callback: () => {
-			void host.applyLatestObsidianProfilePackage();
+			void host.publishObsidianProfileMirrorNow();
 		},
 	});
 
 	registrar.addCommand({
-		id: "restore-profile-package-backup",
-		name: "Restore previous Obsidian profile package",
+		id: "apply-profile-mirror-now",
+		name: "Apply latest Obsidian profile now",
 		callback: () => {
-			void host.restorePreviousObsidianProfilePackage();
+			void host.applyLatestObsidianProfileMirror();
 		},
 	});
 
@@ -283,57 +213,6 @@ export function registerCommands(
 		name: "Nuclear reset (wipe sync state and reseed from disk)",
 		callback: () => {
 			host.nuclearReset();
-		},
-	});
-
-	registrar.addCommand({
-		id: "export-flight-logs-to-vault",
-		name: "Export flight logs to vault (for mobile diagnostics)",
-		callback: () => {
-			void host.exportFlightLogsToVault().then(
-				(result) => new Notice(
-					`YAOS: mirrored flight logs → ${result.targetDir}/ — copied=${result.copied} skipped=${result.skipped} errors=${result.errors}.`,
-					9000,
-				),
-				(err) => {
-					console.error("[yaos] export-flight-logs-to-vault failed", err);
-					new Notice("YAOS: failed to export flight logs. See console.", 7000);
-				},
-			);
-		},
-	});
-
-	registrar.addCommand({
-		id: "export-enabled-plugins-list",
-		name: "Export enabled plugins list to vault (for cross-device diff)",
-		callback: () => {
-			void host.exportEnabledPluginsToVault().then(
-				(result) => new Notice(`YAOS: wrote ${result.count} enabled plugins → ${result.path}.`, 9000),
-				(err) => {
-					console.error("[yaos] export-enabled-plugins-list failed", err);
-					new Notice("YAOS: failed to export plugin list. See console.", 7000);
-				},
-			);
-		},
-	});
-
-	registrar.addCommand({
-		id: "copy-last-boot-summary",
-		name: "Copy last boot summary to clipboard",
-		callback: () => {
-			void host.buildLastBootSummaryText().then(
-				(text) => navigator.clipboard.writeText(text).then(
-					() => new Notice("YAOS: last boot summary copied to clipboard.", 4000),
-					() => {
-						console.debug("[yaos] last boot summary:\n" + text);
-						new Notice("YAOS: clipboard unavailable — printed to console.", 6000);
-					},
-				),
-				(err) => {
-					console.error("[yaos] buildLastBootSummaryText failed", err);
-					new Notice("YAOS: failed to build last boot summary. See console.", 7000);
-				},
-			);
 		},
 	});
 }

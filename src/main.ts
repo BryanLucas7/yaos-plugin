@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Platform, Plugin, TFile, arrayBufferToHex } from "obsidian";
+import { MarkdownView, Notice, Platform, Plugin, TFile, arrayBufferToHex, normalizePath } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -15,7 +15,6 @@ import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
-import type { ProfileSyncDirection } from "./sync/profileSyncPolicy";
 import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
@@ -37,7 +36,6 @@ import {
 	type BlobHashCache,
 	moveCachedHashes,
 } from "./sync/blobHashCache";
-import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
@@ -66,16 +64,9 @@ import {
 	ReconciliationController,
 } from "./runtime/reconciliationController";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
-import {
-	ProfilePackageService,
-	type ProfilePackagePluginCandidate,
-} from "./profile/profilePackageService";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
-import { FlightTraceController } from "./debug/flightTraceController";
-import { FLIGHT_KIND } from "./debug/flightEvents";
-import type { FlightMode } from "./debug/flightEvents";
 import { registerCommands } from "./commands";
 import {
 	getSyncStatusLabel,
@@ -84,11 +75,22 @@ import {
 	type SyncStatus,
 } from "./status/statusBarController";
 import { formatUnknown, yTextToString } from "./utils/format";
-import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runVfsTortureTest } from "./dev/vfsTortureTest";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
-import { buildQaDebugApi } from "./qaDebugApi";
+import { filterBratBetaList, type BratBetaEntry } from "./profile/bratFilter";
+import { applyLazyDesktopToMobileClone, getInstantPluginIdsFromLazy, type LazyData } from "./profile/lazyPluginLoader";
+import {
+	OBSIDIAN_MOBILE_DIR,
+	planMobileFolderPreparation,
+} from "./profile/obsidianMobileFolder";
+import { ProfileMirrorService } from "./profile/profileMirrorService";
+import { HttpProfileLockTransport } from "./profile/profileLockStore";
+import { ALLOWED_ROOT_CONFIG_FILES, createProfilePolicy, type PluginManifestLike, type Profile, type ProfilePolicy } from "./profile/profilePolicy";
+import { ProfilePublisher } from "./profile/profilePublisher";
+import { ProfileSubscriber } from "./profile/profileSubscriber";
+import { HttpProfileBlobTransport, sha256Hex as sha256BytesHex } from "./profile/profileTransport";
+import type { ScannedConfigDir, ScannedFile, ScannedPlugin } from "./profile/profileManifest";
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
@@ -97,7 +99,6 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
-	_preservedUnresolved?: PreservedUnresolvedEntry[];
 };
 
 export default class VaultCrdtSyncPlugin extends Plugin {
@@ -113,18 +114,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private editorBindings: EditorBindingManager | null = null;
 	private diskMirror: DiskMirror | null = null;
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
-	private profilePackageService: ProfilePackageService | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
 	private diagnosticsService: DiagnosticsService | null = null;
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
-	private flightTrace: FlightTraceController | null = null;
+	private profileMirrorService: ProfileMirrorService | null = null;
 	private statusBarEl: HTMLElement | null = null;
 	private statusInterval: ReturnType<typeof setInterval> | null = null;
-	private diagnosticBootForced = false;
-	private diagnosticMirrorTimer: ReturnType<typeof setInterval> | null = null;
+	private pendingProfilePluginRestartIds: string[] = [];
+	private profileLazyCloneOccurredDuringPublish = false;
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -140,7 +140,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
-	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
 
@@ -190,30 +189,414 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
-			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
-			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 		});
 		return this.reconciliationController;
 	}
 
-	private isMarkdownPathSyncable(path: string, direction: ProfileSyncDirection = "upload"): boolean {
-		const runtimeConfig = this.getRuntimeConfig();
-		return isMarkdownSyncable(path, this.excludePatterns, runtimeConfig.vaultConfigDir, {
-			enabled: runtimeConfig.configProfileSyncEnabled,
-			mode: runtimeConfig.configProfileMode,
-			preset: runtimeConfig.configProfileAllowlistPreset,
-			direction,
+	private setupProfileMirrorService(): void {
+		this.profileMirrorService = new ProfileMirrorService({
+			applyLock: (lock) => this.applyProfileMirrorLock(lock),
+			publish: () => this.publishProfileMirrorCurrentSettings(),
+			getRemoteLock: () => this.createProfileLockTransport().getLock(),
+			updateSettings: (mutate, reason) =>
+				this.updateSettings((settings) => mutate(settings), reason),
+			isMobileDevice: () => Platform.isMobileApp,
+			log: (message) => this.log(message),
 		});
 	}
 
-	private isBlobPathSyncable(path: string, direction: ProfileSyncDirection = "upload"): boolean {
-		const runtimeConfig = this.getRuntimeConfig();
-		return isBlobSyncable(path, this.excludePatterns, runtimeConfig.vaultConfigDir, {
-			enabled: runtimeConfig.configProfileSyncEnabled,
-			mode: runtimeConfig.configProfileMode,
-			preset: runtimeConfig.configProfileAllowlistPreset,
-			direction,
+	private createProfileEndpoint(): { host: string; vaultId: string; token: string } {
+		const host = this.settings.host.trim();
+		const vaultId = this.settings.vaultId.trim();
+		const token = this.settings.token.trim();
+		if (!host || !vaultId || !token) {
+			throw new Error("Profile Mirror requires host, vault ID, and token.");
+		}
+		return { host, vaultId, token };
+	}
+
+	private createProfileLockTransport(): HttpProfileLockTransport {
+		return new HttpProfileLockTransport(this.createProfileEndpoint());
+	}
+
+	private createProfileBlobTransport(): HttpProfileBlobTransport {
+		return new HttpProfileBlobTransport(this.createProfileEndpoint());
+	}
+
+	private profileConfigDir(profile: Profile): string {
+		const explicit = profile === "desktop"
+			? this.settings.configProfileDesktopConfigDir.trim()
+			: this.settings.configProfileMobileConfigDir.trim();
+		return normalizePath(explicit || (profile === "desktop" ? this.app.vault.configDir : OBSIDIAN_MOBILE_DIR));
+	}
+
+	private createSettingsProfilePolicy(): ProfilePolicy {
+		const base = createProfilePolicy();
+		const included = new Set(this.settings.configProfileIncludedPluginIds.map((id) => id.trim()).filter(Boolean));
+		const excluded = new Set(this.settings.configProfileExcludedPluginIds.map((id) => id.trim()).filter(Boolean));
+		return {
+			isBootstrapPluginId: (pluginId) => base.isBootstrapPluginId(pluginId),
+			isAllowedRootConfigFile: (name) => base.isAllowedRootConfigFile(name),
+			isPathAllowedForProfile: (relativePath, profile) => base.isPathAllowedForProfile(relativePath, profile),
+			isPluginAllowedForProfile: (pluginId, manifest, profile) => {
+				if (excluded.has(pluginId)) return false;
+				if (included.size > 0 && !included.has(pluginId)) return false;
+				return base.isPluginAllowedForProfile(pluginId, manifest, profile);
+			},
+		};
+	}
+
+	private async publishProfileMirrorCurrentSettings(): Promise<void> {
+		const profile = this.settings.configProfileCurrentProfile;
+		const lockTransport = this.createProfileLockTransport();
+		const blobTransport = this.createProfileBlobTransport();
+		const policy = this.createSettingsProfilePolicy();
+		this.profileLazyCloneOccurredDuringPublish = false;
+		const publisher = new ProfilePublisher({
+			profile,
+			policy,
+			transport: {
+				getLock: () => lockTransport.getLock(),
+				putLock: (body) => lockTransport.putLock(body),
+				uploadJsonBlob: (value) => blobTransport.uploadJsonBlob(value),
+				existsBatch: (hashes) => blobTransport.existsBatch(hashes),
+				uploadBlob: (bytes, expectedHash) => blobTransport.uploadBlob(bytes, expectedHash),
+			},
+			trust: {
+				canPublishProfile: this.settings.configProfileCanPublishProfile,
+				canPublishPluginCode: this.settings.configProfileCanPublishPluginCode,
+			},
+			deviceId: this.settings.deviceName || "unknown-device",
+			deviceName: this.settings.deviceName || "Unknown device",
+			now: () => new Date().toISOString(),
+			nextGeneration: (previous) => `${Date.now().toString(36)}-${profile}-${previous ? "r" : "i"}`,
+			getInstantPluginIds: (targetProfile) => this.getInstantProfilePluginIds(targetProfile),
 		});
+
+		const configDir = this.profileConfigDir(profile);
+		const outcome = await publisher.publish(() => this.scanProfileConfigDir(configDir));
+		if (outcome.kind === "no-permission") {
+			new Notice("Profile mirror: this device is not allowed to publish.");
+			return;
+		}
+		if (outcome.kind === "max-rebases-exceeded") {
+			new Notice("Profile mirror: publish conflict. Try again after this device catches up.", 7000);
+			return;
+		}
+		await this.updateSettings((settings) => {
+			settings.configProfileBaseGeneration = outcome.lock.generation;
+			settings.configProfileLastSeenGeneration = outcome.lock.generation;
+			if (this.profileLazyCloneOccurredDuringPublish) {
+				settings.configProfileLazyMobileInitialized = true;
+			}
+		}, "profile-mirror:publish");
+		new Notice(`Profile mirror: published ${profile} profile.`);
+	}
+
+	private async applyProfileMirrorLock(lock: import("./profile/profileLock").ProfileLock): Promise<void> {
+		const profile = this.settings.configProfileCurrentProfile;
+		const blobTransport = this.createProfileBlobTransport();
+		const configDir = this.profileConfigDir(profile);
+		const subscriber = new ProfileSubscriber({
+			profile,
+			transport: {
+				downloadBlob: (hash) => blobTransport.downloadBlob(hash),
+				downloadJsonBlob: (hash) => blobTransport.downloadJsonBlob(hash),
+			},
+			fs: {
+				hashOf: (path) => this.hashConfigFile(configDir, path),
+				writeStaging: (path, bytes) => this.writeConfigFile(`${configDir}/.profile-staging`, path, bytes),
+				writeLive: (path, bytes) => this.writeConfigFile(configDir, path, bytes),
+				listLiveUnder: (prefix) => this.listRelativeFiles(normalizePath(`${configDir}/${prefix}`), configDir),
+				deleteLive: (path) => this.deleteConfigFile(configDir, path),
+			},
+			state: {
+				getLastAppliedGeneration: async () => this.settings.configProfileLastAppliedGeneration || null,
+				setLastAppliedGeneration: async (generation) => {
+					await this.updateSettings((settings) => {
+						settings.configProfileLastAppliedGeneration = generation;
+						settings.configProfileLastSeenGeneration = generation;
+					}, "profile-mirror:apply");
+				},
+				getPendingPluginRestartIds: async () => [...this.pendingProfilePluginRestartIds],
+				setPendingPluginRestartIds: async (ids) => {
+					this.pendingProfilePluginRestartIds = [...ids];
+					this.refreshStatusBar();
+				},
+			},
+			runtime: {
+				isPluginActive: (pluginId) => this.isCommunityPluginActive(pluginId),
+			},
+		});
+		const outcome = await subscriber.applyLock(lock);
+		if (outcome.deferredPluginIds.length > 0) {
+			new Notice(`Profile mirror: ${outcome.deferredPluginIds.length} plugin update(s) will apply after restart.`, 7000);
+		}
+	}
+
+	private async scanProfileConfigDir(configDir: string): Promise<ScannedConfigDir> {
+		const rootConfigFiles: ScannedConfigDir["rootConfigFiles"] = [];
+		for (const name of ALLOWED_ROOT_CONFIG_FILES) {
+			const path = normalizePath(`${configDir}/${name}`);
+			if (!(await this.adapterExists(path))) continue;
+			const bytes = await this.readAdapterBytes(path);
+			rootConfigFiles.push({
+				name,
+				hash: await sha256BytesHex(bytes),
+				size: bytes.byteLength,
+				bytes,
+			});
+		}
+
+		const scanTypedFolder = async (
+			folderName: "snippets" | "themes" | "icons",
+			kind: ScannedFile["kind"],
+		): Promise<ScannedFile[]> => {
+			const folder = normalizePath(`${configDir}/${folderName}`);
+			const files = await this.listRelativeFiles(folder, configDir);
+			const out: ScannedFile[] = [];
+			for (const relativePath of files) {
+				const bytes = await this.readAdapterBytes(normalizePath(`${configDir}/${relativePath}`));
+				out.push({
+					path: relativePath,
+					hash: await sha256BytesHex(bytes),
+					size: bytes.byteLength,
+					kind,
+					bytes,
+				});
+			}
+			return out;
+		};
+
+		const plugins = await this.scanProfilePlugins(configDir);
+		const rawCommunityPluginIds = await this.readJsonFromAdapter<string[]>(normalizePath(`${configDir}/community-plugins.json`)) ?? [];
+
+		return {
+			rootConfigFiles,
+			snippetFiles: await scanTypedFolder("snippets", "snippet"),
+			themeFiles: await scanTypedFolder("themes", "theme"),
+			iconFiles: await scanTypedFolder("icons", "icon"),
+			plugins,
+			rawCommunityPluginIds: Array.isArray(rawCommunityPluginIds)
+				? rawCommunityPluginIds.filter((id): id is string => typeof id === "string")
+				: [],
+		};
+	}
+
+	private async scanProfilePlugins(configDir: string): Promise<ScannedPlugin[]> {
+		const pluginsDir = normalizePath(`${configDir}/plugins`);
+		if (!(await this.adapterExists(pluginsDir))) return [];
+		let folders: string[] = [];
+		try {
+			folders = (await this.app.vault.adapter.list(pluginsDir)).folders;
+		} catch {
+			return [];
+		}
+
+		const plugins: ScannedPlugin[] = [];
+		for (const folder of folders) {
+			const pluginId = folder.split("/").pop();
+			if (!pluginId) continue;
+			const manifestPath = normalizePath(`${folder}/manifest.json`);
+			const manifest = await this.readJsonFromAdapter<PluginManifestLike>(manifestPath);
+			if (!manifest || typeof manifest.id !== "string" || typeof manifest.version !== "string") continue;
+
+			const files = await this.listRelativeFiles(folder, configDir);
+			const codeFiles: ScannedPlugin["codeFiles"] = [];
+			let dataJson: ScannedPlugin["dataJson"] = null;
+			const otherBehaviorFiles: ScannedPlugin["otherBehaviorFiles"] = [];
+
+			for (const relativePath of files) {
+				const bytes = await this.readAdapterBytes(normalizePath(`${configDir}/${relativePath}`));
+				const entry = {
+					path: relativePath,
+					hash: await sha256BytesHex(bytes),
+					size: bytes.byteLength,
+					bytes,
+				};
+				const tail = relativePath.split("/").pop() ?? "";
+				if (tail === "data.json") {
+					const transformed = await this.transformPluginDataJsonForProfile(pluginId, bytes);
+					dataJson = transformed;
+				} else {
+					codeFiles.push(entry);
+				}
+			}
+
+			plugins.push({
+				pluginId,
+				manifest,
+				codeFiles,
+				dataJson,
+				otherBehaviorFiles,
+			});
+		}
+		return plugins;
+	}
+
+	private async transformPluginDataJsonForProfile(
+		pluginId: string,
+		bytes: Uint8Array,
+	): Promise<{ hash: string; size: number; bytes: Uint8Array }> {
+		if (pluginId === "lazy-plugins" && this.settings.configProfileCurrentProfile === "mobile") {
+			try {
+				const data = JSON.parse(new TextDecoder().decode(bytes)) as LazyData;
+				const cloned = applyLazyDesktopToMobileClone({
+					current: data,
+					initialCloneEnabled: this.settings.configProfileInitialCloneDesktopLazyToMobile,
+					alreadyInitialised: this.settings.configProfileLazyMobileInitialized,
+				});
+				if (cloned.didClone) {
+					this.profileLazyCloneOccurredDuringPublish = true;
+					const nextBytes = new TextEncoder().encode(JSON.stringify(cloned.next, null, 2));
+					return {
+						hash: await sha256BytesHex(nextBytes),
+						size: nextBytes.byteLength,
+						bytes: nextBytes,
+					};
+				}
+			} catch {
+				// Fall back to the original data.json; malformed plugin data should not block the whole profile.
+			}
+		}
+
+		if (pluginId === "obsidian42-brat") {
+			try {
+				const data = JSON.parse(new TextDecoder().decode(bytes)) as { betaPlugins?: unknown };
+				const entries = Array.isArray(data.betaPlugins)
+					? data.betaPlugins as BratBetaEntry[]
+					: [];
+				const next = {
+					...data,
+					betaPlugins: filterBratBetaList({
+						entries,
+						profile: this.settings.configProfileCurrentProfile,
+						policy: this.createSettingsProfilePolicy(),
+					}),
+				};
+				const nextBytes = new TextEncoder().encode(JSON.stringify(next, null, 2));
+				return {
+					hash: await sha256BytesHex(nextBytes),
+					size: nextBytes.byteLength,
+					bytes: nextBytes,
+				};
+			} catch {
+				// BRAT remains bootstrap-local; if parsing fails, leave the original bytes alone.
+			}
+		}
+
+		return {
+			hash: await sha256BytesHex(bytes),
+			size: bytes.byteLength,
+			bytes,
+		};
+	}
+
+	private async getInstantProfilePluginIds(profile: Profile): Promise<string[]> {
+		const configDir = this.profileConfigDir(profile);
+		const lazyData = await this.readJsonFromAdapter<LazyData>(normalizePath(`${configDir}/plugins/lazy-plugins/data.json`));
+		return getInstantPluginIdsFromLazy(lazyData, profile);
+	}
+
+	private isCommunityPluginActive(pluginId: string): boolean {
+		const plugins = (this.app as unknown as {
+			plugins?: { enabledPlugins?: Set<string> };
+		}).plugins;
+		return plugins?.enabledPlugins?.has(pluginId) === true;
+	}
+
+	private async hashConfigFile(configDir: string, relativePath: string): Promise<string | null> {
+		const path = normalizePath(`${configDir}/${relativePath}`);
+		if (!(await this.adapterExists(path))) return null;
+		const bytes = await this.readAdapterBytes(path);
+		return sha256BytesHex(bytes);
+	}
+
+	private async writeConfigFile(configDir: string, relativePath: string, bytes: Uint8Array): Promise<void> {
+		const path = normalizePath(configDir ? `${configDir}/${relativePath}` : relativePath);
+		const parent = path.split("/").slice(0, -1).join("/");
+		if (parent) await this.ensureAdapterDir(parent);
+		await this.app.vault.adapter.writeBinary(path, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+	}
+
+	private async deleteConfigFile(configDir: string, relativePath: string): Promise<void> {
+		const path = normalizePath(configDir ? `${configDir}/${relativePath}` : relativePath);
+		if (!(await this.adapterExists(path))) return;
+		await this.app.vault.adapter.remove(path);
+	}
+
+	private async listRelativeFiles(folder: string, baseDir: string): Promise<string[]> {
+		if (!(await this.adapterExists(folder))) return [];
+		const out: string[] = [];
+		const visit = async (dir: string) => {
+			let listed: { files: string[]; folders: string[] };
+			try {
+				listed = await this.app.vault.adapter.list(dir);
+			} catch {
+				return;
+			}
+			for (const file of listed.files) {
+				out.push(this.relativeConfigPath(baseDir, file));
+			}
+			for (const child of listed.folders) {
+				await visit(child);
+			}
+		};
+		await visit(folder);
+		return out.sort();
+	}
+
+	private relativeConfigPath(configDir: string, path: string): string {
+		const normalizedBase = normalizePath(configDir).replace(/\/$/, "");
+		const normalizedPath = normalizePath(path);
+		return normalizedPath.startsWith(`${normalizedBase}/`)
+			? normalizedPath.slice(normalizedBase.length + 1)
+			: normalizedPath;
+	}
+
+	private async readAdapterBytes(path: string): Promise<Uint8Array> {
+		return new Uint8Array(await this.app.vault.adapter.readBinary(normalizePath(path)));
+	}
+
+	private async readJsonFromAdapter<T>(path: string): Promise<T | null> {
+		try {
+			if (!(await this.adapterExists(path))) return null;
+			return JSON.parse(await this.app.vault.adapter.read(normalizePath(path))) as T;
+		} catch {
+			return null;
+		}
+	}
+
+	private async adapterExists(path: string): Promise<boolean> {
+		try {
+			return await this.app.vault.adapter.exists(normalizePath(path));
+		} catch {
+			return false;
+		}
+	}
+
+	private async ensureAdapterDir(path: string): Promise<void> {
+		const normalized = normalizePath(path);
+		if (!normalized) return;
+		const parts = normalized.split("/");
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (await this.adapterExists(current)) continue;
+			try {
+				await this.app.vault.adapter.mkdir(current);
+			} catch {
+				// Directory may have been created by another file operation.
+			}
+		}
+	}
+
+	private isMarkdownPathSyncable(path: string): boolean {
+		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private isBlobPathSyncable(path: string): boolean {
+		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
 	private getRuntimeConfig(): RuntimeConfig {
@@ -242,7 +625,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			triggerDailySnapshot: () => { void this.snapshotService?.triggerDailySnapshot(); },
 			stopSyncRuntimeForCompatibility: () => {
 				if (this.vaultSync) {
-					void this.teardownSync();
+					this.teardownSync();
 				}
 			},
 			setStatusError: () => this.updateStatusBar("error"),
@@ -250,6 +633,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 		});
 		await this.loadSettings();
+		this.setupProfileMirrorService();
+		await this.profileMirrorService?.onSettingsLoaded(this.settings);
 		this.applyRuntimeSettings("load-settings");
 		this.createReconciliationController();
 		this.editorWorkspace = new EditorWorkspaceOrchestrator({
@@ -291,8 +676,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 				untrackedFileCount: this.reconciliationController.getState().untrackedFileCount,
-				blockedDivergenceCount: this.reconciliationController.getState().blockedDivergenceCount,
-				lastBlockedDivergenceAt: this.reconciliationController.getState().lastBlockedDivergenceAt,
 				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			}),
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
@@ -330,7 +713,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 		this.setupTraceRuntime();
-		this.setupFlightTrace();
 		this.attachmentOrchestrator = new AttachmentOrchestrator({
 			app: this.app,
 			getVaultSync: () => this.vaultSync,
@@ -341,8 +723,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getExcludePatterns: () => this.excludePatterns,
 			persistBlobQueue: (snapshot) => this.persistBlobQueueSnapshot(snapshot),
 			clearPersistedBlobQueue: () => this.clearSavedBlobQueue(),
-			getPreservedUnresolvedEntries: () => this.preservedUnresolvedEntries,
-			onPreservedUnresolvedChanged: () => this.persistPreservedUnresolvedState(),
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			refreshStatusBar: () => this.refreshStatusBar(),
@@ -413,7 +793,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			} catch { /* invalid URL, will fail at connect */ }
 		}
 
-		void this.initSync().then(() => this.mountQaDebugApi());
+		void this.initSync();
 		finishOnload("sync-started");
 	}
 
@@ -436,9 +816,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.vaultSync = new VaultSync(this.settings, {
 				traceContext: this.getTraceHttpContext(),
 				trace: (source, msg, details) => this.trace(source, msg, details),
-				onFlightEvent: (event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput),
-				onFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 			});
+			(this.vaultSync.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
+				.on("custom-message", (payload: string) => {
+					void this.profileMirrorService?.onWebSocketMessage(payload, this.settings);
+				});
 
 			// 2. EditorBindingManager
 			this.editorBindings = new EditorBindingManager(
@@ -469,25 +851,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						previousContent,
 						nextContent,
 					),
-				() => this.settings.deviceName,
-				this.preservedUnresolvedEntries,
-				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.startMapObservers();
-			this.diskMirror.setFlightEventHandler((event) => this.recordFlightEvent(event as import("./debug/flightEvents").FlightEventInput));
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
 			this.attachmentOrchestrator?.start("startup", false);
-			this.profilePackageService?.destroy();
-			this.profilePackageService = new ProfilePackageService({
-				app: this.app,
-				getSettings: () => this.settings,
-				updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
-				getVaultSync: () => this.vaultSync,
-				getTraceHttpContext: () => this.getTraceHttpContext(),
-				log: (message) => this.log(message),
-				isSafeToApplyProfile: () => this.isSafeToApplyProfile(),
-			});
 
 			// 5. Status tracking
 			this.connectionController = new ConnectionController({
@@ -519,46 +887,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				registerCleanup: (cleanup) => this.register(cleanup),
 			});
 			this.connectionController.start();
-
-			// Wire provider flight events
-			this.vaultSync.provider.on("status", (event: { status: string }) => {
-				if (event.status === "connected") {
-					this.recordFlightEvent({
-						priority: "important",
-						kind: "provider.connected",
-						severity: "info",
-						scope: "connection",
-						source: "connectionController",
-						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
-						data: { wsStatus: event.status },
-					});
-				} else if (event.status === "disconnected") {
-					this.recordFlightEvent({
-						priority: "important",
-						kind: "provider.disconnected",
-						severity: "info",
-						scope: "connection",
-						source: "connectionController",
-						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
-						data: { wsStatus: event.status },
-					});
-				}
-			});
-			this.vaultSync.provider.on("sync", (synced: boolean) => {
-				if (synced) {
-					this.recordFlightEvent({
-						priority: "important",
-						kind: "provider.sync.complete",
-						severity: "info",
-						scope: "connection",
-						source: "connectionController",
-						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
-					});
-				}
-			});
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
 				if (this.reconciliationController.isReconciled && this.editorBindings) {
@@ -592,28 +920,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getConnectionController: () => this.connectionController,
 					getDiagnosticsService: () => this.diagnosticsService,
 					getSnapshotService: () => this.snapshotService,
-					getFilesNeedingAttentionText: () => this.buildFilesNeedingAttentionText(),
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					isDebugEnabled: () => this.settings.debug,
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					runVfsTortureTest: () => this.runVfsTortureTest(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
-					publishObsidianProfilePackageNow: () => this.publishObsidianProfilePackageNow(),
-					applyLatestObsidianProfilePackage: () => this.applyLatestObsidianProfilePackage(),
-					restorePreviousObsidianProfilePackage: () => this.restorePreviousObsidianProfilePackage(),
+					prepareObsidianMobileFolder: () => this.prepareObsidianMobileFolder(),
+					publishObsidianProfileMirrorNow: () => this.publishObsidianProfileMirrorNow(),
+					applyLatestObsidianProfileMirror: () => this.applyLatestObsidianProfileMirror(),
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
-				startQaFlightTrace: (mode?: string) => this.startQaFlightTrace(mode),
-				stopQaFlightTrace: () => this.stopQaFlightTrace(),
-				exportSafeFlightTrace: () => this.exportSafeFlightTrace(),
-				exportFullFlightTrace: () => this.exportFullFlightTrace(),
-				showTimelineForCurrentFile: () => this.showTimelineForCurrentFile(),
-				clearFlightLogs: () => this.clearFlightLogs(),
-				exportFlightLogsToVault: () => this.exportFlightLogsToVault(),
-				exportEnabledPluginsToVault: () => this.exportEnabledPluginsToVault(),
-				buildLastBootSummaryText: () => this.buildLastBootSummaryText(),
 				});
 				this.commandsRegistered = true;
 			}
@@ -698,8 +1016,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Startup complete");
 			this.scheduleTraceStateSnapshot("startup-complete");
 			this.attachmentOrchestrator?.markStartupReady("startup-complete");
-			this.profilePackageService?.start();
 			void this.traceRuntime?.refreshServerTrace();
+			if (providerSynced) {
+				void this.profileMirrorService?.refreshFromRemote(this.settings);
+			}
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -721,47 +1041,53 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.reconciliationController.importUntrackedFiles();
 	}
 
-	async publishObsidianProfilePackageNow(): Promise<void> {
-		await this.profilePackageService?.publishNow();
-	}
-
-	async applyLatestObsidianProfilePackage(): Promise<void> {
-		await this.profilePackageService?.applyLatestPackage(true);
-	}
-
-	async restorePreviousObsidianProfilePackage(): Promise<void> {
-		await this.profilePackageService?.restorePreviousBackup();
-	}
-
-	getProfilePackageSummary() {
-		return this.profilePackageService?.getSummary() ?? {
-			enabled: this.settings.configProfileSyncEnabled,
-			mode: this.settings.configProfileMode,
-			lastSeenGeneration: this.settings.configProfileLastSeenGeneration,
-			lastAppliedGeneration: this.settings.configProfileLastAppliedGeneration,
-			lastBackupGeneration: this.settings.configProfileLastBackupGeneration,
-			latestGeneration: null,
-			latestCreatedAt: null,
-			latestFileCount: null,
-			latestSize: null,
-			stagedGeneration: this.settings.configProfileLastSeenGeneration || null,
-		};
-	}
-
-	async getConfigProfilePluginCandidates(): Promise<ProfilePackagePluginCandidate[]> {
-		if (this.profilePackageService) {
-			return await this.profilePackageService.getPluginCandidates();
-		}
-		const service = new ProfilePackageService({
-			app: this.app,
-			getSettings: () => this.settings,
-			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
-			getVaultSync: () => this.vaultSync,
-			getTraceHttpContext: () => this.getTraceHttpContext(),
-			log: (message) => this.log(message),
-			isSafeToApplyProfile: () => this.isSafeToApplyProfile(),
+	async prepareObsidianMobileFolder(): Promise<void> {
+		const mobileDir = normalizePath(this.settings.configProfileMobileConfigDir.trim() || OBSIDIAN_MOBILE_DIR);
+		const existingMobileFiles = await this.listRelativeFiles(mobileDir, mobileDir);
+		const yaosDataPresentInsideMobile = await this.adapterExists(normalizePath(`${mobileDir}/plugins/yaos/data.json`));
+		const ops = planMobileFolderPreparation({
+			currentDesktopFiles: [],
+			existingMobileFiles,
+			yaosDataPresentInsideMobile,
 		});
-		return await service.getPluginCandidates();
+
+		for (const op of ops) {
+			if (op.kind === "ensureDir") {
+				await this.ensureAdapterDir(op.path);
+			} else if (op.kind === "writeJson") {
+				const bytes = new TextEncoder().encode(JSON.stringify(op.value, null, 2));
+				await this.writeConfigFile("", op.path, bytes);
+			} else if (op.kind === "instruct-user") {
+				new Notice(op.message, 12000);
+			}
+		}
+		new Notice("Mobile profile folder prepared.");
+	}
+
+	async publishObsidianProfileMirrorNow(): Promise<void> {
+		if (!this.profileMirrorService) {
+			new Notice("Profile mirror is not initialized.");
+			return;
+		}
+		try {
+			await this.profileMirrorService.publishNow(this.settings);
+		} catch (err) {
+			console.error("[yaos] Profile mirror publish failed:", err);
+			new Notice(`Profile mirror publish failed: ${formatUnknown(err)}`, 10000);
+		}
+	}
+
+	async applyLatestObsidianProfileMirror(): Promise<void> {
+		if (!this.profileMirrorService) {
+			new Notice("Profile mirror is not initialized.");
+			return;
+		}
+		try {
+			await this.profileMirrorService.refreshFromRemote(this.settings);
+		} catch (err) {
+			console.error("[yaos] Profile mirror apply failed:", err);
+			new Notice(`Profile mirror apply failed: ${formatUnknown(err)}`, 10000);
+		}
 	}
 
 	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {
@@ -776,10 +1102,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	// -------------------------------------------------------------------
 	// Vault event handlers
 	// -------------------------------------------------------------------
-
-	private newOpId(): string {
-		return `op-${randomBase64Url(10)}`;
-	}
 
 	private registerVaultEvents(): void {
 		// Layout change: clean up observers for closed files
@@ -816,19 +1138,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
-					const opId = this.newOpId();
-					this.recordFlightPathEvent({
-						priority: "important",
-						kind: FLIGHT_KIND.diskModifyObserved,
-						severity: "info",
-						scope: "file",
-						source: "vaultEvents",
-						layer: "disk",
-						opId,
-						path: file.path,
-						data: { size: file.stat?.size ?? null },
-					});
-					this.reconciliationController.markMarkdownDirty(file, "modify", opId);
+					this.reconciliationController.markMarkdownDirty(file, "modify");
 				} else {
 					const blobSync = this.getBlobSync();
 					if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
@@ -862,39 +1172,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
-					const opId = this.newOpId();
 					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
 						this.log(`Suppressed delete event for "${file.path}"`);
-						this.recordFlightPathEvent({
-							priority: "important",
-							kind: FLIGHT_KIND.diskEventSuppressed,
-							severity: "debug",
-							scope: "file",
-							source: "vaultEvents",
-							layer: "policy",
-							opId,
-							path: file.path,
-							reason: "suppressed-remote-writeback",
-							decision: "suppress",
-						});
 						return;
 					}
-					this.recordFlightPathEvent({
-						priority: "critical",
-						kind: FLIGHT_KIND.diskDeleteObserved,
-						severity: "info",
-						scope: "file",
-						source: "vaultEvents",
-						layer: "disk",
-						opId,
-						path: file.path,
-					});
 					this.editorWorkspace?.onMarkdownDeleted(file.path);
 
 					this.vaultSync?.handleDelete(
 						file.path,
 						this.settings.deviceName,
-						opId,
 					);
 					this.log(`Delete: "${file.path}"`);
 					} else {
@@ -913,19 +1199,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
-					const createOpId = this.newOpId();
-					this.recordFlightPathEvent({
-						priority: "important",
-						kind: FLIGHT_KIND.diskCreateObserved,
-						severity: "info",
-						scope: "file",
-						source: "vaultEvents",
-						layer: "disk",
-						opId: createOpId,
-						path: file.path,
-						data: { size: file.stat?.size ?? null },
-					});
-					this.reconciliationController.markMarkdownDirty(file, "create", createOpId);
+					this.reconciliationController.markMarkdownDirty(file, "create");
 				} else if (this.isBlobPathSyncable(file.path)) {
 					const blobSync = this.getBlobSync();
 					if (blobSync && !blobSync.isSuppressed(file.path)) {
@@ -958,14 +1232,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * destroy provider + persistence + ydoc, reset all flags.
 	 * After this, the plugin is in the same state as before initSync().
 	 */
-	private async teardownSync(): Promise<void> {
+	private teardownSync(): void {
 		this.log("teardownSync: tearing down all sync state");
 
 		this.editorBindings?.unbindAll();
 		this.diskMirror?.destroy();
 
 		this.attachmentOrchestrator?.destroy();
-		this.profilePackageService?.destroy();
 
 		if (this.statusInterval) {
 			clearInterval(this.statusInterval);
@@ -974,13 +1247,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.reconciliationController.reset();
 		this.connectionController?.stop();
 
-		await this.vaultSync?.destroy();
+		void this.vaultSync?.destroy();
 
 		this.vaultSync = null;
 		this.connectionController = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
-		this.profilePackageService = null;
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.editorWorkspace?.reset();
 		this.idbDegradedHandled = false;
@@ -1004,7 +1276,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log("Reset cache: starting");
 				new Notice("Clearing cache and syncing again...");
 
-				await this.teardownSync();
+				this.teardownSync();
 
 				try {
 					await VaultSync.deleteIdb(vaultId);
@@ -1048,7 +1320,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				await new Promise((r) => setTimeout(r, 500));
 
 				const vaultId = this.settings.vaultId;
-				await this.teardownSync();
+				this.teardownSync();
 
 				try {
 					await VaultSync.deleteIdb(vaultId);
@@ -1254,7 +1526,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		previousLength: number | null,
 		nextLength: number,
 	): void {
-		this.trace("quarantine", "frontmatter-quarantined", {
+		this.trace("trace", "frontmatter-quarantined", {
 			path,
 			direction,
 			reason,
@@ -1302,7 +1574,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const nextEntries = clearFrontmatterQuarantinePath(this.frontmatterQuarantineEntries, path);
 		if (nextEntries.length === this.frontmatterQuarantineEntries.length) return;
 		this.frontmatterQuarantineEntries = nextEntries;
-		this.trace("quarantine", "frontmatter-quarantine-cleared", {
+		this.trace("trace", "frontmatter-quarantine-cleared", {
 			path,
 			reason,
 		});
@@ -1368,11 +1640,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.statusBarEl) return;
 		const connectionState = this.connectionController?.getState();
 		const transferStatus = this.getBlobSync()?.transferStatus;
-		const diskAttention =
-			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const blobAttention =
-			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const attentionCount = diskAttention + blobAttention;
 		const vaultSync = this.vaultSync;
 		const serverReceipt = vaultSync ? {
 			serverAppliedLocalState: vaultSync.serverAppliedLocalState,
@@ -1382,24 +1649,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
 		} : null;
 		if (connectionState) {
-			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount);
+			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt);
 		} else {
-			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount);
+			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus);
 		}
-	}
-
-	private buildFilesNeedingAttentionText(): string {
-		const entries = this.collectPreservedUnresolvedEntries()
-			.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
-		if (entries.length === 0) return "No files currently need attention.";
-		return entries.map((entry) => [
-			entry.path,
-			`  kind: ${entry.kind}`,
-			`  reason: ${entry.reason}`,
-			`  first seen: ${new Date(entry.firstSeenAt).toLocaleString()}`,
-			`  last seen: ${new Date(entry.lastSeenAt).toLocaleString()}`,
-			"  suggested action: inspect the local file and conflict artifacts, then edit/save to keep local content or delete it to accept the remote delete.",
-		].join("\n")).join("\n\n");
+		if (this.pendingProfilePluginRestartIds.length > 0) {
+			this.statusBarEl.createSpan({
+				text: ` · ${this.pendingProfilePluginRestartIds.length} profile plugin update(s) pending restart`,
+				cls: "yaos-profile-restart-pending",
+			});
+		}
 	}
 
 	private setupTraceRuntime(): void {
@@ -1416,20 +1675,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.traceRuntime.start();
 	}
 
-	private setupFlightTrace(): void {
-		this.flightTrace = new FlightTraceController({
-			app: this.app,
-			getSettings: () => this.settings,
-			getPluginVersion: () => this.manifest.version,
-			getDocSchemaVersion: () => this.vaultSync?.storedSchemaVersion ?? null,
-			buildCheckpoint: () => this.buildFlightCheckpoint(),
-			registerCleanup: (cleanup) => this.register(cleanup),
-			log: (message) => this.log(message),
-		});
-		void this.refreshFlightTraceState("startup");
-		this.startDiagnosticMirrorLoop();
-	}
-
 	private getTraceHttpContext(): TraceHttpContext | undefined {
 		return this.traceRuntime?.httpContext;
 	}
@@ -1440,14 +1685,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		details?: TraceEventDetails,
 	): void {
 		this.traceRuntime?.record(source, msg, details);
-	}
-
-	private recordFlightEvent(event: import("./debug/flightEvents").FlightEventInput): void {
-		this.flightTrace?.record(event);
-	}
-
-	private recordFlightPathEvent(event: import("./debug/flightEvents").FlightPathEventInput): void {
-		void this.flightTrace?.recordPath(event);
 	}
 
 	private scheduleTraceStateSnapshot(reason: string): void {
@@ -1488,30 +1725,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			},
 			serverTrace: recentServerTrace,
 		};
-	}
-
-	private async buildFlightCheckpoint(): Promise<Record<string, unknown>> {
-		const vaultSync = this.vaultSync;
-		const blobSync = this.getBlobSync();
-		return {
-			connected: vaultSync?.connected ?? false,
-			providerSynced: vaultSync?.providerSynced ?? false,
-			serverReceipt: vaultSync?.serverAppliedLocalState ?? null,
-			diskFileCount: this.app.vault.getMarkdownFiles().length,
-			crdtPathCount: vaultSync?.getActiveMarkdownPaths().length ?? 0,
-			missingOnDisk: 0,
-			missingInCrdt: 0,
-			hashMismatches: 0,
-			pendingBlobUploads: blobSync?.pendingUploads ?? 0,
-			pendingBlobDownloads: blobSync?.pendingDownloads ?? 0,
-			reconcileInFlight: this.reconciliationController?.isReconcileInFlight ?? false,
-			safetyBrakeActive: this.reconciliationController?.getState().lastReconcileStats?.safetyBrakeTriggered ?? false,
-		};
-	}
-
-	private async refreshFlightTraceState(reason: string): Promise<void> {
-		if (!this.flightTrace) return;
-		await this.flightTrace.refreshFromSettings(reason);
 	}
 
 	private async collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>> {
@@ -1605,18 +1818,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
-		if (this.diagnosticMirrorTimer) {
-			clearInterval(this.diagnosticMirrorTimer);
-			this.diagnosticMirrorTimer = null;
-		}
-		if (this.diagnosticBootForced) {
-			const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
-			void this.flightTrace?.mirrorToVault(targetDir).catch(() => undefined);
-		}
-		void this.flightTrace?.stop();
 		void this.traceRuntime?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
-		void this.teardownSync();
+		this.teardownSync();
 	}
 
 	async loadSettings() {
@@ -1624,10 +1828,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = persistedState;
 		this.persistedState = persistedState;
 		this.settings = settings;
-		const autoModeApplied = this.applyInitialMobileProfileMode();
-		const mobileSafetyApplied = this.applyMobileProfileSafetyDefaults();
-		this.applyMobileAttachmentKillSwitch();
-		const diagBootApplied = this.applyDiagnosticBootOverrides();
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -1640,225 +1840,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
 			this.savedBlobQueue = data._blobQueue;
 		}
-		if (Array.isArray(data?._preservedUnresolved)) {
-			this.preservedUnresolvedEntries = data._preservedUnresolved.filter(
-				(entry): entry is PreservedUnresolvedEntry =>
-					typeof entry === "object" &&
-					entry !== null &&
-					typeof (entry as PreservedUnresolvedEntry).path === "string" &&
-					((entry as PreservedUnresolvedEntry).kind === "markdown" ||
-						(entry as PreservedUnresolvedEntry).kind === "blob") &&
-					typeof (entry as PreservedUnresolvedEntry).reason === "string" &&
-					typeof (entry as PreservedUnresolvedEntry).firstSeenAt === "number" &&
-					typeof (entry as PreservedUnresolvedEntry).lastSeenAt === "number",
-			);
-		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
 		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated || autoModeApplied || mobileSafetyApplied || diagBootApplied) {
+		if (migrated) {
 			await this.persistPluginState();
 		}
-	}
-
-	private applyInitialMobileProfileMode(): boolean {
-		if (this.settings.configProfileAutoModeInitialized) return false;
-		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
-		this.settings.configProfileSyncEnabled = true;
-		this.settings.configProfileMode = "subscribe";
-		this.settings.configProfileInitialAutoApply = false;
-		this.settings.configProfileManualApplyAfterInitial = true;
-		this.settings.configProfileAutoModeInitialized = true;
-		return true;
-	}
-
-	private applyMobileProfileSafetyDefaults(): boolean {
-		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
-		if (!this.settings.configProfileInitialAutoApply) return false;
-		this.settings.configProfileInitialAutoApply = false;
-		return true;
-	}
-
-	/**
-	 * 1.6.8 mobile attachment kill switch. Mobile crashes correlate with
-	 * `pendingBlobDownloads > 0` post-startup (see 1.6.7 diagnostic logs). While the
-	 * underlying download/orchestrator bug is unfixed, force the attachment engine OFF
-	 * on mobile each boot. The override is in-memory (does not persist) so users on
-	 * desktop never see a regression, and once we fix the root cause we just flip
-	 * `mobileAttachmentKillSwitch` to false.
-	 */
-	private applyMobileAttachmentKillSwitch(): boolean {
-		if (!(Platform.isMobileApp || Platform.isMobile)) return false;
-		if (!this.settings.mobileAttachmentKillSwitch) return false;
-		if (!this.settings.enableAttachmentSync) return false;
-		this.log("Mobile attachment kill switch active — attachment sync forced OFF for this boot.");
-		this.settings.enableAttachmentSync = false;
-		return false; // do not persist; want desktop & re-enable to keep working
-	}
-
-	/**
-	 * 1.6.7 diagnostics: when `_diagBoot3Remaining > 0`, force the flight recorder ON in
-	 * `safe` mode for this boot (without persisting that override) and decrement the
-	 * counter. Result: the next 3 startups on each device leave a trace on disk that gets
-	 * mirrored into the vault for offline retrieval. Returns true when a counter was
-	 * decremented (caller must persist).
-	 */
-	private applyDiagnosticBootOverrides(): boolean {
-		const remaining = typeof this.settings._diagBoot3Remaining === "number" ? this.settings._diagBoot3Remaining : 0;
-		if (remaining <= 0) return false;
-		this.diagnosticBootForced = true;
-		this.settings.qaTraceEnabled = true;
-		if (this.settings.qaTraceMode !== "safe" && this.settings.qaTraceMode !== "qa-safe") {
-			this.settings.qaTraceMode = "safe";
-		}
-		this.settings._diagBoot3Remaining = Math.max(0, remaining - 1);
-		this.log(`Diagnostic boot window active — ${this.settings._diagBoot3Remaining} boot(s) remaining after this one.`);
-		return true;
-	}
-
-	/**
-	 * Safe-state gate for `applyProfilePackage`. Refuses to apply while the sync engine
-	 * is still settling, to avoid touching `.obsidian` mid-reconcile.
-	 */
-	isSafeToApplyProfile(): { safe: true } | { safe: false; reason: string } {
-		if (!this.vaultSync) return { safe: false, reason: "sync not initialized" };
-		if (!this.vaultSync.providerSynced) return { safe: false, reason: "waiting for first server sync" };
-		if (this.awaitingFirstProviderSyncAfterStartup) return { safe: false, reason: "awaiting first provider sync after startup" };
-		if (this.reconciliationController?.isReconcileInFlight) return { safe: false, reason: "reconcile in flight" };
-		const pending = this.getBlobSync()?.pendingUploads ?? 0;
-		if (pending > 0) return { safe: false, reason: `${pending} pending blob upload(s)` };
-		return { safe: true };
-	}
-
-	private startDiagnosticMirrorLoop(): void {
-		if (this.diagnosticMirrorTimer || !this.diagnosticBootForced) return;
-		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
-		const tick = async () => {
-			try {
-				const result = await this.flightTrace?.mirrorToVault(targetDir);
-				if (result && (result.copied > 0 || result.errors > 0)) {
-					this.log(`Diagnostic mirror → ${targetDir}: copied=${result.copied} skipped=${result.skipped} errors=${result.errors}`);
-				}
-			} catch (err) {
-				this.log(`Diagnostic mirror failed: ${err instanceof Error ? err.message : String(err)}`);
-			}
-		};
-		void tick();
-		this.diagnosticMirrorTimer = setInterval(() => { void tick(); }, 15_000);
-	}
-
-	async exportFlightLogsToVault(): Promise<{ copied: number; skipped: number; errors: number; targetDir: string }> {
-		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
-		const result = (await this.flightTrace?.mirrorToVault(targetDir)) ?? { copied: 0, skipped: 0, errors: 0 };
-		return { ...result, targetDir };
-	}
-
-	async exportEnabledPluginsToVault(): Promise<{ path: string; count: number }> {
-		const targetDir = (this.settings.diagnosticsDir || "YAOS-Diagnostics").replace(/^\/+|\/+$/g, "");
-		const adapter = this.app.vault.adapter;
-		const parts = targetDir.split("/").filter(Boolean);
-		let current = "";
-		for (const part of parts) {
-			current = current ? `${current}/${part}` : part;
-			if (!(await adapter.exists(current))) {
-				await adapter.mkdir(current);
-			}
-		}
-		const platform = Platform.isMobileApp ? "mobile" : "desktop";
-		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const path = `${targetDir}/plugins-${platform}-${stamp}.json`;
-		const plugins = (this.app as unknown as {
-			plugins?: {
-				enabledPlugins?: Set<string>;
-				manifests?: Record<string, { id?: string; name?: string; version?: string; isDesktopOnly?: boolean }>;
-			};
-		}).plugins;
-		const enabled = plugins?.enabledPlugins ? Array.from(plugins.enabledPlugins).sort() : [];
-		const manifests = plugins?.manifests ?? {};
-		const installed = Object.keys(manifests).sort();
-		const payload = {
-			generatedAt: new Date().toISOString(),
-			platform,
-			yaosVersion: this.manifest.version,
-			deviceName: this.settings.deviceName,
-			settings: {
-				enableAttachmentSync: this.settings.enableAttachmentSync,
-				mobileAttachmentKillSwitch: this.settings.mobileAttachmentKillSwitch,
-				configProfileSyncEnabled: this.settings.configProfileSyncEnabled,
-				configProfileMode: this.settings.configProfileMode,
-			},
-			enabledCount: enabled.length,
-			installedCount: installed.length,
-			enabledPlugins: enabled.map((id) => ({
-				id,
-				name: manifests[id]?.name ?? id,
-				version: manifests[id]?.version ?? null,
-				isDesktopOnly: manifests[id]?.isDesktopOnly === true,
-			})),
-			installedButDisabled: installed.filter((id) => !enabled.includes(id)),
-		};
-		await adapter.write(path, `${JSON.stringify(payload, null, 2)}\n`);
-		return { path, count: enabled.length };
-	}
-
-	async buildLastBootSummaryText(): Promise<string> {
-		const adapter = this.app.vault.adapter;
-		const root = `${this.app.vault.configDir}/plugins/yaos/flight-logs`;
-		const lines: string[] = [];
-		lines.push(`# YAOS boot summary`);
-		lines.push(`generated: ${new Date().toISOString()}`);
-		lines.push(`plugin: ${this.manifest.version}`);
-		lines.push(`platform: ${Platform.isMobileApp ? "mobile" : "desktop"}`);
-		lines.push(`diag-boots-remaining: ${this.settings._diagBoot3Remaining}`);
-		lines.push(`attachment-sync-enabled: ${this.settings.enableAttachmentSync}`);
-		lines.push(`mobile-attachment-kill-switch: ${this.settings.mobileAttachmentKillSwitch}`);
-		try {
-			const plugins = (this.app as unknown as {
-				plugins?: {
-					enabledPlugins?: Set<string>;
-					manifests?: Record<string, { id?: string; name?: string; version?: string }>;
-				};
-			}).plugins;
-			const enabled = plugins?.enabledPlugins ? Array.from(plugins.enabledPlugins).sort() : [];
-			const manifests = plugins?.manifests ?? {};
-			lines.push(`enabled-plugins (${enabled.length}):`);
-			for (const id of enabled) {
-				const m = manifests[id];
-				lines.push(`  - ${id}${m?.version ? `@${m.version}` : ""}${m?.name && m.name !== id ? ` (${m.name})` : ""}`);
-			}
-		} catch (err) {
-			lines.push(`enabled-plugins: error (${err instanceof Error ? err.message : String(err)})`);
-		}
-		try {
-			const safe = this.isSafeToApplyProfile();
-			lines.push(`safe-to-apply-profile: ${safe.safe ? "yes" : `no (${safe.reason})`}`);
-		} catch (err) {
-			lines.push(`safe-to-apply-profile: error (${err instanceof Error ? err.message : String(err)})`);
-		}
-		try {
-			if (await adapter.exists(root)) {
-				const days = (await adapter.list(root)).folders.sort();
-				const latestDay = days[days.length - 1];
-				if (latestDay) {
-					const files = (await adapter.list(latestDay)).files.sort();
-					const latestFile = files[files.length - 1];
-					if (latestFile) {
-						const content = await adapter.read(latestFile);
-						const tailLines = content.split("\n").filter(Boolean).slice(-50);
-						lines.push(`source: ${latestFile}`);
-						lines.push(`--- last 50 events ---`);
-						lines.push(...tailLines);
-					}
-				}
-			} else {
-				lines.push(`(no flight logs found at ${root})`);
-			}
-		} catch (err) {
-			lines.push(`error reading flight logs: ${err instanceof Error ? err.message : String(err)}`);
-		}
-		return lines.join("\n");
 	}
 
 	async saveSettings(reason = "settings-save") {
@@ -1881,7 +1870,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
 		this.applyCursorVisibility();
-		void this.refreshFlightTraceState(reason);
 		this.trace("trace", "runtime-settings-applied", {
 			reason,
 			hostConfigured: !!this.runtimeConfig.host,
@@ -1901,12 +1889,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.supportsAttachments ?? true;
 	}
 
-	get serverSupportsSnapshots(): boolean {
-		return this.capabilityUpdateService?.supportsSnapshots ?? true;
+	get serverMaxBlobUploadBytes(): number | null {
+		return this.capabilityUpdateService?.maxBlobUploadBytes ?? null;
 	}
 
-	get serverMaxBlobUploadBytes(): number | null {
-		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
+	get serverSupportsSnapshots(): boolean {
+		return this.capabilityUpdateService?.supportsSnapshots ?? true;
 	}
 
 	buildSetupDeepLink(): string | null {
@@ -2077,37 +2065,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} else {
 			delete nextState._frontmatterQuarantine;
 		}
-		const preserved = this.collectPreservedUnresolvedEntries();
-		if (preserved.length > 0) {
-			nextState._preservedUnresolved = preserved;
-		} else {
-			delete nextState._preservedUnresolved;
-		}
 		this.persistedState = nextState;
-	}
-
-	private collectPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {
-		const entries = new Map<string, PreservedUnresolvedEntry>();
-		const hasDiskRegistry = this.diskMirror !== null;
-		const hasBlobRegistry = this.getBlobSync() !== null;
-		for (const entry of this.preservedUnresolvedEntries) {
-			if (entry.kind === "markdown" && hasDiskRegistry) continue;
-			if (entry.kind === "blob" && hasBlobRegistry) continue;
-			entries.set(`${entry.kind}:${entry.path}`, entry);
-		}
-		for (const entry of this.diskMirror?.getPreservedUnresolvedEntries() ?? []) {
-			entries.set(`${entry.kind}:${entry.path}`, entry);
-		}
-		for (const entry of this.getBlobSync()?.getPreservedUnresolvedEntries() ?? []) {
-			entries.set(`${entry.kind}:${entry.path}`, entry);
-		}
-		this.preservedUnresolvedEntries = Array.from(entries.values());
-		return this.preservedUnresolvedEntries;
-	}
-
-	private persistPreservedUnresolvedState(): void {
-		void this.persistPluginState();
-		this.refreshStatusBar();
 	}
 
 	private async persistPluginState(
@@ -2176,171 +2134,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			eventRing: this.eventRing,
 			log: (msg) => this.log(msg),
 		});
-	}
-
-	private async startQaFlightTrace(mode?: string): Promise<void> {
-		const resolved = (mode ?? this.settings.qaTraceMode) as FlightMode;
-		await this.flightTrace?.start(resolved, this.settings.qaTraceSecret || null, {
-			manualStart: true,
-		});
-		new Notice(`QA flight trace started (mode: ${resolved}).`, 4000);
-	}
-
-	private async stopQaFlightTrace(): Promise<void> {
-		await this.flightTrace?.stop();
-		new Notice("QA flight trace stopped.", 4000);
-	}
-
-	private async exportSafeFlightTrace(): Promise<void> {
-		await this.exportFlightTrace("safe");
-	}
-
-	private async exportFullFlightTrace(): Promise<void> {
-		await new Promise<void>((resolve) => {
-			new ConfirmModal(
-				this.app,
-				"Export flight trace with filenames?",
-				"This export includes vault file names. It never includes note contents or sync tokens. Review before sharing.",
-				async () => {
-					try {
-						await this.exportFlightTrace("full");
-					} catch (err) {
-						this.log(`flight trace export failed: ${String(err)}`);
-						new Notice("Flight trace export failed. Check console.", 10000);
-					} finally {
-						resolve();
-					}
-				},
-				"Export with filenames",
-				"Cancel",
-				() => resolve(),
-			).open();
-		});
-	}
-
-	private async exportFlightTrace(requestedPrivacy: "safe" | "full"): Promise<void> {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) {
-			new Notice("QA flight trace is not active. Start it first.", 6000);
-			return;
-		}
-		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
-		if (!diagDir) {
-			new Notice("Diagnostics directory unavailable.", 6000);
-			return;
-		}
-		new Notice("Exporting QA flight trace…");
-		const result = await controller.exportTrace({ requestedPrivacy, diagDir });
-		if (!result.ok) {
-			switch (result.reason) {
-				case "trace-not-active":
-					new Notice("QA flight trace is not active.", 6000);
-					break;
-				case "trace-unsafe-for-safe-export": {
-					const mode = controller.currentRecorder?.mode ?? "unknown";
-					new Notice(
-						`This trace was recorded in "${mode}" mode and includes filenames. ` +
-						`Export with filenames instead, or start a new safe trace.`,
-						10000,
-					);
-					break;
-				}
-				case "trace-not-exportable":
-					new Notice(
-						"Local-private traces cannot be exported. Start a new trace in safe or qa-safe mode.",
-						10000,
-					);
-					break;
-				case "flush-failed":
-					new Notice("Failed to flush trace buffer before export. Check console.", 10000);
-					break;
-				default:
-					new Notice("Flight trace export failed. Check console.", 10000);
-					break;
-			}
-			this.log(`flight trace export failed: ${result.reason}`);
-			return;
-		}
-		const outName = result.path.split("/").pop() ?? result.path;
-		new Notice(`Flight trace exported: ${outName}`, 8000);
-		this.log(`Flight trace exported (${requestedPrivacy}) to: ${result.path}`);
-	}
-
-	private async clearFlightLogs(): Promise<void> {
-		await this.flightTrace?.clearLogs();
-	}
-
-	private showTimelineForCurrentFile(): void {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) {
-			new Notice("QA flight trace is not active.", 5000);
-			return;
-		}
-		const file = this.app.workspace.getActiveFile();
-		if (!file) {
-			new Notice("No active file.", 4000);
-			return;
-		}
-		void controller.getPathId(file.path).then(({ pathId }) => {
-			const recorder = controller.currentRecorder;
-			if (!recorder) {
-				new Notice("Recorder not available.", 4000);
-				return;
-			}
-			const events = recorder.getRecentEventsForPath(pathId, 100);
-			if (events.length === 0) {
-				new Notice(`No flight trace events for this file yet (${pathId}).`, 6000);
-				console.debug(`[yaos] No flight events for pathId=${pathId} (${file.path})`);
-				return;
-			}
-			const lines = events.map((e) => `${new Date(e.ts).toISOString()} [${e.severity}] ${e.kind}${e.reason ? ` reason=${e.reason}` : ""}${e.decision ? ` decision=${e.decision}` : ""}`);
-			const summary = lines.join("\n");
-			new Notice(`Timeline for ${file.path} (${events.length} events) printed to console.`, 6000);
-			console.debug(`[yaos] Flight timeline for ${file.path} (pathId=${pathId}):\n${summary}`);
-		});
-	}
-
-	// -------------------------------------------------------------------
-	// QA debug API surface
-	// -------------------------------------------------------------------
-
-	private mountQaDebugApi(): void {
-		if (!this.settings.qaDebugMode) return;
-		const api = buildQaDebugApi({
-			app: this.app,
-			getVaultSync: () => this.vaultSync,
-			getReconciliationController: () => this.reconciliationController,
-			getConnectionController: () => this.connectionController,
-			getFlightTraceController: () => this.flightTrace,
-			getDiagnosticsDir: () => this.diagnosticsService?.ensureDiagnosticsDir(),
-			sha256Hex: (text) => this.sha256Hex(text),
-			startQaFlightTrace: (mode) => this.startQaFlightTrace(mode),
-			stopQaFlightTrace: () => this.stopQaFlightTrace(),
-			exportFlightTrace: (privacy) => this.exportFlightTraceForApi(privacy),
-			runReconciliation: () => this.runReconciliation(this.vaultSync?.getSafeReconcileMode() ?? "conservative"),
-			disconnectProvider: (reason) => {
-				this.log(`QA: disconnectProvider(${reason ?? ""})`);
-				this.vaultSync?.provider.disconnect();
-			},
-			connectProvider: (reason) => {
-				this.log(`QA: connectProvider(${reason ?? ""})`);
-				void this.vaultSync?.provider.connect().catch((e) =>
-					this.log(`QA connectProvider error: ${String(e)}`),
-				);
-			},
-		});
-		(window as unknown as Record<string, unknown>).__YAOS_DEBUG__ = api;
-		this.log("QA debug API mounted at window.__YAOS_DEBUG__");
-		new Notice("YAOS: QA debug mode active. window.__YAOS_DEBUG__ is available.", 6000);
-	}
-
-	private async exportFlightTraceForApi(privacy: "safe" | "full"): Promise<string | null> {
-		const controller = this.flightTrace;
-		if (!controller?.isEnabled) return null;
-		const diagDir = await this.diagnosticsService?.ensureDiagnosticsDir();
-		if (!diagDir) return null;
-		const result = await controller.exportTrace({ requestedPrivacy: privacy, diagDir });
-		return result.ok ? result.path : null;
 	}
 
 	private log(msg: string): void {

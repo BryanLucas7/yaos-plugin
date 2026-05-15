@@ -34,7 +34,6 @@ export function getLabelFromConnectionState(
 	state: ConnectionState,
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
-	attentionCount = 0,
 ): string {
 	let base: string;
 	switch (state.kind) {
@@ -75,9 +74,6 @@ export function getLabelFromConnectionState(
 	const receipt = serverReceipt && shouldShowReceiptStatus(state)
 		? getServerReceiptStatusLabel(serverReceipt, state.kind === "online")
 		: null;
-	if (attentionCount > 0) {
-		base = `${base} · ${attentionCount} file${attentionCount === 1 ? "" : "s"} need attention`;
-	}
 	return receipt ? `${base} · ${receipt}` : base;
 }
 
@@ -119,14 +115,10 @@ export function renderSyncStatus(
 	statusBarEl: HTMLElement,
 	state: SyncStatus,
 	transferStatus?: string | null,
-	attentionCount = 0,
 ): void {
 	let text = getSyncStatusLabel(state);
 	if (transferStatus) {
 		text += ` (${transferStatus})`;
-	}
-	if (attentionCount > 0) {
-		text += ` · ${attentionCount} file${attentionCount === 1 ? "" : "s"} need attention`;
 	}
 	statusBarEl.setText(text);
 }
@@ -140,9 +132,8 @@ export function renderConnectionState(
 	state: ConnectionState,
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
-	attentionCount = 0,
 ): void {
-	statusBarEl.setText(getLabelFromConnectionState(state, transferStatus, serverReceipt, attentionCount));
+	statusBarEl.setText(getLabelFromConnectionState(state, transferStatus, serverReceipt));
 	const title = serverReceipt && shouldShowReceiptStatus(state)
 		? "Server receipt means the server Y.Doc received this device's latest local CRDT state. It is not durable and does not mean other devices have applied it."
 		: "";

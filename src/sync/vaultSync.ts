@@ -3,7 +3,6 @@ import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
 import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
-import type { ProfilePackageRef } from "../profile/profilePackage";
 import { ORIGIN_SEED } from "./origins";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../debug/trace";
@@ -18,8 +17,6 @@ import {
 	type SvEchoCounters,
 } from "./svEchoMessage";
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
-import { FLIGHT_KIND } from "../debug/flightEvents";
-import type { FlightPathEventInput } from "../debug/flightEvents";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export const SCHEMA_VERSION = 2;
@@ -117,7 +114,6 @@ type ServerReceiptStartupValidation =
  *   pathToBlob:      Y.Map<BlobRef>        — vault-relative path -> { hash, size }
  *   blobMeta:        Y.Map<BlobMeta>       — sha256 hex -> { size, mime, createdAt }
  *   blobTombstones:  Y.Map<BlobTombstone>  — vault-relative path -> { deletedAt, device? }
- *   profilePackages: Y.Map<ProfilePackageRef> — package preset -> latest profile package metadata
  */
 export class VaultSync {
 	readonly ydoc: Y.Doc;
@@ -135,7 +131,6 @@ export class VaultSync {
 	readonly pathToBlob: Y.Map<BlobRef>;
 	readonly blobMeta: Y.Map<BlobMeta>;
 	readonly blobTombstones: Y.Map<BlobTombstone>;
-	readonly profilePackages: Y.Map<ProfilePackageRef>;
 
 	/**
 	 * In-memory reverse map: Y.Text instance -> fileId.
@@ -190,23 +185,17 @@ export class VaultSync {
 	private readonly debug: boolean;
 	private _eventRing: Array<{ ts: string; msg: string }> = [];
 	private readonly trace?: TraceRecord;
-	private readonly onFlightEvent?: (event: Record<string, unknown>) => void;
-	private readonly onFlightPathEvent?: (event: FlightPathEventInput) => void;
 
 	constructor(
 		settings: VaultSyncSettings,
 		options?: {
 			traceContext?: TraceHttpContext;
 			trace?: TraceRecord;
-			onFlightEvent?: (event: Record<string, unknown>) => void;
-			onFlightPathEvent?: (event: FlightPathEventInput) => void;
 		},
 	) {
 		this.debug = settings.debug;
 		this._device = settings.deviceName || undefined;
 		this.trace = options?.trace;
-		this.onFlightEvent = options?.onFlightEvent;
-		this.onFlightPathEvent = options?.onFlightPathEvent;
 
 		this.ydoc = new Y.Doc();
 		this.pathToId = this.ydoc.getMap<string>("pathToId");
@@ -217,7 +206,6 @@ export class VaultSync {
 		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
 		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
-		this.profilePackages = this.ydoc.getMap<ProfilePackageRef>("profilePackages");
 		this.meta.observe(() => {
 			this._pathIndexesDirty = true;
 		});
@@ -280,7 +268,7 @@ export class VaultSync {
 			this.provider,
 			this.persistence,
 		);
-		this.serverAckTracker = new ServerAckTracker(this.trace, this.onFlightEvent);
+		this.serverAckTracker = new ServerAckTracker(this.trace);
 
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
@@ -927,15 +915,12 @@ export class VaultSync {
 			}
 		}
 
-		const tombstonedPaths: string[] = [];
-
 		// Disk files not in CRDT
 		for (const path of diskPresentPaths) {
 			if (crdtPaths.has(path)) continue;
 
 			if (this._deletedPathIndex.has(path)) {
 				this.log(`reconcile: "${path}" was tombstoned, skipping`);
-				tombstonedPaths.push(path);
 				skipped++;
 				continue;
 			}
@@ -968,7 +953,7 @@ export class VaultSync {
 			`${skipped} tombstoned`,
 		);
 
-		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, tombstonedPaths, skipped };
+		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, skipped };
 	}
 
 	// -------------------------------------------------------------------
@@ -983,12 +968,11 @@ export class VaultSync {
 		path: string,
 		currentContent: string,
 		device?: string,
-		options?: { reviveTombstone?: boolean; reviveReason?: string; opId?: string },
+		options?: { reviveTombstone?: boolean; reviveReason?: string },
 	): Y.Text | null {
 		path = this.normPath(path);
 		const reviveTombstone = options?.reviveTombstone === true;
 		const reviveReason = options?.reviveReason ?? "unknown";
-		const opId = options?.opId;
 
 		const existingId = this.getFileId(path);
 		if (!existingId) {
@@ -1029,27 +1013,16 @@ export class VaultSync {
 						this.meta.delete(tombstoneId);
 					}
 				}, ORIGIN_SEED);
-			this._pathIndexesDirty = true;
-			this.trace?.("sync", "ensureFile-tombstone-revived", {
-				path,
-				tombstoneIds,
-				device: device ?? null,
-				reason: reviveReason,
-			});
-			this.onFlightPathEvent?.({
-				priority: "critical",
-				kind: FLIGHT_KIND.crdtFileRevived,
-				severity: "info",
-				scope: "file",
-				source: "vaultSync",
-				layer: "crdt",
-				path,
-				opId,
-				data: { reason: reviveReason },
-			});
-			this.log(
-				`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
-			);
+				this._pathIndexesDirty = true;
+				this.trace?.("sync", "ensureFile-tombstone-revived", {
+					path,
+					tombstoneIds,
+					device: device ?? null,
+					reason: reviveReason,
+				});
+				this.log(
+					`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
+				);
 			} else {
 				this.trace?.("sync", "ensureFile-tombstone-blocked", {
 					path,
@@ -1076,17 +1049,6 @@ export class VaultSync {
 		this._pathIndexesDirty = true;
 		this.log(`ensureFile: created "${path}" (id=${fileId})`);
 		this._textToFileId.set(ytext, fileId);
-		this.onFlightPathEvent?.({
-			priority: "important",
-			kind: FLIGHT_KIND.crdtFileCreated,
-			severity: "info",
-			scope: "file",
-			source: "vaultSync",
-			layer: "crdt",
-			path,
-			fileId,
-			opId,
-		});
 		return ytext;
 	}
 
@@ -1397,7 +1359,7 @@ export class VaultSync {
 		return tombstonedIds;
 	}
 
-	handleDelete(path: string, device?: string, opId?: string): void {
+	handleDelete(path: string, device?: string): void {
 		path = this.normPath(path);
 
 		// Check pending rename batch for races:
@@ -1457,17 +1419,6 @@ export class VaultSync {
 			fileId,
 			device: device ?? null,
 		});
-		this.onFlightPathEvent?.({
-			priority: "critical",
-			kind: FLIGHT_KIND.crdtFileTombstoned,
-			severity: "info",
-			scope: "file",
-			source: "vaultSync",
-			layer: "crdt",
-			path: resolvedPath,
-			fileId,
-			opId,
-		});
 
 		this.log(`handleDelete: "${resolvedPath}" marked deleted (id=${fileId})`);
 	}
@@ -1499,8 +1450,6 @@ export class VaultSync {
 	get serverAppliedLocalState(): boolean | null { return this.serverAckTracker.serverAppliedLocalState; }
 	get lastServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastServerReceiptEchoAt; }
 	get lastKnownServerReceiptEchoAt(): number | null { return this.serverAckTracker.lastKnownServerReceiptEchoAt; }
-	get serverReceiptCandidateId(): string | null { return this.serverAckTracker.lastCandidateId; }
-	get lastConfirmedReceiptCandidateId(): string | null { return this.serverAckTracker.lastConfirmedCandidateId; }
 	get candidatePersistenceHealthy(): boolean | null {
 		if (!this._serverAckScope && !this._serverAckPersistenceUnavailable) return null;
 		if (this._serverAckPersistenceUnavailable) return false;
@@ -1683,7 +1632,6 @@ export class VaultSync {
 		tombstonedPathCount: number;
 		storedSchemaVersion: number | null;
 		blobPathCount: number;
-		profilePackageCount: number;
 		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
 		serverReceiptStartupValidation: ServerReceiptStartupValidation;
 		svEcho: SvEchoCounters;
@@ -1702,7 +1650,6 @@ export class VaultSync {
 			tombstonedPathCount: this._deletedPathIndex.size,
 			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
-			profilePackageCount: this.profilePackages.size,
 			serverReceipt: {
 				...this.serverAckTracker.getState(),
 				persistenceUnavailable: this._serverAckPersistenceUnavailable,
@@ -1795,7 +1742,5 @@ export interface ReconcileResult {
 	updatedOnDisk: string[];
 	seededToCrdt: string[];
 	untracked: string[];
-	/** Disk paths that were tombstoned in CRDT and skipped. */
-	tombstonedPaths: string[];
 	skipped: number;
 }

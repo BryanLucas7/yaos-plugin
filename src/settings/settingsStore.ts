@@ -1,9 +1,4 @@
 import { randomBase64Url } from "../utils/base64url";
-import type { ConfigProfileAllowlistPreset, ConfigProfileMode } from "../sync/profileSyncPolicy";
-import {
-	DEFAULT_MOBILE_PROFILE_PLUGIN_IDS,
-	normalizeProfilePluginIds,
-} from "../profile/profilePackage";
 
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
@@ -54,57 +49,44 @@ export interface VaultSyncSettings {
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
-	/** Enable explicit allowlisted Obsidian configuration profile sync. */
-	configProfileSyncEnabled: boolean;
-	/** Publish profile files from this device, subscribe to them, or keep the original YAOS behavior. */
-	configProfileMode: ConfigProfileMode;
-	/** Active allowlist preset for profile sync. */
-	configProfileAllowlistPreset: ConfigProfileAllowlistPreset;
-	/** Mobile plugin directories included in the profile package when this device publishes. */
-	configProfileMobilePluginIds: string[];
-	/** True after YAOS has made its one-time platform-specific profile mode choice. */
-	configProfileAutoModeInitialized: boolean;
-	/** Automatically apply the first staged PC profile package on a new subscriber. Disabled by default for mobile safety. */
-	configProfileInitialAutoApply: boolean;
-	/** Require a command/button after the first profile package has been applied. */
-	configProfileManualApplyAfterInitial: boolean;
-	/** Latest profile package generation seen by this device. */
-	configProfileLastSeenGeneration: string;
-	/** Latest profile package generation applied to this device. */
-	configProfileLastAppliedGeneration: string;
-	/** Latest local backup generation created before applying a profile package. */
-	configProfileLastBackupGeneration: string;
-	/** Enable QA flight recorder tracing. */
-	qaTraceEnabled: boolean;
-	/** QA trace mode: safe/qa-safe/full/local-private. */
-	qaTraceMode: "safe" | "qa-safe" | "full" | "local-private";
-	/** Optional shared secret for QA-safe multi-device trace. */
-	qaTraceSecret?: string;
 	/** Optional repo URL used to deep-link provider-native update pages. */
 	updateRepoUrl: string;
 	/** Optional default branch for provider-native update links. */
 	updateRepoBranch: string;
-	/** Expose window.__YAOS_DEBUG__ programmatic control surface for QA. Never ship enabled. */
-	qaDebugMode: boolean;
-	/**
-	 * Internal: number of remaining boots in which the flight recorder must be forced ON
-	 * (regardless of `qaTraceEnabled`) and logs mirrored to the vault. Decrements each boot
-	 * until 0. Seeded on first 1.6.7 boot to 3 to capture the mobile crash window.
-	 */
-	_diagBoot3Remaining: number;
-	/**
-	 * Internal: vault-relative folder where flight logs are mirrored so they can ride along
-	 * with normal note sync (the canonical `.obsidian/plugins/yaos/flight-logs` path is not
-	 * synced on mobile).
-	 */
-	diagnosticsDir: string;
-	/**
-	 * Mobile attachment kill switch (1.6.8). When true, attachment sync is forced OFF on
-	 * mobile each boot regardless of `enableAttachmentSync`. Flight logs from 1.6.7 showed
-	 * mobile crashing while `pendingBlobDownloads > 0`, so we disable the engine until
-	 * the root cause is fixed. Set to false manually in `data.json` to override.
-	 */
-	mobileAttachmentKillSwitch: boolean;
+
+	// ── Profile Mirror (Etapa 10) ────────────────────────────────────────
+	/** Master switch for the profile-mirror channel. */
+	configProfileSyncEnabled: boolean;
+	/** Per-device role. */
+	configProfileMode: "off" | "publish" | "subscribe";
+	/** Whether this device may publish anything at all. */
+	configProfileTrustedPublisher: boolean;
+	/** May publish profile manifests (configs, themes, snippets, behavior). */
+	configProfileCanPublishProfile: boolean;
+	/** May publish PluginCodeManifest + pluginLocks updates. */
+	configProfileCanPublishPluginCode: boolean;
+	/** Which profile this device represents. */
+	configProfileCurrentProfile: "desktop" | "mobile";
+	/** Optional explicit desktop configDir override (defaults to .obsidian). */
+	configProfileDesktopConfigDir: string;
+	/** Optional explicit mobile configDir override (defaults to .obsidian-mobile). */
+	configProfileMobileConfigDir: string;
+	/** True after the first-mobile auto-mode has been applied (subscribe). */
+	configProfileAutoModeInitialized: boolean;
+	/** Last lock generation observed via WS / GET. */
+	configProfileLastSeenGeneration: string;
+	/** Last lock generation fully applied to the configDir. */
+	configProfileLastAppliedGeneration: string;
+	/** Generation the publisher believes the remote is on (for CAS). */
+	configProfileBaseGeneration: string;
+	/** Optional explicit allowlist of plugin ids the user has chosen. */
+	configProfileIncludedPluginIds: string[];
+	/** Optional explicit denylist of plugin ids the user has chosen. */
+	configProfileExcludedPluginIds: string[];
+	/** First-pass clone desktop Lazy section into mobile. */
+	configProfileInitialCloneDesktopLazyToMobile: boolean;
+	/** True once the desktop->mobile Lazy clone has happened. */
+	configProfileLazyMobileInitialized: boolean;
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
@@ -123,25 +105,25 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
 	showRemoteCursors: true,
-	configProfileSyncEnabled: false,
-	configProfileMode: "off",
-	configProfileAllowlistPreset: "mobile",
-	configProfileMobilePluginIds: [...DEFAULT_MOBILE_PROFILE_PLUGIN_IDS],
-	configProfileAutoModeInitialized: false,
-	configProfileInitialAutoApply: false,
-	configProfileManualApplyAfterInitial: true,
-	configProfileLastSeenGeneration: "",
-	configProfileLastAppliedGeneration: "",
-	configProfileLastBackupGeneration: "",
-	qaTraceEnabled: false,
-	qaTraceMode: "safe",
-	qaTraceSecret: "",
 	updateRepoUrl: "",
 	updateRepoBranch: "main",
-	qaDebugMode: false,
-	_diagBoot3Remaining: 3,
-	diagnosticsDir: "YAOS-Diagnostics",
-	mobileAttachmentKillSwitch: true,
+
+	configProfileSyncEnabled: false,
+	configProfileMode: "off",
+	configProfileTrustedPublisher: false,
+	configProfileCanPublishProfile: false,
+	configProfileCanPublishPluginCode: false,
+	configProfileCurrentProfile: "desktop",
+	configProfileDesktopConfigDir: "",
+	configProfileMobileConfigDir: ".obsidian-mobile",
+	configProfileAutoModeInitialized: false,
+	configProfileLastSeenGeneration: "",
+	configProfileLastAppliedGeneration: "",
+	configProfileBaseGeneration: "",
+	configProfileIncludedPluginIds: [],
+	configProfileExcludedPluginIds: [],
+	configProfileInitialCloneDesktopLazyToMobile: true,
+	configProfileLazyMobileInitialized: false,
 };
 
 export interface SettingsPersistence {
@@ -194,79 +176,6 @@ export function readVaultSyncSettings(
 			attachmentSizeCapKB(),
 			Math.max(1, Math.floor(Number(settings.maxAttachmentSizeKB) || DEFAULT_SETTINGS.maxAttachmentSizeKB)),
 		);
-		migrated = true;
-	}
-	if (settings.configProfileMode !== "publish" && settings.configProfileMode !== "subscribe" && settings.configProfileMode !== "off") {
-		settings.configProfileMode = DEFAULT_SETTINGS.configProfileMode;
-		migrated = true;
-	}
-	if (settings.configProfileAllowlistPreset !== "mobile") {
-		settings.configProfileAllowlistPreset = DEFAULT_SETTINGS.configProfileAllowlistPreset;
-		migrated = true;
-	}
-	if (typeof settings.configProfileSyncEnabled !== "boolean") {
-		settings.configProfileSyncEnabled = DEFAULT_SETTINGS.configProfileSyncEnabled;
-		migrated = true;
-	}
-	const normalizedMobilePluginIds = normalizeProfilePluginIds(
-		Array.isArray(settings.configProfileMobilePluginIds)
-			? settings.configProfileMobilePluginIds.filter((value): value is string => typeof value === "string")
-			: undefined,
-	);
-	if (
-		!Array.isArray(settings.configProfileMobilePluginIds) ||
-		normalizedMobilePluginIds.length !== settings.configProfileMobilePluginIds.length ||
-		normalizedMobilePluginIds.some((pluginId, index) => pluginId !== settings.configProfileMobilePluginIds[index])
-	) {
-		settings.configProfileMobilePluginIds = normalizedMobilePluginIds;
-		migrated = true;
-	}
-	if (typeof settings.configProfileAutoModeInitialized !== "boolean") {
-		settings.configProfileAutoModeInitialized = DEFAULT_SETTINGS.configProfileAutoModeInitialized;
-		migrated = true;
-	}
-	if (typeof settings.configProfileInitialAutoApply !== "boolean") {
-		settings.configProfileInitialAutoApply = DEFAULT_SETTINGS.configProfileInitialAutoApply;
-		migrated = true;
-	}
-	if (typeof settings.configProfileManualApplyAfterInitial !== "boolean") {
-		settings.configProfileManualApplyAfterInitial = DEFAULT_SETTINGS.configProfileManualApplyAfterInitial;
-		migrated = true;
-	}
-	if (typeof settings.configProfileLastSeenGeneration !== "string") {
-		settings.configProfileLastSeenGeneration = DEFAULT_SETTINGS.configProfileLastSeenGeneration;
-		migrated = true;
-	}
-	if (typeof settings.configProfileLastAppliedGeneration !== "string") {
-		settings.configProfileLastAppliedGeneration = DEFAULT_SETTINGS.configProfileLastAppliedGeneration;
-		migrated = true;
-	}
-	if (typeof settings.configProfileLastBackupGeneration !== "string") {
-		settings.configProfileLastBackupGeneration = DEFAULT_SETTINGS.configProfileLastBackupGeneration;
-		migrated = true;
-	}
-	// 1.6.7 diagnostics: seed forced 3-boot recorder window for users upgrading from <=1.6.6.
-	if (
-		typeof settings._diagBoot3Remaining !== "number" ||
-		!Number.isFinite(settings._diagBoot3Remaining) ||
-		settings._diagBoot3Remaining < 0
-	) {
-		settings._diagBoot3Remaining = DEFAULT_SETTINGS._diagBoot3Remaining;
-		migrated = true;
-	}
-	if (typeof settings.diagnosticsDir !== "string" || settings.diagnosticsDir.trim() === "") {
-		settings.diagnosticsDir = DEFAULT_SETTINGS.diagnosticsDir;
-		migrated = true;
-	}
-	// 1.6.8: seed mobile attachment kill switch (default true) for users upgrading.
-	if (typeof settings.mobileAttachmentKillSwitch !== "boolean") {
-		settings.mobileAttachmentKillSwitch = DEFAULT_SETTINGS.mobileAttachmentKillSwitch;
-		migrated = true;
-	}
-	// 1.6.8: while the mobile crash is unresolved, re-arm the 3-boot window once it
-	// reaches 0 so we keep capturing logs across cycles.
-	if (settings._diagBoot3Remaining === 0) {
-		settings._diagBoot3Remaining = 3;
 		migrated = true;
 	}
 	return { settings, migrated };

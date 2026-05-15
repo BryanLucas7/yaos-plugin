@@ -2,8 +2,7 @@
  * Shared type definitions for the vault CRDT sync plugin.
  */
 
-import { isExcludedForDirection } from "./sync/exclude";
-import type { ConfigProfileSyncPolicy } from "./sync/profileSyncPolicy";
+import { isExcluded } from "./sync/exclude";
 
 // -------------------------------------------------------------------
 // Markdown CRDT types
@@ -84,14 +83,9 @@ export { ORIGIN_SEED } from "./sync/origins";
  * Check if a vault-relative path is a markdown file eligible for CRDT sync.
  * Single choke point for all ".md" checks in the codebase.
  */
-export function isMarkdownSyncable(
-	path: string,
-	excludePatterns: string[],
-	configDir: string,
-	configProfilePolicy?: ConfigProfileSyncPolicy,
-): boolean {
+export function isMarkdownSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
 	if (!path.endsWith(".md")) return false;
-	return !isExcludedForDirection(path, excludePatterns, configDir, configProfilePolicy);
+	return !isExcluded(path, excludePatterns, configDir);
 }
 
 /**
@@ -99,12 +93,7 @@ export function isMarkdownSyncable(
  * blob/attachment sync. Excludes the config directory, .trash/, user patterns,
  * and markdown files (handled by the CRDT text pipeline).
  */
-export function isBlobSyncable(
-	path: string,
-	excludePatterns: string[],
-	configDir: string,
-	configProfilePolicy?: ConfigProfileSyncPolicy,
-): boolean {
+export function isBlobSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
 	if (path.endsWith(".md")) return false;
-	return !isExcludedForDirection(path, excludePatterns, configDir, configProfilePolicy);
+	return !isExcluded(path, excludePatterns, configDir);
 }
