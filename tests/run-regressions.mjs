@@ -71,6 +71,7 @@ const suites = [
 	[JITI, "tests/server-ack-tracker.ts"],
 	[JITI, "tests/indexed-db-candidate-store.ts"],
 	[JITI, "tests/profile-policy.ts"],
+	[JITI, "tests/profile-lock-cas.ts"],
 ];
 
 let totalPassed = 0;

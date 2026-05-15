@@ -24,6 +24,12 @@ import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
+import {
+	isProfileLockDTO,
+	ProfileLockStore,
+	PROFILE_WS_LOCK_UPDATED,
+	type ProfileLockDTO,
+} from "./profileLockStore";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -99,6 +105,7 @@ export class VaultSyncServer extends YServer {
 	private roomIdHint: string | null = null;
 	private chunkedDocStore: ChunkedDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
+	private profileLockStoreInstance: ProfileLockStore | null = null;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
 	private readonly traceRateLimiter = new TraceRateLimiter();
@@ -230,6 +237,37 @@ export class VaultSyncServer extends YServer {
 				body = {};
 			}
 			return json(await this.createDailySnapshotMaybe(body.device));
+		}
+
+		if (url.pathname === "/__yaos/profile-lock") {
+			if (request.method === "GET") {
+				const lock = await this.getProfileLockStore().read();
+				return json({ lock });
+			}
+			if (request.method === "PUT") {
+				let body: { baseGeneration?: unknown; nextLock?: unknown };
+				try {
+					body = await request.json();
+				} catch {
+					return json({ error: "invalid json" }, 400);
+				}
+				if (typeof body.baseGeneration !== "string") {
+					return json({ error: "missing baseGeneration" }, 400);
+				}
+				if (!isProfileLockDTO(body.nextLock)) {
+					return json({ error: "invalid nextLock" }, 400);
+				}
+				const result = await this.getProfileLockStore().cas(
+					body.baseGeneration,
+					body.nextLock,
+				);
+				if (result.kind === "accepted") {
+					this.broadcastProfileLockUpdated(result.lock);
+					return json({ kind: "accepted", lock: result.lock });
+				}
+				return json({ kind: "stale-base", current: result.current }, 409);
+			}
+			return json({ error: "method not allowed" }, 405);
 		}
 
 		await this.ensureDocumentLoaded();
@@ -428,6 +466,21 @@ export class VaultSyncServer extends YServer {
 			this.chunkedDocStore = new ChunkedDocStore(this.ctx.storage);
 		}
 		return this.chunkedDocStore;
+	}
+
+	private getProfileLockStore(): ProfileLockStore {
+		if (!this.profileLockStoreInstance) {
+			this.profileLockStoreInstance = new ProfileLockStore(this.ctx.storage);
+		}
+		return this.profileLockStoreInstance;
+	}
+
+	private broadcastProfileLockUpdated(lock: ProfileLockDTO): void {
+		try {
+			this.broadcast(`${PROFILE_WS_LOCK_UPDATED}:${JSON.stringify(lock)}`);
+		} catch (err) {
+			console.warn(`${LOG_PREFIX} profile lock broadcast failed:`, err);
+		}
 	}
 
 	private getPersistenceCoordinator(): PersistenceCoordinator {
