@@ -119,7 +119,7 @@ export class ProfileSubscriber {
 
 		const phases: Record<ProfileApplyPhase, ProfileManifestFile[]> = {
 			"safe-now": [],
-			"plugin-code": [],
+			"next-startup": [],
 			"activation-last": [],
 		};
 		for (const f of profileFiles) phases[f.applyPhase].push(f);
