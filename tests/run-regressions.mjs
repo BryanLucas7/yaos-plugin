@@ -70,6 +70,7 @@ const suites = [
 	[JITI, "tests/sv-echo-client-receiver.ts"],
 	[JITI, "tests/server-ack-tracker.ts"],
 	[JITI, "tests/indexed-db-candidate-store.ts"],
+	[JITI, "tests/profile-policy.ts"],
 ];
 
 let totalPassed = 0;
