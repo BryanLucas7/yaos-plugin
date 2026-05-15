@@ -77,6 +77,7 @@ const suites = [
 	[JITI, "tests/profile-subscriber.ts"],
 	[JITI, "tests/profile-lazy.ts"],
 	[JITI, "tests/profile-brat.ts"],
+	[JITI, "tests/profile-obsidian-mobile.ts"],
 ];
 
 let totalPassed = 0;
