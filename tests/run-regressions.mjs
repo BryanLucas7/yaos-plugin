@@ -73,6 +73,7 @@ const suites = [
 	[JITI, "tests/profile-policy.ts"],
 	[JITI, "tests/profile-lock-cas.ts"],
 	[JITI, "tests/profile-transport-gc.ts"],
+	[JITI, "tests/profile-publisher.ts"],
 ];
 
 let totalPassed = 0;
