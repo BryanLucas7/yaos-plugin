@@ -1408,6 +1408,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.supportsAttachments ?? true;
 	}
 
+	get serverMaxBlobUploadBytes(): number | null {
+		return this.capabilityUpdateService?.maxBlobUploadBytes ?? null;
+	}
+
 	get serverSupportsSnapshots(): boolean {
 		return this.capabilityUpdateService?.supportsSnapshots ?? true;
 	}
